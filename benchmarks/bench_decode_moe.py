@@ -75,6 +75,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, help="checkpoint dir (or .ftw)")
     p.add_argument(
+        "--nowag-expert-path",
+        default=None,
+        help="expert-only NoWAG directory; non-expert weights still come from --model",
+    )
+    p.add_argument(
         "--backend",
         default="offload",
         help="comma list of offload|cpu|hybrid; one server per backend",
@@ -189,6 +194,8 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
         cmd += ["--moe-cache-rate", str(args.cache_rate)]
     else:
         cmd.append("--moe-cache-auto")
+    if args.nowag_expert_path:
+        cmd += ["--nowag-expert-path", args.nowag_expert_path]
     return cmd
 
 
@@ -336,6 +343,7 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
             stream_generate(origin, model_id, problem, sampling, args)
             r = stream_generate(origin, model_id, problem, sampling, args)
             stats = get_json(f"{origin}/v1/stats")
+            cache_geometry = get_json(f"{origin}/v1/cache/status").get("geometry", {})
         finally:
             stop_server(proc)
             pump.join(timeout=10)
@@ -351,6 +359,7 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
     gaps = sorted((b - a) * 1e3 for a, b in zip(stamps, stamps[1:]))
     row = {
         "model": args.model,
+        "nowag_expert_path": args.nowag_expert_path,
         "backend": backend,
         "problem": args.problem,
         "prompt_tokens": usage["prompt_tokens"],
@@ -363,6 +372,14 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
         "events": len(stamps),
         "completion_tokens": completion,
         "vram_gib": stats.get("vram_bytes", 0) / 2**30,
+        "moe_cache_slots": cache_geometry.get("moe_cache_size"),
+        "moe_expert_mib": (
+            cache_geometry.get("unit_bytes", {}).get("moe_per_expert", 0) / 2**20
+        ),
+        "kv_tokens": (
+            cache_geometry.get("num_pages", 0)
+            * cache_geometry.get("page_size", 0)
+        ),
         "sampling": sampling,
         "output_sha1": hashlib.sha1(r["text"].encode()).hexdigest()[:12],
         "server_log": log_path,
@@ -375,6 +392,10 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
           f"(event p50 {row['event_ms_p50']:.3f} / p99 {row['event_ms_p99']:.3f} ms, "
           f"{len(stamps)} events)")
     print(f"  vram (server)     : {row['vram_gib']:8.2f} GiB")
+    print(
+        f"  expert cache     : {row['moe_cache_slots']} slots, "
+        f"{row['moe_expert_mib']:.2f} MiB/slot; KV {row['kv_tokens']} tokens"
+    )
     sha_note = "greedy" if args.greedy else "sampled, per-server deterministic"
     print(f"  output sha1       : {row['output_sha1']}  ({sha_note}; compare across backends)")
     print(f"  output sample     : {r['text'][:240]!r}")
