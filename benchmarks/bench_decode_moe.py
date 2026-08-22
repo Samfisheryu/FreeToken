@@ -232,17 +232,23 @@ def stop_server(proc: subprocess.Popen) -> None:
     Best-effort by design: it runs in ``finally`` and must not mask the real error.
     killpg runs even when the frontend already exited -- a crashed frontend leaves live
     non-daemon workers in the group, and they hold the GPU."""
+    process_group = proc.pid
     for sig, wait_s in ((signal.SIGTERM, 90), (signal.SIGKILL, 30)):
         try:
-            os.killpg(proc.pid, sig)
+            os.killpg(process_group, sig)
         except ProcessLookupError:  # whole group already gone
-            pass
-        try:
-            proc.wait(timeout=wait_s)
-            break
-        except subprocess.TimeoutExpired:
-            continue
-    time.sleep(3)  # let the driver reclaim VRAM before the next backend's server
+            proc.wait(timeout=1.0)
+            return
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            proc.poll()  # reap the frontend while waiting for its GPU worker
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                proc.wait(timeout=1.0)
+                return
+            time.sleep(0.5)
+    proc.wait(timeout=1.0)
 
 
 def stream_generate(origin: str, model_id: str, problem: str, sampling: dict,
