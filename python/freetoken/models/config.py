@@ -220,8 +220,11 @@ class ModelConfig:
     # Weight quantization of the MoE experts only. "none" keeps the default BF16
     # offload/fused path; "nvfp4" stores experts as packed FP4 + block scales;
     # "fp8_block" is DeepSeek-V3-style 128x128 block-fp8 (weight fp8-e4m3 +
-    # weight_scale_inv per block), also applied to the dense projections.
+    # weight_scale_inv per block), also applied to the dense projections. "nowag"
+    # stores routed experts as codebook + assignment + normalizer weights.
     expert_quant: str = "none"
+    # Directory containing the expert-only NoWAG output selected by EngineConfig.
+    nowag_expert_path: str | None = None
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend); injected from EngineConfig.
     nvfp4_backend: str = "triton"
     # Block size (out, in) for block-wise weight quantization (fp8_block: (128, 128)).

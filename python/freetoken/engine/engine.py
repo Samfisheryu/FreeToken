@@ -568,6 +568,7 @@ class Engine:
             )
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            cache.set_codebook(banks.codebook)
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -1096,6 +1097,12 @@ def _adjust_config(config: EngineConfig):
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
+    nowag_expert_path = getattr(config, "nowag_expert_path", None)
+    if nowag_expert_path is not None:
+        if not is_dsv4:
+            raise ValueError("--nowag-expert-path currently supports only DeepSeek-V4")
+        object.__setattr__(model_config, "expert_quant", "nowag")
+        object.__setattr__(model_config, "nowag_expert_path", nowag_expert_path)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
     if not is_moe:
@@ -1246,7 +1253,10 @@ def _adjust_config(config: EngineConfig):
         from freetoken.moe.bench_profile import load_backend_recommendation
 
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name) == "hybrid":
+        if (
+            expert_quant != "nowag"
+            and load_backend_recommendation(bench_fmt, gpu_name=gpu_name) == "hybrid"
+        ):
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")
@@ -1291,6 +1301,14 @@ def _adjust_config(config: EngineConfig):
                 "No MoE cache sizing flag given; defaulting to --moe-cache-auto for "
                 f"auto-selected backend {config.moe_backend!r}"
             )
+
+    if expert_quant == "nowag" and (
+        config.moe_backend != "offload" or config.moe_cpu_layers
+    ):
+        raise ValueError(
+            "DeepSeek-V4 NoWAG currently supports only --moe-backend offload "
+            "without --moe-cpu-layers"
+        )
 
     if is_moe and config.moe_backend == "fused":
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The

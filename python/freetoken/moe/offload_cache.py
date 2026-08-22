@@ -75,6 +75,19 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # DeepSeek-V4 FP4: packed e2m1 codes + e8m0 per-32 block scales, no global scale
     # (4 banks). Read by DeepSeek-V4's own DS-FP4 grouped GEMV kernels via bank_views().
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
+    # DeepSeek-V4 NoWAG: three projections, each with packed assignments and
+    # input/output normalizers. The shared codebook is installed separately once.
+    "nowag": (
+        "gate_assignments",
+        "gate_input_norm",
+        "gate_output_norm",
+        "up_assignments",
+        "up_input_norm",
+        "up_output_norm",
+        "down_assignments",
+        "down_input_norm",
+        "down_output_norm",
+    ),
 }
 
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
@@ -189,6 +202,8 @@ class OffloadMoeCache:
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
+        # One model-wide NoWAG codebook; it is not replicated per cache slot.
+        self.codebook: torch.Tensor | None = None
         # Opt-in decode miss-rate instrumentation. Accumulated on-device (no per-step host
         # sync); read via ``decode_miss_stats``. Graph-safe: the ``+=`` is captured into the
         # decode graph and re-executes with each replay's REAL routing (record_decode_stats
@@ -474,6 +489,16 @@ class OffloadMoeCache:
         assert gate_up_alpha.shape == down_alpha.shape == (total,)
         self.gate_up_alpha = gate_up_alpha.to(self.device)
         self.down_alpha = down_alpha.to(self.device)
+
+    def set_codebook(self, codebook: torch.Tensor | None) -> None:
+        """Install the model-wide NoWAG codebook on the cache device."""
+        if codebook is None:
+            return
+        if codebook.ndim != 2:
+            raise ValueError(
+                f"NoWAG codebook must be [entries, group_size], got {tuple(codebook.shape)}"
+            )
+        self.codebook = codebook.to(self.device).contiguous()
 
     def set_cpu_executor(self, executor) -> None:
         """Attach the CPU MoE executor (``decode_target`` in {"cpu", "hybrid"}).

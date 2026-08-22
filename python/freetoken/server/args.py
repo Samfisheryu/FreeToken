@@ -477,6 +477,15 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--nowag-expert-path",
+        default=ServerArgs.nowag_expert_path,
+        help=(
+            "Directory produced by the DeepSeek-V4 expert-only NoWAG quantizer. "
+            "The original --model path continues to provide all non-expert weights."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",

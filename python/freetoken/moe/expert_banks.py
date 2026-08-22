@@ -40,6 +40,9 @@ class ExpertBanks:
     # marlin/b12x per-expert global scales ([L*E]); None for formats without them
     gate_up_alpha: torch.Tensor | None = field(default=None)
     down_alpha: torch.Tensor | None = field(default=None)
+    # One model-wide NoWAG codebook. It is copied to the GPU once and does not
+    # contribute to the per-expert slot size.
+    codebook: torch.Tensor | None = field(default=None)
     # Per-layer HostResidency values; None -> all pinned (the only class
     # served; policies that assign other classes are not implemented).
     layer_residency: list[str] | None = field(default=None)
@@ -276,6 +279,28 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     )
 
 
+def _nowag_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if getattr(model_config, "dsv4_args", None) is None:
+        raise ValueError("the current NoWAG expert loader supports only DeepSeek-V4")
+    if decode_target != "gpu":
+        raise ValueError("NoWAG experts currently support only GPU offload")
+    if dummy:
+        raise ValueError("NoWAG experts require a completed quantization output")
+    if layer_sink is not None:
+        raise NotImplementedError("FTW conversion does not yet write NoWAG expert banks")
+    from freetoken.models.deepseek_v4.nowag import load_nowag_expert_sources
+
+    path = getattr(model_config, "nowag_expert_path", None)
+    if not path:
+        raise ValueError("NoWAG expert path was not configured")
+    sources, codebook = load_nowag_expert_sources(path, model_config, dtype=dtype)
+    return ExpertBanks(
+        "nowag",
+        {name: sources[name] for name in _BANK_SCHEMAS["nowag"]},
+        codebook=codebook,
+    )
+
+
 def _model_setup_override(model_config):
     architectures = getattr(model_config, "architectures", None)
     if not architectures:
@@ -298,6 +323,7 @@ _PROVIDERS = {
     "none": _bf16_banks,
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
+    "nowag": _nowag_banks,
     "q4_0": _q4_0_banks,
 }
 

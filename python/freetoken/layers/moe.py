@@ -570,6 +570,38 @@ class OffloadMoELayer(MoELayer):
                 gate_up_packed, gate_up_scale, down_packed, down_scale,
                 self.swiglu_limit,
             )
+        if fmt == "nowag":
+            from freetoken.moe.fused_nowag import routed_experts_nowag_dsv4
+
+            if cache.codebook is None:
+                raise RuntimeError("NoWAG cache has no shared codebook")
+            (
+                gate_assignments,
+                gate_input_norm,
+                gate_output_norm,
+                up_assignments,
+                up_input_norm,
+                up_output_norm,
+                down_assignments,
+                down_input_norm,
+                down_output_norm,
+            ) = views
+            return routed_experts_nowag_dsv4(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                cache.codebook,
+                gate_assignments,
+                gate_input_norm,
+                gate_output_norm,
+                up_assignments,
+                up_input_norm,
+                up_output_norm,
+                down_assignments,
+                down_input_norm,
+                down_output_norm,
+                self.swiglu_limit,
+            )
         assert fmt == "bf16", f"unknown quant_format {fmt!r}"
         gate_up, down = views
         impl = fused_experts_impl if is_prefill else fused_experts_decode_impl

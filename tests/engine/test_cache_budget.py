@@ -168,6 +168,27 @@ def test_adjust_config_allows_auto_for_dsv4():
     assert cfg.page_size == 128  # DSV4's KV page is the P-token window page
 
 
+def test_adjust_config_selects_nowag_experts_for_dsv4_offload():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(nowag_expert_path="/data1/dsv4-nowag")
+    _adjust_config(cfg)
+
+    assert cfg.model_config.expert_quant == "nowag"
+    assert cfg.model_config.nowag_expert_path == "/data1/dsv4-nowag"
+    assert cfg.moe_backend == "offload"
+
+
+def test_adjust_config_rejects_nowag_cpu_or_hybrid():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(
+        nowag_expert_path="/data1/dsv4-nowag", moe_backend="hybrid"
+    )
+    with pytest.raises(ValueError, match="only --moe-backend offload"):
+        _adjust_config(cfg)
+
+
 def test_adjust_config_resolves_num_tokens_for_dsv4():
     # --num-tokens resolves AFTER every page_size override, so DSV4's P=128 page divides it.
     from freetoken.engine.engine import _adjust_config
