@@ -42,7 +42,12 @@ def routed_experts_nowag_dsv4(
         act_quant_fp8_inplace,
         act_quant_fp8_roundtrip,
     )
-    from freetoken.moe.fused import moe_align_block_size
+    # NoWAG's smaller expert rows can make the auto-sized slot cache exceed the
+    # native sgl_kernel aligner's 1024-entry scan geometry.  The in-tree Triton
+    # aligner has the same contract without that limit.
+    from freetoken.kernel.triton.moe_align import (
+        moe_align_block_size as moe_align_block_size_triton,
+    )
 
     rounded_x = act_quant_fp8_roundtrip(x, 128)
 
@@ -76,7 +81,7 @@ def routed_experts_nowag_dsv4(
         structural_down=False,
         swiglu_limit=swiglu_limit,
         middle_transform=round_down_input,
-        align_routes=moe_align_block_size,
+        align_routes=moe_align_block_size_triton,
         sum_routes=moe_sum_reduce_triton,
     )
 

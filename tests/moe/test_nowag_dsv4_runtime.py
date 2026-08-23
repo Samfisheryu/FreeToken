@@ -88,6 +88,7 @@ def test_nowag_sidecar_maps_three_projections_to_nine_banks(tmp_path, monkeypatc
 
 def test_dsv4_wrapper_keeps_fp8_roundtrips_and_clamped_swiglu(monkeypatch):
     import nowag_vllm.moe_ops as nowag_moe_ops
+    from freetoken.kernel.triton.moe_align import moe_align_block_size
     from freetoken.kernel.triton.dsv4 import fp8_linear
     from freetoken.moe.fused_nowag import routed_experts_nowag_dsv4
 
@@ -109,6 +110,7 @@ def test_dsv4_wrapper_keeps_fp8_roundtrips_and_clamped_swiglu(monkeypatch):
         assert kwargs["structural_down"] is False
         assert kwargs["swiglu_limit"] == 10.0
         assert kwargs["validate_route_ids"] is False
+        assert kwargs["align_routes"] is moe_align_block_size
         assert kwargs["gate_codebook"] is kwargs["up_codebook"]
         assert kwargs["gate_codebook"] is kwargs["down_codebook"]
         middle = torch.zeros(2, 6, dtype=torch.bfloat16)
@@ -179,6 +181,22 @@ def test_shared_codebook_is_not_part_of_the_per_expert_slot():
     resident = cache.codebook
     cache.rebuild(3)
     assert cache.codebook is resident
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_nowag_triton_aligner_handles_auto_cache_above_1024_slots():
+    from freetoken.kernel.triton.moe_align import moe_align_block_size
+
+    slots = torch.tensor(
+        [[0, 1, 1023, 1024, 1200, 1458]], dtype=torch.int32, device="cuda"
+    )
+    sorted_tickets, expert_ids, num_tickets = moe_align_block_size(slots, 16, 1459)
+    torch.cuda.synchronize()
+
+    assert num_tickets.cpu().item() == 96
+    valid = sorted_tickets[:96].cpu()
+    assert sorted(valid[valid < slots.numel()].tolist()) == list(range(slots.numel()))
+    assert set(expert_ids[:6].cpu().tolist()) == set(slots.cpu().view(-1).tolist())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
