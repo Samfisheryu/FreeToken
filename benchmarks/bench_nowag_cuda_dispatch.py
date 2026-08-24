@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import statistics
 import sys
@@ -18,8 +19,15 @@ import torch
 
 from freetoken.moe.fused_nowag import routed_experts_nowag
 from freetoken.moe.nowag import get_nowag_model_rule
+from nowag_vllm.execution_profile import select_cuda_moe_backend
 from nowag_vllm.moe_ops import required_structural_middle_rows
-from nowag_vllm.moe_tuning import MoeCudaLaunchPlan, MoeCudaStageConfig
+from nowag_vllm.moe_tuning import (
+    MoeCudaLaunchPlan,
+    MoeCudaStageConfig,
+    cuda_hardware_identity,
+    moe_shape_identity,
+    select_moe_cuda_launch_plan,
+)
 
 
 Runner = Callable[[], torch.Tensor]
@@ -268,6 +276,33 @@ def main() -> None:
     down_output_norm = normalizer(hidden_size)
     plans = _candidate_plans(intermediate_size, hidden_size)
     max_down_bm = max(plan.down.block_m for plan in plans.values())
+    activation_identity = {
+        "activation_kind": "silu_mul",
+        "gate_up_input_rounding": activation_rule.gate_up_input_rounding,
+        "swiglu_limit": (
+            args.swiglu_limit if args.activation_mode == "dsv4" else None
+        ),
+        "down_input_rounding": activation_rule.down_input_rounding,
+        "down_norm_placement": activation_rule.down_norm_placement,
+    }
+    shape_identity = moe_shape_identity(
+        num_experts=model_experts,
+        physical_expert_rows=bank_rows,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        physical_intermediate_size=intermediate_size,
+        pad_down_to_k48=False,
+        down_input_group_start_lane=0,
+        assignment_layout="word_major",
+        structural_down=True,
+        top_k=top_k,
+        codebook_size=codebook_size,
+        dtype=dtype,
+        group_size=group_size,
+        assignment_bits=assignment_bits,
+        **activation_identity,
+    )
+    hardware_identity = cuda_hardware_identity(device)
     rows = []
 
     for seed in args.seeds:
@@ -340,7 +375,64 @@ def main() -> None:
                 runners: dict[str, Runner] = {"triton": triton_run}
                 relative_rmse = {"triton": 0.0}
                 failures = {}
+                auto_dispatch = None
                 if args.check_auto:
+                    wrapper_environment_override = os.environ.get(
+                        "FREETOKEN_NOWAG_BACKEND"
+                    )
+                    selected_backend = (
+                        "triton"
+                        if wrapper_environment_override == "triton"
+                        else select_cuda_moe_backend(
+                            device=device,
+                            dtype=dtype,
+                            group_size=group_size,
+                            assignment_bits=assignment_bits,
+                            codebook_size=codebook_size,
+                            num_experts=model_experts,
+                            physical_expert_rows=bank_rows,
+                            hidden_size=hidden_size,
+                            intermediate_size=intermediate_size,
+                            physical_intermediate_size=intermediate_size,
+                            pad_down_to_k48=False,
+                            down_input_group_start_lane=0,
+                            assignment_layout="word_major",
+                            structural_down=True,
+                            top_k=top_k,
+                            num_tokens=num_tokens,
+                            **activation_identity,
+                        )
+                    )
+                    uses_exact_plan = selected_backend == "cuda_exact_k48"
+                    selected_plan = (
+                        select_moe_cuda_launch_plan(
+                            hardware=hardware_identity,
+                            shape=shape_identity,
+                            num_tokens=num_tokens,
+                        )
+                        if uses_exact_plan
+                        else None
+                    )
+                    auto_dispatch = {
+                        "requested_backend": "auto",
+                        "selected_backend": selected_backend,
+                        "selected_plan": (
+                            _plan_label(selected_plan)
+                            if selected_plan is not None
+                            else None
+                        ),
+                        "selected_plan_source": (
+                            selected_plan.source
+                            if selected_plan is not None
+                            else None
+                        ),
+                        "selected_profile": (
+                            selected_plan.profile_name
+                            if selected_plan is not None
+                            else None
+                        ),
+                        "wrapper_environment_override": wrapper_environment_override,
+                    }
 
                     def auto_run():
                         return routed_experts_nowag(**common)
@@ -389,22 +481,29 @@ def main() -> None:
                     "routing": routing,
                     "timings_ms": timings,
                     "relative_rmse_vs_triton": relative_rmse,
+                    "auto_dispatch": auto_dispatch,
                     "failures": failures,
                     "best": best,
                     "best_ms": timings[best],
                     "best_speedup_over_triton": timings["triton"] / timings[best],
                 }
                 rows.append(row)
+                auto_summary = ""
+                if auto_dispatch is not None:
+                    auto_summary = f", auto={auto_dispatch['selected_backend']}"
+                    if auto_dispatch["selected_plan"] is not None:
+                        auto_summary += f" {auto_dispatch['selected_plan']}"
                 print(
                     f"seed={seed} M={num_tokens} {routing}: {best} "
-                    f"{timings[best]:.4f} ms, Triton {timings['triton']:.4f} ms",
+                    f"{timings[best]:.4f} ms, Triton {timings['triton']:.4f} ms"
+                    + auto_summary,
                     flush=True,
                 )
 
     properties = torch.cuda.get_device_properties(device)
     command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "command": command,
         "elapsed_seconds": time.perf_counter() - started,
         "gpu": {
@@ -438,6 +537,10 @@ def main() -> None:
             "samples_per_candidate": args.samples,
             "relative_rmse_tolerance": args.rmse_tolerance,
             "check_auto": args.check_auto,
+            "requested_auto_backend": "auto" if args.check_auto else None,
+            "wrapper_environment_override": os.environ.get(
+                "FREETOKEN_NOWAG_BACKEND"
+            ),
             "timing": (
                 "randomized multi-candidate ABBA: forward, reverse, reverse, "
                 "forward"
