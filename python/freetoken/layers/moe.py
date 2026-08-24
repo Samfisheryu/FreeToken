@@ -604,6 +604,7 @@ class OffloadMoELayer(MoELayer):
                 down_input_norm,
                 down_output_norm,
                 model_type=self.nowag_model_type,
+                model_num_experts=self.num_experts,
                 swiglu_limit=getattr(self, "swiglu_limit", None),
             )
         assert fmt == "bf16", f"unknown quant_format {fmt!r}"

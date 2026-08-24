@@ -86,7 +86,10 @@ def test_nowag_sidecar_maps_three_projections_to_nine_banks(tmp_path, monkeypatc
     assert codebook.shape == (4096, 6)
 
 
-def test_qwen_nowag_sidecar_uses_common_manifest_and_real_shapes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source_layout", [None, "row_major", "word_major"])
+def test_qwen_nowag_sidecar_uses_common_manifest_and_real_shapes(
+    tmp_path, monkeypatch, source_layout
+):
     from freetoken.moe.host_banks import HostBank
     from freetoken.moe.nowag import load_nowag_expert_sources
 
@@ -98,6 +101,7 @@ def test_qwen_nowag_sidecar_uses_common_manifest_and_real_shapes(tmp_path, monke
     gate_words = 2  # ceil(ceil(13 / 6) * 12 / 32)
     down_words = 1  # ceil(ceil(7 / 6) * 12 / 32)
     tensors = {}
+    logical_assignments = {}
     projection_shapes = {
         "w1": (intermediate, gate_words, hidden, intermediate),
         "w3": (intermediate, gate_words, hidden, intermediate),
@@ -106,8 +110,14 @@ def test_qwen_nowag_sidecar_uses_common_manifest_and_real_shapes(tmp_path, monke
     for expert in range(experts):
         for projection, (rows, words, in_size, out_size) in projection_shapes.items():
             value = {"w1": 10, "w3": 20, "w2": 30}[projection] + expert
-            tensors[_key(0, expert, projection, "assignments")] = torch.full(
-                (rows, words), value, dtype=torch.int32
+            key = _key(0, expert, projection, "assignments")
+            logical = torch.arange(rows * words, dtype=torch.int32).view(rows, words)
+            logical.add_(value * 100)
+            logical_assignments[key] = logical
+            tensors[key] = (
+                logical
+                if source_layout in (None, "row_major")
+                else logical.t().contiguous()
             )
             tensors[_key(0, expert, projection, "normalizer.norms.0")] = torch.full(
                 (in_size,), float(value), dtype=torch.bfloat16
@@ -139,6 +149,8 @@ def test_qwen_nowag_sidecar_uses_common_manifest_and_real_shapes(tmp_path, monke
         },
         "layers": [{"layer": 0, "file": "layer-000.safetensors"}],
     }
+    if source_layout is not None:
+        manifest["assignment_layout"] = source_layout
     (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     config = SimpleNamespace(
         model_type="qwen3_5_moe",
@@ -152,11 +164,16 @@ def test_qwen_nowag_sidecar_uses_common_manifest_and_real_shapes(tmp_path, monke
 
     banks, codebook = load_nowag_expert_sources(output, config)
 
-    assert banks["gate_assignments"][0].shape == (experts, intermediate, gate_words)
-    assert banks["down_assignments"][0].shape == (experts, hidden, down_words)
-    assert banks["gate_assignments"][0][1, 0, 0].item() == 11
-    assert banks["up_assignments"][0][1, 0, 0].item() == 21
-    assert banks["down_assignments"][0][1, 0, 0].item() == 31
+    assert banks["gate_assignments"][0].shape == (experts, gate_words, intermediate)
+    assert banks["down_assignments"][0].shape == (experts, down_words, hidden)
+    for projection, bank in (("w1", "gate"), ("w3", "up"), ("w2", "down")):
+        for expert in range(experts):
+            expected = logical_assignments[
+                _key(0, expert, projection, "assignments")
+            ].t().contiguous()
+            torch.testing.assert_close(
+                banks[f"{bank}_assignments"][0][expert], expected
+            )
     assert codebook.shape == (4096, 6)
 
 
@@ -180,13 +197,29 @@ def test_dsv4_wrapper_keeps_fp8_roundtrips_and_clamped_swiglu(monkeypatch):
     result = torch.full((2, 12), 7, dtype=torch.bfloat16)
 
     def fake_nowag_fused_moe(**kwargs):
-        assert kwargs["hidden_states"].eq(2).all()
-        assert kwargs["structural_down"] is False
+        assert kwargs["hidden_states"].eq(1).all()
+        assert kwargs["assignment_layout"] == "word_major"
+        assert kwargs["gate_up_backend"] == "auto"
+        assert kwargs["down_backend"] == "auto"
+        assert kwargs["structural_down"] is True
         assert kwargs["swiglu_limit"] == 10.0
+        assert (
+            kwargs["gate_up_input_rounding"]
+            == "dynamic_e4m3_per_token_group128_ue8m0"
+        )
+        assert (
+            kwargs["down_input_rounding"]
+            == "dynamic_e4m3_per_token_group128_ue8m0"
+        )
+        assert kwargs["down_norm_placement"] == "down_prologue"
         assert kwargs["validate_route_ids"] is False
         assert kwargs["align_routes"] is moe_align_block_size
         assert kwargs["gate_codebook"] is kwargs["up_codebook"]
         assert kwargs["gate_codebook"] is kwargs["down_codebook"]
+        rounded_input = kwargs["gate_up_input_transform"](
+            kwargs["hidden_states"]
+        )
+        assert rounded_input.eq(2).all()
         middle = torch.zeros(2, 6, dtype=torch.bfloat16)
         assert kwargs["middle_transform"](middle) is middle
         assert middle.eq(2).all()
@@ -235,8 +268,15 @@ def test_qwen_wrapper_keeps_bf16_input_and_unclamped_swiglu(monkeypatch):
 
     def fake_nowag_fused_moe(**kwargs):
         assert kwargs["hidden_states"] is x
+        assert kwargs["assignment_layout"] == "word_major"
+        assert kwargs["gate_up_backend"] == "auto"
+        assert kwargs["down_backend"] == "auto"
         assert kwargs["structural_down"] is True
         assert kwargs["swiglu_limit"] is None
+        assert kwargs["gate_up_input_rounding"] == "none"
+        assert kwargs["down_input_rounding"] == "none"
+        assert kwargs["down_norm_placement"] == "gate_up_epilogue"
+        assert kwargs["gate_up_input_transform"] is None
         assert kwargs["middle_transform"] is None
         assert kwargs["validate_route_ids"] is False
         assert kwargs["align_routes"] is moe_align_block_size
@@ -271,6 +311,39 @@ def test_qwen_wrapper_keeps_bf16_input_and_unclamped_swiglu(monkeypatch):
     )
 
     assert actual is result
+
+
+def test_nowag_backend_environment_override(monkeypatch):
+    import freetoken.moe.fused_nowag as fused_nowag
+
+    monkeypatch.setenv("FREETOKEN_NOWAG_BACKEND", "triton")
+    monkeypatch.setattr(
+        "nowag_vllm.moe_ops.nowag_fused_moe",
+        lambda **kwargs: (kwargs["gate_up_backend"], kwargs["down_backend"]),
+    )
+    x = torch.ones(1, 12, dtype=torch.bfloat16)
+    assignments = torch.zeros(2, 1, 6, dtype=torch.int32)
+    input_norm = torch.ones(2, 12, dtype=torch.bfloat16)
+    output_norm = torch.ones(2, 6, dtype=torch.bfloat16)
+
+    actual = fused_nowag.routed_experts_nowag(
+        x,
+        torch.zeros(1, 1, dtype=torch.int32),
+        torch.ones(1, 1),
+        torch.ones(4096, 6, dtype=torch.bfloat16),
+        assignments,
+        input_norm,
+        output_norm,
+        assignments,
+        input_norm,
+        output_norm,
+        assignments,
+        output_norm,
+        input_norm,
+        model_type="qwen3_5_moe",
+    )
+
+    assert actual == ("triton", "triton")
 
 
 def test_qwen_offload_layer_dispatches_with_qwen_rule(monkeypatch):
@@ -317,7 +390,11 @@ def test_qwen_offload_layer_dispatches_with_qwen_rule(monkeypatch):
     )
 
     assert actual is x
-    assert called == {"model_type": "qwen3_5_moe", "swiglu_limit": None}
+    assert called == {
+        "model_type": "qwen3_5_moe",
+        "model_num_experts": 2,
+        "swiglu_limit": None,
+    }
 
 
 def test_shared_codebook_is_not_part_of_the_per_expert_slot():
@@ -398,7 +475,7 @@ def test_dsv4_nowag_wrapper_compiles_on_cuda():
         )
         packed = torch.stack(
             [pack_assignments(ids[expert], 12) for expert in range(num_experts)]
-        ).to(device)
+        ).transpose(1, 2).contiguous().to(device)
         input_norm = torch.ones(
             (num_experts, in_features), dtype=torch.bfloat16, device=device
         )
@@ -501,7 +578,7 @@ def test_qwen_nowag_wrapper_matches_plain_swiglu_on_cuda():
         )
         packed = torch.stack(
             [pack_assignments(ids[expert], 12) for expert in range(num_experts)]
-        ).to(device)
+        ).transpose(1, 2).contiguous().to(device)
         input_norm = torch.ones(
             (num_experts, in_features), dtype=torch.bfloat16, device=device
         )

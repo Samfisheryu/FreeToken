@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
-from freetoken.moe.nowag import get_nowag_model_rule
+from freetoken.moe.nowag import (
+    NO_ACTIVATION_ROUNDING,
+    RUNTIME_ASSIGNMENT_LAYOUT,
+    get_nowag_model_rule,
+)
 
 
 def routed_experts_nowag(
@@ -23,12 +29,27 @@ def routed_experts_nowag(
     down_output_norm: torch.Tensor,
     *,
     model_type: str | None,
+    model_num_experts: int | None = None,
     swiglu_limit: float | None = None,
+    gate_up_backend: str = "auto",
+    down_backend: str = "auto",
+    cuda_launch_plan: object | None = None,
+    output: torch.Tensor | None = None,
+    middle_workspace: torch.Tensor | None = None,
+    route_output_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one supported model's activation math over shared-codebook experts."""
     if codebook.ndim != 2:
         raise ValueError(f"NoWAG codebook must be [C, d], got {tuple(codebook.shape)}")
     rule = get_nowag_model_rule(model_type)
+    backend_override = os.environ.get("FREETOKEN_NOWAG_BACKEND")
+    if backend_override is not None:
+        if backend_override not in ("triton", "auto"):
+            raise ValueError(
+                "FREETOKEN_NOWAG_BACKEND must be 'triton' or 'auto'"
+            )
+        gate_up_backend = backend_override
+        down_backend = backend_override
 
     try:
         from nowag_vllm.moe_ops import nowag_fused_moe
@@ -43,29 +64,39 @@ def routed_experts_nowag(
         moe_align_block_size as moe_align_block_size_triton,
     )
 
-    kernel_input = x
+    gate_up_input_transform = None
     middle_transform = None
-    if rule.dsv4_activation_math:
+    if rule.requires_swiglu_limit:
         if swiglu_limit is None:
-            raise ValueError("DeepSeek-V4 NoWAG requires swiglu_limit")
+            raise ValueError(f"{rule.model_type} NoWAG requires swiglu_limit")
         from freetoken.kernel.triton.dsv4.fp8_linear import (
             act_quant_fp8_inplace,
             act_quant_fp8_roundtrip,
         )
 
-        kernel_input = act_quant_fp8_roundtrip(x, 128)
+        def round_gate_up_input(hidden: torch.Tensor) -> torch.Tensor:
+            return act_quant_fp8_roundtrip(hidden, 128)
 
         def round_down_input(middle: torch.Tensor) -> torch.Tensor:
             return act_quant_fp8_inplace(middle, 128)
 
+        gate_up_input_transform = round_gate_up_input
         middle_transform = round_down_input
     else:
-        # Qwen3.6 keeps activations in BF16 and uses ordinary, unclamped SwiGLU.
         swiglu_limit = None
+
+    if (
+        rule.gate_up_input_rounding == NO_ACTIVATION_ROUNDING
+    ) != (gate_up_input_transform is None):
+        raise RuntimeError("NoWAG Gate/Up rounding rule has no matching transform")
+    if (
+        rule.down_input_rounding == NO_ACTIVATION_ROUNDING
+    ) != (middle_transform is None):
+        raise RuntimeError("NoWAG Down rounding rule has no matching transform")
 
     shared = codebook.unsqueeze(0)
     return nowag_fused_moe(
-        hidden_states=kernel_input,
+        hidden_states=x,
         gate_codebook=shared,
         gate_packed_assignments=gate_assignments,
         gate_input_norm=gate_input_norm,
@@ -83,12 +114,23 @@ def routed_experts_nowag(
         down_in_features=gate_output_norm.shape[1],
         topk_weights=topk_weights,
         topk_ids=slots,
+        model_num_experts=model_num_experts,
         group_size=codebook.shape[1],
         assignment_bits=12,
-        assignment_layout="row_major",
+        assignment_layout=RUNTIME_ASSIGNMENT_LAYOUT,
         validate_route_ids=False,
-        structural_down=not rule.dsv4_activation_math,
+        structural_down=True,
+        gate_up_backend=gate_up_backend,
+        down_backend=down_backend,
+        cuda_launch_plan=cuda_launch_plan,
+        output=output,
+        middle_workspace=middle_workspace,
+        route_output_workspace=route_output_workspace,
         swiglu_limit=swiglu_limit,
+        gate_up_input_rounding=rule.gate_up_input_rounding,
+        down_input_rounding=rule.down_input_rounding,
+        down_norm_placement=rule.down_norm_placement,
+        gate_up_input_transform=gate_up_input_transform,
         middle_transform=middle_transform,
         align_routes=moe_align_block_size_triton,
         sum_routes=moe_sum_reduce_triton,

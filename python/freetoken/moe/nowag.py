@@ -15,6 +15,11 @@ from safetensors import safe_open
 FORMAT = "nowag_expert_sidecar_v1"
 LEGACY_DSV4_FORMAT = "deepseek_v4_nowag_expert_sidecar_v1"
 CODEBOOK_KEY = "global_all.codebook"
+RUNTIME_ASSIGNMENT_LAYOUT = "word_major"
+NO_ACTIVATION_ROUNDING = "none"
+DYNAMIC_E4M3_GROUP128_UE8M0 = "dynamic_e4m3_per_token_group128_ue8m0"
+GATE_UP_EPILOGUE_NORM = "gate_up_epilogue"
+DOWN_PROLOGUE_NORM = "down_prologue"
 
 # The files keep the projection names used by the first DSV4 quantizer.  Their
 # meaning is model-independent: w1 is gate, w3 is up, and w2 is down.
@@ -24,14 +29,27 @@ _PROJECTION_BANK = {"w1": "gate", "w3": "up", "w2": "down"}
 @dataclass(frozen=True)
 class NowagModelRule:
     model_type: str
-    # DSV4 rounds activations through FP8 and clamps SwiGLU.  Qwen uses the
-    # ordinary BF16 SwiGLU path supported by the same NoWAG kernel.
-    dsv4_activation_math: bool
+    gate_up_input_rounding: str
+    down_input_rounding: str
+    down_norm_placement: str
+    requires_swiglu_limit: bool
 
 
 _MODEL_RULES = {
-    "deepseek_v4": NowagModelRule("deepseek_v4", dsv4_activation_math=True),
-    "qwen3_5_moe": NowagModelRule("qwen3_5_moe", dsv4_activation_math=False),
+    "deepseek_v4": NowagModelRule(
+        "deepseek_v4",
+        gate_up_input_rounding=DYNAMIC_E4M3_GROUP128_UE8M0,
+        down_input_rounding=DYNAMIC_E4M3_GROUP128_UE8M0,
+        down_norm_placement=DOWN_PROLOGUE_NORM,
+        requires_swiglu_limit=True,
+    ),
+    "qwen3_5_moe": NowagModelRule(
+        "qwen3_5_moe",
+        gate_up_input_rounding=NO_ACTIVATION_ROUNDING,
+        down_input_rounding=NO_ACTIVATION_ROUNDING,
+        down_norm_placement=GATE_UP_EPILOGUE_NORM,
+        requires_swiglu_limit=False,
+    ),
 }
 
 
@@ -126,7 +144,14 @@ def load_nowag_expert_sources(
     dtype: torch.dtype = torch.bfloat16,
     model_type: str | None = None,
 ) -> tuple[dict[str, list[torch.Tensor]], torch.Tensor]:
-    """Load and pin the nine per-expert banks plus one model-wide codebook."""
+    """Load and pin the nine per-expert banks plus one model-wide codebook.
+
+    Assignment banks are always returned as contiguous ``[E, W, N]`` tensors.
+    Existing sidecars store each expert as ``[N, W]`` and are transposed while
+    copying into the final pinned bank.  A sidecar that declares
+    ``assignment_layout="word_major"`` is copied directly, so a quantizer can
+    write the runtime layout and avoid the transpose altogether.
+    """
     if dtype != torch.bfloat16:
         raise ValueError("NoWAG expert serving currently requires bfloat16")
 
@@ -157,6 +182,11 @@ def load_nowag_expert_sources(
         raise ValueError("NoWAG runtime currently supports only D6/B12")
     if manifest.get("assignments_packed") is not True:
         raise ValueError("NoWAG runtime requires packed assignments")
+    source_assignment_layout = manifest.get("assignment_layout", "row_major")
+    if source_assignment_layout not in ("row_major", RUNTIME_ASSIGNMENT_LAYOUT):
+        raise ValueError(
+            "NoWAG assignment_layout must be 'row_major' or 'word_major'"
+        )
     if int(manifest.get("matrix_count", -1)) != layers * experts * 3:
         raise ValueError("NoWAG output does not cover every routed expert matrix")
 
@@ -178,13 +208,13 @@ def load_nowag_expert_sources(
     gate_words = _words(hidden, group_size, assignment_bits)
     down_words = _words(intermediate, group_size, assignment_bits)
     specs = {
-        "gate_assignments": ((experts, intermediate, gate_words), torch.int32),
+        "gate_assignments": ((experts, gate_words, intermediate), torch.int32),
         "gate_input_norm": ((experts, hidden), dtype),
         "gate_output_norm": ((experts, intermediate), dtype),
-        "up_assignments": ((experts, intermediate, gate_words), torch.int32),
+        "up_assignments": ((experts, gate_words, intermediate), torch.int32),
         "up_input_norm": ((experts, hidden), dtype),
         "up_output_norm": ((experts, intermediate), dtype),
-        "down_assignments": ((experts, hidden, down_words), torch.int32),
+        "down_assignments": ((experts, down_words, hidden), torch.int32),
         "down_input_norm": ((experts, intermediate), dtype),
         "down_output_norm": ((experts, hidden), dtype),
     }
@@ -222,9 +252,12 @@ def load_nowag_expert_sources(
                         for kind, key in keys.items():
                             target = sources[f"{bank}_{kind}"][layer][expert]
                             loaded = handle.get_tensor(key)
-                            if tuple(loaded.shape) != tuple(target.shape):
+                            expected_shape = tuple(target.shape)
+                            if kind == "assignments" and source_assignment_layout == "row_major":
+                                expected_shape = (target.shape[1], target.shape[0])
+                            if tuple(loaded.shape) != expected_shape:
                                 raise ValueError(
-                                    f"{key}: expected {tuple(target.shape)}, "
+                                    f"{key}: expected {expected_shape}, "
                                     f"got {tuple(loaded.shape)}"
                                 )
                             if kind == "assignments" and loaded.dtype != torch.int32:
@@ -233,7 +266,10 @@ def load_nowag_expert_sources(
                                 raise TypeError(
                                     f"{key}: normalizer must use {dtype}, got {loaded.dtype}"
                                 )
-                            target.copy_(loaded)
+                            if kind == "assignments" and source_assignment_layout == "row_major":
+                                target.copy_(loaded.transpose(0, 1))
+                            else:
+                                target.copy_(loaded)
             pins(layer, {name: per[layer] for name, per in host_banks.items()})
 
     codebook_entry = manifest.get("codebook")
@@ -263,8 +299,13 @@ def load_nowag_expert_sources(
 
 __all__ = [
     "CODEBOOK_KEY",
+    "DOWN_PROLOGUE_NORM",
+    "DYNAMIC_E4M3_GROUP128_UE8M0",
     "FORMAT",
+    "GATE_UP_EPILOGUE_NORM",
     "LEGACY_DSV4_FORMAT",
+    "NO_ACTIVATION_ROUNDING",
+    "RUNTIME_ASSIGNMENT_LAYOUT",
     "NowagModelRule",
     "get_nowag_model_rule",
     "load_nowag_expert_sources",
