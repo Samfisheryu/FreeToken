@@ -87,6 +87,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             activation="silu",
         )
         self.swiglu_limit = args.swiglu_limit
+        self.nowag_model_type = "deepseek_v4"
 
     def _prefill_routed(
         self,

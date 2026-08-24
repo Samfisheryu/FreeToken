@@ -218,6 +218,9 @@ class OffloadMoELayer(MoELayer):
         )
         self.layer_id = layer_id
         self.offload_cache: OffloadMoeCache | None = None
+        # Set by make_moe_layer (or a model-specific subclass) so NoWAG can
+        # preserve each model's activation math without changing cache layout.
+        self.nowag_model_type: str | None = None
 
     def forward(
         self,
@@ -571,7 +574,7 @@ class OffloadMoELayer(MoELayer):
                 self.swiglu_limit,
             )
         if fmt == "nowag":
-            from freetoken.moe.fused_nowag import routed_experts_nowag_dsv4
+            from freetoken.moe.fused_nowag import routed_experts_nowag
 
             if cache.codebook is None:
                 raise RuntimeError("NoWAG cache has no shared codebook")
@@ -586,7 +589,7 @@ class OffloadMoELayer(MoELayer):
                 down_input_norm,
                 down_output_norm,
             ) = views
-            return routed_experts_nowag_dsv4(
+            return routed_experts_nowag(
                 hidden_states,
                 topk_ids,
                 topk_weights,
@@ -600,7 +603,8 @@ class OffloadMoELayer(MoELayer):
                 down_assignments,
                 down_input_norm,
                 down_output_norm,
-                self.swiglu_limit,
+                model_type=self.nowag_model_type,
+                swiglu_limit=getattr(self, "swiglu_limit", None),
             )
         assert fmt == "bf16", f"unknown quant_format {fmt!r}"
         gate_up, down = views
@@ -663,6 +667,10 @@ def make_moe_layer(
     else:
         kwargs["weight_format"] = weight_format
     layer = layer_cls(**kwargs)
+    if offload and getattr(config, "expert_quant", "none") == "nowag":
+        from freetoken.moe.nowag import get_nowag_model_rule
+
+        layer.nowag_model_type = get_nowag_model_rule(config).model_type
     for name, value in (extra_attrs or {}).items():
         setattr(layer, name, value)
     return layer

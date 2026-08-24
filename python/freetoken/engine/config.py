@@ -28,8 +28,8 @@ class EngineConfig:
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
     # low-memory reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
-    # Expert-only DeepSeek-V4 NoWAG output. The base model path still supplies
-    # every non-expert weight.
+    # Expert-only NoWAG output. The base model path still supplies every
+    # non-routed-expert weight.
     nowag_expert_path: str | None = None
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None

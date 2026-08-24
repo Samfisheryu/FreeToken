@@ -1099,8 +1099,9 @@ def _adjust_config(config: EngineConfig):
     is_moe = getattr(model_config, "is_moe", False)
     nowag_expert_path = getattr(config, "nowag_expert_path", None)
     if nowag_expert_path is not None:
-        if not is_dsv4:
-            raise ValueError("--nowag-expert-path currently supports only DeepSeek-V4")
+        from freetoken.moe.nowag import get_nowag_model_rule
+
+        get_nowag_model_rule(model_config)
         object.__setattr__(model_config, "expert_quant", "nowag")
         object.__setattr__(model_config, "nowag_expert_path", nowag_expert_path)
     expert_quant = getattr(model_config, "expert_quant", "none")
@@ -1306,7 +1307,7 @@ def _adjust_config(config: EngineConfig):
         config.moe_backend != "offload" or config.moe_cpu_layers
     ):
         raise ValueError(
-            "DeepSeek-V4 NoWAG currently supports only --moe-backend offload "
+            "NoWAG currently supports only --moe-backend offload "
             "without --moe-cpu-layers"
         )
 

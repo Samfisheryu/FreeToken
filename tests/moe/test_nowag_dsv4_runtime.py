@@ -86,6 +86,80 @@ def test_nowag_sidecar_maps_three_projections_to_nine_banks(tmp_path, monkeypatc
     assert codebook.shape == (4096, 6)
 
 
+def test_qwen_nowag_sidecar_uses_common_manifest_and_real_shapes(tmp_path, monkeypatch):
+    from freetoken.moe.host_banks import HostBank
+    from freetoken.moe.nowag import load_nowag_expert_sources
+
+    monkeypatch.setattr(HostBank, "pin", lambda self: setattr(self, "_pinned", True))
+    output = tmp_path / "qwen-nowag"
+    output.mkdir()
+
+    hidden, intermediate, experts = 13, 7, 2
+    gate_words = 2  # ceil(ceil(13 / 6) * 12 / 32)
+    down_words = 1  # ceil(ceil(7 / 6) * 12 / 32)
+    tensors = {}
+    projection_shapes = {
+        "w1": (intermediate, gate_words, hidden, intermediate),
+        "w3": (intermediate, gate_words, hidden, intermediate),
+        "w2": (hidden, down_words, intermediate, hidden),
+    }
+    for expert in range(experts):
+        for projection, (rows, words, in_size, out_size) in projection_shapes.items():
+            value = {"w1": 10, "w3": 20, "w2": 30}[projection] + expert
+            tensors[_key(0, expert, projection, "assignments")] = torch.full(
+                (rows, words), value, dtype=torch.int32
+            )
+            tensors[_key(0, expert, projection, "normalizer.norms.0")] = torch.full(
+                (in_size,), float(value), dtype=torch.bfloat16
+            )
+            tensors[_key(0, expert, projection, "normalizer.norms.1")] = torch.full(
+                (out_size,), float(value + 1), dtype=torch.bfloat16
+            )
+    save_file(tensors, output / "layer-000.safetensors")
+    save_file(
+        {"global_all.codebook": torch.zeros(4096, 6, dtype=torch.bfloat16)},
+        output / "global_codebook.safetensors",
+    )
+    manifest = {
+        "format": "nowag_expert_sidecar_v1",
+        "model_type": "qwen3_5_moe",
+        "scope": "expert_only",
+        "codebook_sharing": "global_all",
+        "d": 6,
+        "assignment_bits": 12,
+        "assignments_packed": True,
+        "num_moe_layers": 1,
+        "num_experts": experts,
+        "hidden_size": hidden,
+        "moe_intermediate_size": intermediate,
+        "matrix_count": experts * 3,
+        "codebook": {
+            "file": "global_codebook.safetensors",
+            "tensor": "global_all.codebook",
+        },
+        "layers": [{"layer": 0, "file": "layer-000.safetensors"}],
+    }
+    (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    config = SimpleNamespace(
+        model_type="qwen3_5_moe",
+        is_moe=True,
+        hidden_act="silu",
+        num_moe_layers=1,
+        num_experts=experts,
+        hidden_size=hidden,
+        moe_intermediate_size=intermediate,
+    )
+
+    banks, codebook = load_nowag_expert_sources(output, config)
+
+    assert banks["gate_assignments"][0].shape == (experts, intermediate, gate_words)
+    assert banks["down_assignments"][0].shape == (experts, hidden, down_words)
+    assert banks["gate_assignments"][0][1, 0, 0].item() == 11
+    assert banks["up_assignments"][0][1, 0, 0].item() == 21
+    assert banks["down_assignments"][0][1, 0, 0].item() == 31
+    assert codebook.shape == (4096, 6)
+
+
 def test_dsv4_wrapper_keeps_fp8_roundtrips_and_clamped_swiglu(monkeypatch):
     import nowag_vllm.moe_ops as nowag_moe_ops
     from freetoken.kernel.triton.moe_align import moe_align_block_size
@@ -149,6 +223,101 @@ def test_dsv4_wrapper_keeps_fp8_roundtrips_and_clamped_swiglu(monkeypatch):
 
     assert actual is result
     assert calls == [("input", 128), ("middle", 128)]
+
+
+def test_qwen_wrapper_keeps_bf16_input_and_unclamped_swiglu(monkeypatch):
+    import nowag_vllm.moe_ops as nowag_moe_ops
+    from freetoken.kernel.triton.moe_align import moe_align_block_size
+    from freetoken.moe.fused_nowag import routed_experts_nowag
+
+    result = torch.full((2, 12), 7, dtype=torch.bfloat16)
+    x = torch.ones(2, 12, dtype=torch.bfloat16)
+
+    def fake_nowag_fused_moe(**kwargs):
+        assert kwargs["hidden_states"] is x
+        assert kwargs["structural_down"] is True
+        assert kwargs["swiglu_limit"] is None
+        assert kwargs["middle_transform"] is None
+        assert kwargs["validate_route_ids"] is False
+        assert kwargs["align_routes"] is moe_align_block_size
+        assert kwargs["gate_codebook"] is kwargs["up_codebook"]
+        assert kwargs["gate_codebook"] is kwargs["down_codebook"]
+        return result
+
+    monkeypatch.setattr(nowag_moe_ops, "nowag_fused_moe", fake_nowag_fused_moe)
+
+    slots = torch.zeros(2, 2, dtype=torch.int32)
+    weights = torch.ones(2, 2, dtype=torch.float32)
+    codebook = torch.zeros(4096, 6, dtype=torch.bfloat16)
+    assignments = torch.zeros(2, 6, 1, dtype=torch.int32)
+    hidden_norm = torch.ones(2, 12, dtype=torch.bfloat16)
+    intermediate_norm = torch.ones(2, 6, dtype=torch.bfloat16)
+
+    actual = routed_experts_nowag(
+        x,
+        slots,
+        weights,
+        codebook,
+        assignments,
+        hidden_norm,
+        intermediate_norm,
+        assignments,
+        hidden_norm,
+        intermediate_norm,
+        torch.zeros(2, 12, 1, dtype=torch.int32),
+        intermediate_norm,
+        hidden_norm,
+        model_type="qwen3_5_moe",
+    )
+
+    assert actual is result
+
+
+def test_qwen_offload_layer_dispatches_with_qwen_rule(monkeypatch):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.moe import make_moe_layer
+    from freetoken.moe import fused_nowag
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    config = SimpleNamespace(
+        moe_backend="offload",
+        expert_quant="nowag",
+        model_type="qwen3_5_moe",
+        num_experts=2,
+        num_experts_per_tok=1,
+        hidden_size=12,
+        moe_intermediate_size=6,
+        norm_topk_prob=True,
+    )
+    layer = make_moe_layer(config, layer_id=0, renormalize=True)
+    x = torch.ones(1, 12, dtype=torch.bfloat16)
+    called = {}
+
+    def fake_routed(*args, **kwargs):
+        called.update(kwargs)
+        return x
+
+    monkeypatch.setattr(fused_nowag, "routed_experts_nowag", fake_routed)
+    cache = SimpleNamespace(
+        quant_format="nowag",
+        codebook=torch.zeros(4096, 6, dtype=torch.bfloat16),
+    )
+    views = tuple(torch.zeros(1, dtype=torch.bfloat16) for _ in range(9))
+
+    actual = layer._expert_gemm(
+        cache,
+        x,
+        torch.ones(1, 1, dtype=torch.float32),
+        torch.zeros(1, 1, dtype=torch.int32),
+        views=views,
+        n=None,
+        alphas=None,
+        is_prefill=False,
+    )
+
+    assert actual is x
+    assert called == {"model_type": "qwen3_5_moe", "swiglu_limit": None}
 
 
 def test_shared_codebook_is_not_part_of_the_per_expert_slot():
@@ -296,6 +465,96 @@ def test_dsv4_nowag_wrapper_compiles_on_cuda():
                 * weight
             ).to(torch.bfloat16)
         )
+    expected = torch.stack(route_output).reshape(3, 2, hidden).float().sum(1)
+    expected = expected.to(torch.bfloat16)
+
+    assert output.shape == hidden_states.shape
+    assert output.dtype == torch.bfloat16
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output) > 0
+    torch.testing.assert_close(output, expected, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qwen_nowag_wrapper_matches_plain_swiglu_on_cuda():
+    import torch.nn.functional as F
+
+    from freetoken.moe.fused_nowag import routed_experts_nowag
+    from nowag_vllm.ops import pack_assignments
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device="cpu").manual_seed(20260824)
+    num_experts = 4
+    hidden = intermediate = 128
+    codebook = (
+        torch.randn((4096, 6), generator=generator) * 0.5
+    ).to(device=device, dtype=torch.bfloat16)
+
+    def projection(out_features: int, in_features: int):
+        groups = (in_features + 5) // 6
+        ids = torch.randint(
+            0,
+            4096,
+            (num_experts, out_features, groups),
+            generator=generator,
+            dtype=torch.int64,
+        )
+        packed = torch.stack(
+            [pack_assignments(ids[expert], 12) for expert in range(num_experts)]
+        ).to(device)
+        input_norm = torch.ones(
+            (num_experts, in_features), dtype=torch.bfloat16, device=device
+        )
+        output_norm = torch.ones(
+            (num_experts, out_features), dtype=torch.bfloat16, device=device
+        )
+        dense = codebook[ids.to(device)].reshape(num_experts, out_features, -1)[
+            ..., :in_features
+        ].contiguous()
+        return (packed, input_norm, output_norm), dense
+
+    gate, dense_gate = projection(intermediate, hidden)
+    up, dense_up = projection(intermediate, hidden)
+    down, dense_down = projection(hidden, intermediate)
+    hidden_states = (
+        torch.randn((3, hidden), generator=generator) * 0.2
+    ).to(device=device, dtype=torch.bfloat16)
+    slots = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int32, device=device)
+    topk_weights = torch.tensor(
+        [[0.6, 0.4], [0.25, 0.75], [0.5, 0.5]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    output = routed_experts_nowag(
+        hidden_states,
+        slots,
+        topk_weights,
+        codebook,
+        *gate,
+        *up,
+        *down,
+        model_type="qwen3_5_moe",
+    )
+    torch.cuda.synchronize()
+
+    route_output = []
+    for token in range(slots.shape[0]):
+        for route in range(slots.shape[1]):
+            expert = int(slots[token, route])
+            gate_value = torch.mv(
+                dense_gate[expert].float(), hidden_states[token].float()
+            )
+            up_value = torch.mv(
+                dense_up[expert].float(), hidden_states[token].float()
+            )
+            middle = (F.silu(gate_value) * up_value).to(torch.bfloat16)
+            route_output.append(
+                (
+                    torch.mv(dense_down[expert].float(), middle.float())
+                    * topk_weights[token, route]
+                ).to(torch.bfloat16)
+            )
     expected = torch.stack(route_output).reshape(3, 2, hidden).float().sum(1)
     expected = expected.to(torch.bfloat16)
 

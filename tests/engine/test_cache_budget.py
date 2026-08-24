@@ -179,6 +179,24 @@ def test_adjust_config_selects_nowag_experts_for_dsv4_offload():
     assert cfg.moe_backend == "offload"
 
 
+def test_adjust_config_selects_nowag_experts_for_qwen_offload():
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(
+        nowag_expert_path="/data1/qwen-nowag",
+        attention_backend="triton",
+    )
+    cfg.model_config.dsv4_args = None
+    cfg.model_config.model_type = "qwen3_5_moe"
+    cfg.model_config.hidden_act = "silu"
+
+    _adjust_config(cfg)
+
+    assert cfg.model_config.expert_quant == "nowag"
+    assert cfg.model_config.nowag_expert_path == "/data1/qwen-nowag"
+    assert cfg.moe_backend == "offload"
+
+
 def test_adjust_config_rejects_nowag_cpu_or_hybrid():
     from freetoken.engine.engine import _adjust_config
 

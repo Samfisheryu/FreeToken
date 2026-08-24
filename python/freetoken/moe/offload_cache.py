@@ -75,8 +75,8 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # DeepSeek-V4 FP4: packed e2m1 codes + e8m0 per-32 block scales, no global scale
     # (4 banks). Read by DeepSeek-V4's own DS-FP4 grouped GEMV kernels via bank_views().
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
-    # DeepSeek-V4 NoWAG: three projections, each with packed assignments and
-    # input/output normalizers. The shared codebook is installed separately once.
+    # NoWAG: three projections, each with packed assignments and input/output
+    # normalizers. The model-wide shared codebook is installed separately once.
     "nowag": (
         "gate_assignments",
         "gate_input_norm",

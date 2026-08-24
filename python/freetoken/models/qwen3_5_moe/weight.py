@@ -837,8 +837,8 @@ def setup_offload_expert_banks(
     decode_target: str = "gpu", layer_sink=None,
 ):
     """Build the routed-expert offload banks. The qwen3_5_moe module always exports this hook,
-    so it intercepts *every* qwen3_5_moe offload load -- defer non-block-fp8 checkpoints (plain
-    BF16, or modelopt NVFP4) to the generic provider for that ``expert_quant``.
+    so it intercepts *every* qwen3_5_moe offload load -- defer every non-block-fp8 format
+    (plain BF16, modelopt NVFP4, or an expert-only NoWAG sidecar) to its generic provider.
 
     block-fp8 default ("fp8"): keep experts block-fp8 -- ``gate_up``/``down`` fp8 banks + their
     bf16 ``weight_scale_inv`` banks (half the host/cache bytes; routed rows are dequantized on
@@ -852,7 +852,9 @@ def setup_offload_expert_banks(
     GPU-tiled) bank layouts -- e.g. native ``nvfp4`` rows rather than marlin/b12x."""
     eq = getattr(model_config, "expert_quant", "none")
     if eq != "fp8_block":
-        from freetoken.moe.expert_banks import _PROVIDERS  # nvfp4 -> _nvfp4_banks, none -> _bf16_banks
+        # Includes nowag -> _nowag_banks; the original Qwen checkpoint still supplies
+        # attention, router, shared-expert, embedding, and lm-head weights.
+        from freetoken.moe.expert_banks import _PROVIDERS
 
         return _PROVIDERS[eq](model_path, model_config, device, dtype, dummy,
                               parallel=parallel, workers=workers, chunk=chunk,

@@ -280,15 +280,13 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
 
 
 def _nowag_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
-    if getattr(model_config, "dsv4_args", None) is None:
-        raise ValueError("the current NoWAG expert loader supports only DeepSeek-V4")
     if decode_target != "gpu":
         raise ValueError("NoWAG experts currently support only GPU offload")
     if dummy:
         raise ValueError("NoWAG experts require a completed quantization output")
     if layer_sink is not None:
         raise NotImplementedError("FTW conversion does not yet write NoWAG expert banks")
-    from freetoken.models.deepseek_v4.nowag import load_nowag_expert_sources
+    from freetoken.moe.nowag import load_nowag_expert_sources
 
     path = getattr(model_config, "nowag_expert_path", None)
     if not path:

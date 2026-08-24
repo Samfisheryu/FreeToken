@@ -481,8 +481,8 @@ def parse_args(
         "--nowag-expert-path",
         default=ServerArgs.nowag_expert_path,
         help=(
-            "Directory produced by the DeepSeek-V4 expert-only NoWAG quantizer. "
-            "The original --model path continues to provide all non-expert weights."
+            "Directory produced by an expert-only NoWAG quantizer. The original "
+            "--model path continues to provide all non-routed-expert weights."
         ),
     )
 
