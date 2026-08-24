@@ -7,6 +7,7 @@ import torch
 from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
+from freetoken.gpu_select import gpu_identity
 from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -70,6 +71,8 @@ class Scheduler(SchedulerIOMixin):
             else None
         )
         torch.cuda.set_stream(self.stream)
+        # sent on the readiness ack for /v1/stats gpus; a list so TP can add one entry per rank
+        self.gpus = [gpu_identity(self.device.index)] if self.device.type == "cuda" else []
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
