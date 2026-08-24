@@ -28,12 +28,19 @@ class RequestStatus:
 
 
 class LLM(Scheduler):
-    def __init__(self, model_path: str, dtype: torch.dtype = torch.bfloat16, **kwargs):
+    def __init__(
+        self,
+        model_path: str,
+        dtype: torch.dtype = torch.bfloat16,
+        distributed_port: int = 2333,
+        **kwargs,
+    ):
         config = SchedulerConfig(
             model_path=model_path,
             tp_info=DistributedInfo(0, 1),
             dtype=dtype,
             offline_mode=True,
+            distributed_port=distributed_port,
             **kwargs,
         )
         super().__init__(config)
