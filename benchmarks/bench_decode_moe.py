@@ -170,10 +170,29 @@ def get_json(url: str, timeout: float = 10) -> dict:
         return json.load(resp)
 
 
+def _port_pair_available(port: int) -> bool:
+    if port >= 65535:
+        return False
+    sockets = [socket.socket(), socket.socket()]
+    try:
+        sockets[0].bind(("127.0.0.1", port))
+        sockets[1].bind(("127.0.0.1", port + 1))
+        return True
+    except OSError:
+        return False
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    # FreeToken uses port+1 for its internal process group, so both ports must be free.
+    while True:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+        if _port_pair_available(port):
+            return port
 
 
 def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
