@@ -334,9 +334,10 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
+                # ``can_decode`` tracks launched forwards; overlap may already have advanced it
+                # for the ongoing batch. Length is reached only when this drained token fills
+                # the host-visible output budget. EOS and stop strings still win over length.
+                hit_length = req.input_ids.numel() == req.max_device_len
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                 )
