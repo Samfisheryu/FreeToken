@@ -213,7 +213,7 @@ def test_dsv4_wrapper_keeps_fp8_roundtrips_and_clamped_swiglu(monkeypatch):
         )
         assert kwargs["down_norm_placement"] == "down_prologue"
         assert kwargs["validate_route_ids"] is False
-        assert kwargs["align_routes"] is moe_align_block_size
+        assert callable(kwargs["align_routes"])
         assert kwargs["gate_codebook"] is kwargs["up_codebook"]
         assert kwargs["gate_codebook"] is kwargs["down_codebook"]
         rounded_input = kwargs["gate_up_input_transform"](
@@ -279,7 +279,7 @@ def test_qwen_wrapper_keeps_bf16_input_and_unclamped_swiglu(monkeypatch):
         assert kwargs["gate_up_input_transform"] is None
         assert kwargs["middle_transform"] is None
         assert kwargs["validate_route_ids"] is False
-        assert kwargs["align_routes"] is moe_align_block_size
+        assert callable(kwargs["align_routes"])
         assert kwargs["gate_codebook"] is kwargs["up_codebook"]
         assert kwargs["gate_codebook"] is kwargs["down_codebook"]
         return result

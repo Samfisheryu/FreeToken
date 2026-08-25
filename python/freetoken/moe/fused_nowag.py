@@ -52,17 +52,37 @@ def routed_experts_nowag(
         down_backend = backend_override
 
     try:
+        from nowag_vllm import cuda_ops as nowag_cuda_ops
         from nowag_vllm.moe_ops import nowag_fused_moe
     except ImportError as exc:
         raise RuntimeError("NoWAG serving requires the local nowag_vllm package") from exc
 
     from freetoken.kernel import moe_sum_reduce_triton
-    # NoWAG's smaller expert rows can make the auto-sized slot cache exceed the
-    # native sgl_kernel aligner's 1024-entry scan geometry. The in-tree Triton
-    # aligner has the same contract without that limit.
+    # Larger route sets retain the in-tree Triton aligner, which has no native
+    # sgl_kernel limit on the number of physical expert rows.
     from freetoken.kernel.triton.moe_align import (
         moe_align_block_size as moe_align_block_size_triton,
     )
+
+    def align_nowag_routes(
+        topk_ids: torch.Tensor,
+        block_size: int,
+        physical_expert_rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            topk_ids.numel() <= 256
+            and nowag_cuda_ops.has_moe_sparse_route_align()
+        ):
+            return nowag_cuda_ops.moe_sparse_route_align(
+                topk_ids=topk_ids,
+                block_size=block_size,
+                num_experts=physical_expert_rows,
+            )
+        return moe_align_block_size_triton(
+            topk_ids,
+            block_size,
+            physical_expert_rows,
+        )
 
     gate_up_input_transform = None
     middle_transform = None
@@ -132,7 +152,7 @@ def routed_experts_nowag(
         down_norm_placement=rule.down_norm_placement,
         gate_up_input_transform=gate_up_input_transform,
         middle_transform=middle_transform,
-        align_routes=moe_align_block_size_triton,
+        align_routes=align_nowag_routes,
         sum_routes=moe_sum_reduce_triton,
     )
 
