@@ -205,7 +205,7 @@ class M3SparseAttnBackend(BaseAttnBackend):
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         seqlens_q = [r.extend_len for r in reqs]
         seqlens_k = [r.device_len for r in reqs]
-        is_decode = getattr(batch, "phase", None) == "decode"
+        is_decode = batch.is_decode_only
         qo_indptr = torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
         kv_len = torch.tensor(seqlens_k, **_CPU_PINNED)
         last = (qo_indptr[1:].to(torch.int32) - 1).to(self.device, non_blocking=True)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Iterable, List, Tuple
 
 import torch
 from freetoken.core import Req
@@ -118,6 +118,16 @@ class CacheManager:
         Naive has no tree, so only the free-list counts."""
         tree = self.prefix_cache.swa_evictable_size if self.is_swa else 0
         return self.swa_pool.swa_available_size() + tree
+
+    def decode_swa_reservation(self, reqs: Iterable[Req]) -> int:
+        """SWA token slots needed by these requests' pending query rows this forward."""
+        if not self.swa_paged:
+            return 0
+        ps = self.page_size
+        return sum(
+            (div_ceil(req.device_len, ps) - div_ceil(req.cached_len, ps)) * ps
+            for req in reqs
+        )
 
     def ensure_swa_slots(self, n: int) -> None:
         """Free swa-pool slots until >= ``n`` are available by tombstoning LRU tree swa nodes

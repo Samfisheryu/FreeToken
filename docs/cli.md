@@ -43,7 +43,8 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
-| `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
+| `--max-prefill-length` | 8192 | Per-forward query-token budget; `mixed` spends it on decode rows first and gives the remainder to chunked prefill |
+| `--batching-policy` | legacy | `legacy` runs the original prefill-priority policy; `mixed` combines decode and chunked prefill in one forward |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
@@ -153,4 +154,3 @@ expert format + GPU name, so a profile from different hardware is ignored
 rather than misapplied. Selection flags: `--dtype`, `--model`, `--formats`,
 `--isa`; decision rule: `--threshold` (default 2.0 — recommend hybrid when CPU
 bandwidth > 2× PCIe).
-

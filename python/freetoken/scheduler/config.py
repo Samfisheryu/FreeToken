@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from freetoken.engine import EngineConfig
 
@@ -14,6 +15,7 @@ def _get_pid_suffix() -> str:
 @dataclass(frozen=True)
 class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
+    batching_policy: Literal["legacy", "mixed"] = "legacy"
     cache_type: str = "radix"
     offline_mode: bool = False
     decode_log_interval: int = 40

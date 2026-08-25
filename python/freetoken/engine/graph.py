@@ -41,7 +41,7 @@ class GraphCaptureBuffer:
         )
 
     def set_batch(self, batch: Batch) -> None:
-        from freetoken.attention.linear import FLAMetadata
+        from freetoken.attention.linear import FLAMetadata, FLAPathMetadata
 
         _slice = slice(batch.padded_size)
         bs = batch.padded_size
@@ -52,7 +52,10 @@ class GraphCaptureBuffer:
         # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
         batch.fla_metadata = FLAMetadata(
-            cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[_slice]
+            decode=FLAPathMetadata(
+                cu_seqlens=self.fla_cu_seqlens[: bs + 1],
+                cache_indices=self.table_idx[_slice],
+            )
         )
 
     def copy_from(self, batch: Batch) -> None:
@@ -160,7 +163,7 @@ class GraphRunner:
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
             graph = torch.cuda.CUDAGraph()
-            batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+            batch = Batch(reqs=[self.dummy_req] * bs, decode_size=bs)
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
@@ -187,7 +190,7 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        return batch.is_decode_only and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)

@@ -44,12 +44,14 @@ class FICaptureData(BaseCaptureData):
 
 
 @dataclass
-class FIMetadata(BaseAttnMetadata):
+class FIPathMetadata:
+    """FlashInfer plan and tensors for one homogeneous attention path."""
+
     # fmt: off
+    kind:                Literal["decode", "prefill"]
     cu_seqlens_q_cpu:   torch.Tensor  # on cpu
     cu_seqlens_k_cpu:   torch.Tensor  # on cpu
-    cu_seqlens_q_gpu:   torch.Tensor  # on gpu
-    indices:            torch.Tensor  # on gpu
+    indices:            torch.Tensor  # on backend device
     last_page_len_cpu:  torch.Tensor  # on cpu
     num_qo_heads:       int
     num_kv_heads:       int
@@ -58,7 +60,8 @@ class FIMetadata(BaseAttnMetadata):
     pos_encoding_mode:  str
     seq_lens_cpu:       torch.Tensor  # on cpu
     dtype:              torch.dtype
-    wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
+    num_query_tokens:   int
+    wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper | CUDAGraphBatchDecodeWithPagedKVCacheWrapper
     initialized:        bool = False
     # fmt: on
 
@@ -67,14 +70,21 @@ class FIMetadata(BaseAttnMetadata):
         assert (
             self.cu_seqlens_k_cpu.is_cpu
             and self.cu_seqlens_q_cpu.is_cpu
-            and self.cu_seqlens_q_gpu.is_cuda
-            and self.indices.is_cuda
             and self.last_page_len_cpu.is_cpu
             and self.seq_lens_cpu.is_cpu
         )
 
+
+@dataclass
+class FIMetadata(BaseAttnMetadata):
+    """Batch-level FlashInfer metadata with decode-first path views."""
+
+    query_indptr: torch.Tensor
+    decode: FIPathMetadata | None = None
+    prefill: FIPathMetadata | None = None
+
     def get_last_indices(self, bs: int) -> torch.Tensor:
-        return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
+        return self.query_indptr[1 : 1 + bs] - 1
 
 
 class FlashInferBackend(BaseAttnBackend):
@@ -126,16 +136,19 @@ class FlashInferBackend(BaseAttnBackend):
             backend="fa2",  # flashinfer fa3 is slow, use fa2 instead
         )
 
-        # NOTE: some hack to reuse the int_workspace_buffer
-        self.int_workspace_buffer = self.prefill_wrapper._int_workspace_buffer
-        self.decode_wrappers._int_workspace_buffer = self.int_workspace_buffer
+        # Eager prefill/decode plans must retain their own integer workspaces. CUDA-graph
+        # decode wrappers reuse the eager decode workspace below; graph and eager decode are
+        # mutually exclusive for a forward and the graph wrapper is replanned before replay.
+        self.int_workspace_buffer = self.decode_wrappers._int_workspace_buffer
 
         # initialize some data members
         tp_size = get_tp_info().size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
         self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
 
-        self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
+        self.cached_ones_cpu: torch.Tensor = torch.tensor(
+            [], dtype=torch.int32, pin_memory=self.device.type == "cuda"
+        )
         # for cuda graph
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
@@ -144,17 +157,15 @@ class FlashInferBackend(BaseAttnBackend):
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
-    def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
+    def _initialize_path_once(self, metadata: FIPathMetadata) -> None:
         if metadata.initialized:
             return
-
-        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
         metadata.initialized = True
         # FlashInfer planning reuses a pinned host staging buffer and launches an
         # async H2D copy. Wait here before the next plan mutates that host buffer.
         self.last_event.synchronize()
-        if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
+        if metadata.kind == "decode":
             metadata.wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
                 indices=metadata.indices,
@@ -189,12 +200,20 @@ class FlashInferBackend(BaseAttnBackend):
             )
         self.last_event.record()
 
+    def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
+        if metadata.decode is not None:
+            self._initialize_path_once(metadata.decode)
+        if metadata.prefill is not None:
+            self._initialize_path_once(metadata.prefill)
+
     def _get_ones_cpu(self, bs: int) -> torch.Tensor:
         if bs <= len(self.cached_ones_cpu):
             return self.cached_ones_cpu[:bs]
         # padding to next pow of 2
         next_len = _next_power_of_2(bs)
-        self.cached_ones_cpu = torch.ones(next_len, dtype=torch.int32, pin_memory=True)
+        self.cached_ones_cpu = torch.ones(
+            next_len, dtype=torch.int32, pin_memory=self.device.type == "cuda"
+        )
         return self.cached_ones_cpu[:bs]
 
     def forward(
@@ -220,43 +239,110 @@ class FlashInferBackend(BaseAttnBackend):
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
-        return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
-    def prepare_metadata(self, batch: Batch) -> None:
-        reqs = batch.padded_reqs
+        if metadata.decode is None:
+            assert metadata.prefill is not None
+            return metadata.prefill.wrapper.run(q=q, paged_kv_cache=kv_cache)
+        if metadata.prefill is None:
+            return metadata.decode.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
-        padded_size = len(reqs)
+        # Mixed batches are decode-first. FlashInfer supports writing directly into an
+        # output view, so both specialized kernels preserve token order without a cat/copy.
+        decode_tokens = metadata.decode.num_query_tokens
+        output = torch.empty_like(q)
+        metadata.decode.wrapper.run(
+            q=q[:decode_tokens],
+            paged_kv_cache=kv_cache,
+            out=output[:decode_tokens],
+        )
+        metadata.prefill.wrapper.run(
+            q=q[decode_tokens:],
+            paged_kv_cache=kv_cache,
+            out=output[decode_tokens:],
+        )
+        return output
+
+    def _build_path_metadata(
+        self,
+        reqs,
+        *,
+        kind: Literal["decode", "prefill"],
+        wrapper,
+        page_table: torch.Tensor,
+        cpu_kwargs: dict,
+    ) -> FIPathMetadata:
         seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
-        max_seqlen_q = max(seqlens_q)
-        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
-
-        device = self.device
-        seq_len_cpu = torch.tensor(seqlens_k, **CPU_KWARGS)
-        cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
-        if max_seqlen_q == 1:  # decode with all extend_len = 1
-            cu_seqlens_q_cpu = torch.arange(0, padded_size + 1, **CPU_KWARGS)
-        elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
+        seq_lens_cpu = torch.tensor(seqlens_k, **cpu_kwargs)
+        cu_seqlens_k_cpu = torch.tensor([0, *seqlens_k], **cpu_kwargs).cumsum_(0)
+        if kind == "decode":
+            cu_seqlens_q_cpu = torch.arange(len(reqs) + 1, **cpu_kwargs)
+        elif all(length == 0 for length in cached_lens):
             cu_seqlens_q_cpu = cu_seqlens_k_cpu
-        else:  # normal extend prefill, with partial cache hit
-            cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
+        else:
+            cu_seqlens_q_cpu = torch.tensor([0, *seqlens_q], **cpu_kwargs).cumsum_(0)
 
-        page_table = get_global_ctx().page_table
-        batch.attn_metadata = FIMetadata(
+        return FIPathMetadata(
+            kind=kind,
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
-            cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
-            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
-            last_page_len_cpu=self._get_ones_cpu(padded_size),
+            indices=torch.cat(
+                [page_table[req.table_idx, : req.device_len] for req in reqs]
+            ),
+            last_page_len_cpu=self._get_ones_cpu(len(reqs)),
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
             head_dim=self.config.head_dim,
             page_size=1,
             pos_encoding_mode="NONE",
-            seq_lens_cpu=seq_len_cpu,
+            seq_lens_cpu=seq_lens_cpu,
             dtype=self.kvcache.dtype,
-            wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
+            num_query_tokens=sum(seqlens_q),
+            wrapper=wrapper,
+        )
+
+    def prepare_metadata(self, batch: Batch) -> None:
+        page_table = get_global_ctx().page_table
+        cpu_kwargs = {
+            "device": "cpu",
+            "dtype": torch.int32,
+            "pin_memory": self.device.type == "cuda",
+        }
+        decode = None
+        prefill = None
+        if batch.has_decode:
+            decode_reqs = batch.padded_reqs if batch.is_decode_only else batch.decode_reqs
+            decode = self._build_path_metadata(
+                decode_reqs,
+                kind="decode",
+                wrapper=self.decode_wrappers,
+                page_table=page_table,
+                cpu_kwargs=cpu_kwargs,
+            )
+        if batch.has_prefill:
+            prefill = self._build_path_metadata(
+                batch.prefill_reqs,
+                kind="prefill",
+                wrapper=self.prefill_wrapper,
+                page_table=page_table,
+                cpu_kwargs=cpu_kwargs,
+            )
+
+        if decode is not None and prefill is not None:
+            query_lens = [req.extend_len for req in batch.reqs]
+            query_indptr_cpu = torch.tensor(
+                [0, *query_lens], **cpu_kwargs
+            ).cumsum_(0)
+        else:
+            path = decode if decode is not None else prefill
+            assert path is not None
+            query_indptr_cpu = path.cu_seqlens_q_cpu
+
+        batch.attn_metadata = FIMetadata(
+            query_indptr=query_indptr_cpu.to(self.device, non_blocking=True),
+            decode=decode,
+            prefill=prefill,
         )
 
     def reset_capture(self) -> None:
@@ -302,12 +388,15 @@ class FlashInferBackend(BaseAttnBackend):
         self.prepare_metadata(batch)
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
-        metadata.wrapper = self.graph_wrappers[bs]
+        assert metadata.decode is not None and metadata.prefill is None
+        metadata.decode.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
-        assert isinstance(metadata, FIMetadata) and not metadata.initialized
+        assert isinstance(metadata, FIMetadata)
+        assert metadata.decode is not None and metadata.prefill is None
+        assert not metadata.decode.initialized
         assert self.capture is not None and bs in self.capture_bs
-        metadata.wrapper = self.graph_wrappers[bs]
+        metadata.decode.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)

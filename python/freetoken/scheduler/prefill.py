@@ -251,6 +251,9 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            reserved_swa=self.cache_manager.decode_swa_reservation(
+                self.decode_manager.running_reqs
+            ),
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -283,7 +286,7 @@ class PrefillManager:
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
-        batch = Batch(reqs=reqs, phase="prefill")
+        batch = Batch(reqs=reqs, decode_size=0)
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens
         batch.prompt_admissions = prompt_admissions
@@ -295,6 +298,10 @@ class PrefillManager:
                 self.pending_list.pop(i)
                 return req.chunked_req
         return None
+
+    @property
+    def requires_exclusive_batch(self) -> bool:
+        return any(req.mm_embeds is not None for req in self.pending_list)
 
     @property
     def runnable(self) -> bool:

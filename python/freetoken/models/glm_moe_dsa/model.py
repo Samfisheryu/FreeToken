@@ -34,7 +34,7 @@ class GlmFp8LMHead(ParallelLMHead):
         from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
 
         batch = get_global_ctx().batch
-        if batch.is_prefill:
+        if batch.uses_extend_path:
             indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
         return fp8_pertensor_linear(x, self.weight, self.weight_scale)

@@ -645,6 +645,7 @@ def test_triton_backend_stores_kv_and_matches_reference(monkeypatch):
 
     backend = TritonAttentionBackend(SimpleNamespace())
     batch = SimpleNamespace(
+        is_decode_only=True,
         padded_reqs=[
             SimpleNamespace(extend_len=1, device_len=2, cached_len=1, table_idx=0),
             SimpleNamespace(extend_len=1, device_len=2, cached_len=1, table_idx=1),
@@ -711,6 +712,7 @@ def test_triton_backend_replay_metadata_uses_capture_buffers(monkeypatch):
     assert capture_metadata.q_positions.data_ptr() == backend.capture.positions.data_ptr()
 
     runtime_batch = SimpleNamespace(
+        is_decode_only=True,
         padded_size=2,
         padded_reqs=[
             SimpleNamespace(extend_len=1, device_len=3, cached_len=2, table_idx=0),
@@ -767,6 +769,7 @@ def test_triton_metadata_keeps_full_indices_and_optional_swa_indices(monkeypatch
 
     backend = TritonAttentionBackend(SimpleNamespace())
     batch = SimpleNamespace(
+        is_decode_only=False,
         padded_reqs=[
             SimpleNamespace(extend_len=1, device_len=2, cached_len=1, table_idx=0),
             SimpleNamespace(extend_len=2, device_len=3, cached_len=1, table_idx=1),

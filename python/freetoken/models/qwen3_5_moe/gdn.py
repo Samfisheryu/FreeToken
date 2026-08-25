@@ -144,6 +144,59 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
+    def _run_decode(
+        self, conv_in: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+        pool, li: int, fla, dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Run the fused single-token conv and recurrence for a decode sub-batch."""
+        mixed = self._conv_decode(conv_in, fla.cache_indices, pool)
+        size = mixed.shape[0]
+        qf, kf, vf = torch.split(
+            mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        )
+        q = qf.reshape(1, size, self.num_k_heads, self.head_k_dim).to(dtype)
+        k = kf.reshape(1, size, self.num_k_heads, self.head_k_dim).to(dtype)
+        v = vf.reshape(1, size, self.num_v_heads, self.head_v_dim).to(dtype)
+        return gdn_decode_fla(
+            q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
+            state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+            cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+        )
+
+    def _run_prefill(
+        self, conv_in: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+        pool, li: int, fla, dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Run varlen conv and chunked recurrence for a prefill sub-batch."""
+        mixed = self._conv_prefill(
+            conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state
+        )
+        size = mixed.shape[0]
+        qf, kf, vf = torch.split(
+            mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        )
+        q = qf.reshape(1, size, self.num_k_heads, self.head_k_dim).to(dtype)
+        k = kf.reshape(1, size, self.num_k_heads, self.head_k_dim).to(dtype)
+        v = vf.reshape(1, size, self.num_v_heads, self.head_v_dim).to(dtype)
+        g, beta = self._gate_params(a, b)
+        g = g.reshape(1, size, self.num_v_heads)
+        beta = beta.float().reshape(1, size, self.num_v_heads)
+        # The chunk kernel reads and writes state_source[cache_indices] in place.
+        if fla.fresh_state_indices is not None:
+            pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
+        track = fla.track_dst is not None
+        result = gdn_prefill_chunk_fla(
+            q, k, v, g, beta,
+            state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+            cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+            return_h=track,
+        )
+        if not track:
+            return result
+        core_out, h = result
+        self._write_track_snapshot(pool, li, conv_in, h, fla)
+        return core_out
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -172,48 +225,22 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
-            # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
-            # per-request state read/write-by-index, all in one kernel (no gather/scatter,
-            # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
-            B = mixed.shape[0]
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
-            core_out = gdn_decode_fla(
-                q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+        if batch.is_decode_only:
+            assert fla.decode is not None
+            core_out = self._run_decode(conv_in, a, b, pool, li, fla.decode, dtype)
+        elif batch.is_mixed:
+            assert fla.decode is not None and fla.prefill is not None
+            split = batch.decode_size
+            decode_out = self._run_decode(
+                conv_in[:split], a[:split], b[:split], pool, li, fla.decode, dtype
             )
+            prefill_out = self._run_prefill(
+                conv_in[split:], a[split:], b[split:], pool, li, fla.prefill, dtype
+            )
+            core_out = torch.cat((decode_out, prefill_out), dim=0)
         else:
-            mixed = self._conv_prefill(
-                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
-            # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
-            g, beta = self._gate_params(a, b)
-            g = g.reshape(1, total, self.num_v_heads)
-            beta = beta.float().reshape(1, total, self.num_v_heads)
-            # The chunk kernel reads + writes back initial_state[cache_indices] in place;
-            # fresh sequences (cached_len==0) must start from a zeroed slot.
-            if fla.fresh_state_indices is not None:
-                pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
-            track = fla.track_dst is not None
-            result = gdn_prefill_chunk_fla(
-                q, k, v, g, beta,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                return_h=track,
-            )
-            if track:
-                core_out, h = result
-                self._write_track_snapshot(pool, li, conv_in, h, fla)
-            else:
-                core_out = result
+            assert fla.prefill is not None
+            core_out = self._run_prefill(conv_in, a, b, pool, li, fla.prefill, dtype)
 
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)

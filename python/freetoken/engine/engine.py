@@ -921,7 +921,7 @@ class Engine:
                     sampling_params=None,  # type: ignore[arg-type]
                     cache_handle=None,  # type: ignore[arg-type]
                 )
-                batch = Batch(reqs=[warm_req], phase="prefill")
+                batch = Batch(reqs=[warm_req], decode_size=0)
                 batch.padded_reqs = batch.reqs
                 batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
                 batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)

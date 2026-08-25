@@ -29,6 +29,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .mixed_batch import LegacyBatchComposer, MixedBatchComposer
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -87,6 +88,16 @@ class Scheduler(SchedulerIOMixin):
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
+        )
+        if config.batching_policy == "legacy":
+            composer_cls = LegacyBatchComposer
+        elif config.batching_policy == "mixed":
+            composer_cls = MixedBatchComposer
+        else:
+            raise ValueError(f"Unknown batching policy: {config.batching_policy!r}")
+        self.batch_composer = composer_cls(
+            prefill_manager=self.prefill_manager,
+            decode_manager=self.decode_manager,
         )
 
         # some alias for easy access
@@ -374,7 +385,7 @@ class Scheduler(SchedulerIOMixin):
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
+                elif i >= batch.decode_size and req.table_idx != -1:
                     # for prefill, non-chunk req, cache the prefix.
                     # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
                     # the generic manager inserts the prefix into its radix/naive cache.
@@ -585,9 +596,9 @@ class Scheduler(SchedulerIOMixin):
         (first chunk only). MUST run on the ENGINE stream so it is program-ordered after the
         prior batch's snapshot writes and before this forward reads the live slot."""
         pool = self.engine.linear_state_pool
-        if pool is None or not batch.is_prefill:
+        if pool is None or not batch.has_prefill:
             return
-        for req in batch.reqs:
+        for req in batch.prefill_reqs:
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
@@ -760,30 +771,30 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
-        if batch.is_decode:
+        if batch.has_decode:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
             # footprint during decode. (no-op unless the model is SWA / paged swa pool.)
             self.cache_manager.maybe_free_swa_out_of_window(
-                batch.reqs, forward_iter=self._forward_iter)
-            for req in batch.reqs:
+                batch.decode_reqs, forward_iter=self._forward_iter)
+            for req in batch.decode_reqs:
                 req.decode_batch_idx += 1
-        else:
+        if batch.has_prefill:
             # Prefill sibling of the decode driver: free out-of-window swa BEFORE allocating
             # this chunk, so a chunked prompt longer than the swa pool never accumulates its
             # whole swa footprint (which would exhaust alloc_swa). No-op unless SWA/paged.
-            self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
+            self.cache_manager.free_swa_out_of_window_extend(batch.prefill_reqs)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
-        if batch.is_prefill:
+        if batch.has_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
         if self.engine.linear_state_pool is not None:
-            if batch.is_decode:
+            if batch.is_decode_only:
                 # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
                 # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
                 # NOT on whether any padded req has a linear_slot_idx -- the persistent dummy
@@ -804,7 +815,7 @@ class Scheduler(SchedulerIOMixin):
             # built once here instead of rebuilt in each of the 30 GDN layers. For decode
             # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
             batch.fla_metadata = build_fla_metadata(batch, self.device)
-        if batch.is_decode:
+        if batch.is_decode_only:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
@@ -817,21 +828,17 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
+        """Concatenate prefill requests' vision soft tokens in request order so the
+        model can scatter them at image-token positions. ``req.mm_embeds``
         is kept (not cleared) so the cache manager can recognize multimodal requests and
         keep them out of the shared prefix cache (image placeholders share a token id but
         carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
+        parts = [req.mm_embeds for req in batch.prefill_reqs if req.mm_embeds is not None]
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        batch = self.batch_composer.schedule_next_batch(self.prefill_budget)
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)
@@ -844,7 +851,7 @@ class Scheduler(SchedulerIOMixin):
         ``send_result`` is rank-aware: TP rank 0 forwards the signal, other ranks are
         no-ops. The offline handler explicitly ignores this online-accounting message.
         """
-        if not batch.is_prefill or not batch.prompt_admissions:
+        if not batch.prompt_admissions:
             return
         self.send_result(
             [
@@ -864,8 +871,8 @@ class Scheduler(SchedulerIOMixin):
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
-        if self.toolcall_anchor_id is not None and not batch.is_prefill:
-            self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        if self.toolcall_anchor_id is not None and batch.has_decode:
+            self.cache_manager.snapshot_toolcall_anchor(batch.decode_reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)

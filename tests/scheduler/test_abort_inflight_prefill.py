@@ -107,7 +107,7 @@ def test_abort_inflight_final_chunk_marks_then_drains():
     pool, cm, tm, dm, _pm, sent, stub = _setup()
     req = _launch_req(pool, cm, tm, torch.arange(1, 13, dtype=torch.int32),
                       track_seqlen=8)
-    batch = Batch(reqs=[req], phase="prefill")
+    batch = Batch(reqs=[req], decode_size=0)
     dm.filter_reqs(batch.reqs)                  # _forward: joins running_reqs at launch
     stub._last_data = _as_last_data(batch)      # overlap_loop exposes the un-drained batch
 
@@ -137,7 +137,7 @@ def test_abort_inflight_intermediate_chunk_marks_then_drains():
                          sampling_params=SamplingParams(max_tokens=4))
     pending.chunked_req = chunk
     pm.pending_list = [pending]
-    batch = Batch(reqs=[chunk], phase="prefill")
+    batch = Batch(reqs=[chunk], decode_size=0)
     stub._last_data = _as_last_data(batch)
 
     Scheduler._process_one_msg(stub, AbortBackendMsg(uid=UID))
@@ -176,7 +176,7 @@ def test_prefix_commit_sentinel_guard():
     pool, cm, tm, dm, _pm, sent, stub = _setup()
     req = _launch_req(pool, cm, tm, torch.arange(1, 13, dtype=torch.int32),
                       track_seqlen=8)
-    batch = Batch(reqs=[req], phase="prefill")
+    batch = Batch(reqs=[req], decode_size=0)
     dm.filter_reqs(batch.reqs)
 
     aborted = dm.abort_req(UID)
@@ -211,14 +211,14 @@ def test_post_terminal_overlap_step_is_dropped():
                       track_seqlen=8)
     dm.filter_reqs([req])
 
-    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="prefill")))
+    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], decode_size=0)))
     assert req in stub.finished_reqs and req.table_idx == -1
     terminal = [m for m in sent if isinstance(m, DetokenizeMsg)]
     assert len(terminal) == 1 and terminal[0].finished
 
     # The overlap extra step: the same req sits in the next batch's drain.
     output_len_before = req.output_len
-    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="decode")))
+    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], decode_size=1)))
     assert [m for m in sent if isinstance(m, DetokenizeMsg)] == terminal  # no 2nd msg
     assert req.output_len == output_len_before                           # no append
     cm.check_integrity()

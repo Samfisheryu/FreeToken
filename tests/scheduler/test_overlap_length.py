@@ -88,7 +88,7 @@ def test_overlap_length_keeps_the_last_launched_token():
     scheduler, decode_manager, sent, freed = _scheduler()
     req = _request(max_tokens=3)
 
-    last_batch = Batch(reqs=[req], phase="prefill")
+    last_batch = Batch(reqs=[req], decode_size=0)
     _launch(last_batch, decode_manager)
 
     # Each overlap iteration launches ongoing first, then settles last_batch.
@@ -123,7 +123,7 @@ def test_non_overlap_length_still_returns_exact_budget():
     scheduler, decode_manager, sent, freed = _scheduler()
     req = _request(max_tokens=3)
 
-    batch = Batch(reqs=[req], phase="prefill")
+    batch = Batch(reqs=[req], decode_size=0)
     for token in (101, 102, 103):
         _launch(batch, decode_manager)
         _drain(scheduler, batch, token)
@@ -141,7 +141,7 @@ def test_overlap_eos_still_wins_and_drops_speculative_next_token():
     scheduler, decode_manager, sent, freed = _scheduler(eos_token_ids={42})
     req = _request(max_tokens=3)
 
-    last_batch = Batch(reqs=[req], phase="prefill")
+    last_batch = Batch(reqs=[req], decode_size=0)
     _launch(last_batch, decode_manager)
     ongoing_batch = decode_manager.schedule_next_batch()
     assert ongoing_batch is not None
@@ -162,7 +162,7 @@ def test_stop_string_still_wins_when_it_meets_the_length_limit():
     scheduler, decode_manager, sent, freed = _scheduler()
     req = _request(max_tokens=1, stop_strs=["END"])
     scheduler._match_stop_str = lambda _req: "END"
-    batch = Batch(reqs=[req], phase="prefill")
+    batch = Batch(reqs=[req], decode_size=0)
 
     _launch(batch, decode_manager)
     _drain(scheduler, batch, 77)

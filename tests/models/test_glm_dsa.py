@@ -290,6 +290,7 @@ def test_backend_ragged_prefill_identity_and_selection():
                        hist_loc, 0)
 
     batch = SimpleNamespace(reqs=reqs, positions=positions, out_loc=out_loc,
+                            is_decode_only=False,
                             active_table_idx=None, attn_metadata=None)
     backend.prepare_metadata(batch)
 
@@ -335,8 +336,9 @@ def test_backend_ragged_prefill_identity_and_selection():
     ctx_d.page_table.copy_(ctx.page_table)
     for lid in (0, 1):
         ctx_d.kv_cache._kv_buffer.copy_(pool._kv_buffer)
-    batch_d = SimpleNamespace(reqs=reqs, positions=positions, out_loc=out_loc,
-                              active_table_idx=None, attn_metadata=None)
+        batch_d = SimpleNamespace(reqs=reqs, positions=positions, out_loc=out_loc,
+                                  is_decode_only=False,
+                                  active_table_idx=None, attn_metadata=None)
     backend_d.prepare_metadata(batch_d)
     od = backend_d.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch_d, indexer_qkw=None)
     slab_d = ctx_d.kv_cache.latent_rows(0)

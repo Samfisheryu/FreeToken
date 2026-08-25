@@ -123,11 +123,10 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         seqlens_q = [r.extend_len for r in reqs]
         seqlens_k = [r.device_len for r in reqs]
-        # Follow the BATCH PHASE, not a max(extend)==1 heuristic: a fully radix-hit
-        # prompt arrives as a 1-token PREFILL batch, and the scheduler only stages
-        # active_table_idx (which the decode path's addressing requires) for
-        # phase == "decode". The prefill path handles extend_len == 1 fine.
-        is_decode = getattr(batch, "phase", None) == "decode"
+        # Follow the execution path, not a max(extend)==1 heuristic: a fully radix-hit
+        # prompt arrives as a 1-token extend, and the scheduler only stages
+        # active_table_idx (which decode addressing requires) for pure decode.
+        is_decode = batch.is_decode_only
         qo_indptr = torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
         kv_len = torch.tensor(seqlens_k, **_CPU_PINNED)
         last = (qo_indptr[1:].to(torch.int32) - 1).to(self.device, non_blocking=True)

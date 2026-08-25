@@ -225,7 +225,7 @@ class TritonAttentionBackend(BaseAttnBackend):
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
         num_query_tokens = sum(seqlens_q)
-        is_decode = max(seqlens_q) == 1
+        is_decode = batch.is_decode_only
         prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
 
         indptr = torch.tensor([0] + seqlens_k, dtype=torch.int32, device=device).cumsum_(0)

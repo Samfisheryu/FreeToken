@@ -10,16 +10,12 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class FLAMetadata:
-    """Per-forward GatedDeltaNet (flash-linear-attention) metadata, built once per
-    forward and shared by every GDN layer -- mirrors ``BaseAttnMetadata``. Replaces the
-    per-layer rebuilds the GDN op used to do (``cu_seqlens`` arange, per-request
-    ``cache_indices``/``has_initial_state``), which were pageable, synchronous H2D copies
-    issued in each of the 30 GDN layers.
+class FLAPathMetadata:
+    """Metadata for one homogeneous GDN execution path.
 
     Fields:
-      cu_seqlens          query indptr; decode = arange(bs+1) (1 token/req), prefill =
-                          cumsum of extend_len. int32 on device.
+      cu_seqlens          query indptr; decode = arange(bs+1) (1 token/request), prefill =
+                          cumsum of extend_len.
       cache_indices       per-request recurrent/conv state slot (= Req.table_idx). int32.
       has_initial_state   prefill only: whether each request continues a cached prefix
                           (cached_len > 0). None for decode (state always present).
@@ -43,50 +39,76 @@ class FLAMetadata:
     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
 
 
-def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
-    """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D
-    (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
-    stalling it.
+@dataclass
+class FLAMetadata:
+    """Per-forward GDN metadata, built once and shared by every GDN layer.
 
-    Decode is one token per request, so ``cu_seqlens`` is a plain ``arange(bs+1)`` and
-    ``cache_indices`` is ``batch.linear_table_idx`` (already int32) -- reused as-is. Under
-    CUDA graph the decode ``FLAMetadata`` is instead built directly in
-    ``GraphCaptureBuffer.set_batch`` against the persistent buffers (stable addresses); this
-    builder serves the eager scheduler path and direct-op test callers.
+    Decode and prefill use different kernels. A mixed forward therefore carries one
+    metadata view for each sub-batch instead of forcing its one-token decode sequences
+    through the chunked prefill path.
     """
-    reqs = batch.padded_reqs
-    pin = {"device": "cpu", "pin_memory": True}
+
+    decode: FLAPathMetadata | None = None
+    prefill: FLAPathMetadata | None = None
+
+
+def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
+    """Build decode/prefill GDN views for one forward.
+
+    Host-built fields use pinned staging and non-blocking H2D, matching the input and
+    attention-metadata path. Decode-only CUDA graphs install their persistent decode view
+    directly in ``GraphCaptureBuffer.set_batch`` instead.
+    """
+    pin = {"device": "cpu", "pin_memory": device.type == "cuda"}
 
     # GDN state slot per request: the hybrid-radix live slot (decoupled from table_idx) when
     # allocated, else table_idx (naive / force-naive GDN models keep the old keying).
     def gdn_slot(r):
         return r.linear_slot_idx if r.linear_slot_idx is not None else r.table_idx
 
-    if batch.is_decode:
-        bs = len(reqs)
-        cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
+    def build_decode(reqs, cache_indices=None):
+        cu_seqlens = torch.arange(len(reqs) + 1, dtype=torch.int32, device=device)
+        if cache_indices is None:
+            idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
+            cache_indices = idx_host.to(device, non_blocking=True)
+        return FLAPathMetadata(cu_seqlens=cu_seqlens, cache_indices=cache_indices)
+
+    def build_prefill(reqs):
+        lens = [r.extend_len for r in reqs]
+        cu_host = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0)
+        idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
+        has_init_host = torch.tensor(
+            [r.cached_len > 0 for r in reqs], dtype=torch.bool, **pin
+        )
+        fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
+        fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
+        track_dst, track_h_row, track_conv_src = _build_track_metadata(
+            reqs, cu_host, device, pin
+        )
+        return FLAPathMetadata(
+            cu_seqlens=cu_host.to(device, non_blocking=True),
+            cache_indices=idx_host.to(device, non_blocking=True),
+            has_initial_state=has_init_host.to(device, non_blocking=True),
+            fresh_state_indices=(
+                fresh_host.to(device, non_blocking=True) if fresh_host is not None else None
+            ),
+            track_dst=track_dst,
+            track_h_row=track_h_row,
+            track_conv_src=track_conv_src,
+        )
+
+    if batch.is_decode_only:
         # the scheduler stages linear_table_idx from gdn_slot (decode), reused as-is here
         assert batch.linear_table_idx is not None
-        return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=batch.linear_table_idx)
+        return FLAMetadata(
+            decode=build_decode(batch.padded_reqs, batch.linear_table_idx)
+        )
 
-    # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.
-    lens = [r.extend_len for r in reqs]
-    cu_host = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0)
-    idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
-    has_init_host = torch.tensor([r.cached_len > 0 for r in reqs], dtype=torch.bool, **pin)
-    fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
-    fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
-
-    track_dst, track_h_row, track_conv_src = _build_track_metadata(reqs, cu_host, device, pin)
-
+    decode = build_decode(batch.decode_reqs) if batch.has_decode else None
+    prefill = build_prefill(batch.prefill_reqs) if batch.has_prefill else None
     return FLAMetadata(
-        cu_seqlens=cu_host.to(device, non_blocking=True),
-        cache_indices=idx_host.to(device, non_blocking=True),
-        has_initial_state=has_init_host.to(device, non_blocking=True),
-        fresh_state_indices=(
-            fresh_host.to(device, non_blocking=True) if fresh_host is not None else None
-        ),
-        track_dst=track_dst, track_h_row=track_h_row, track_conv_src=track_conv_src,
+        decode=decode,
+        prefill=prefill,
     )
 
 
@@ -126,4 +148,4 @@ def _build_track_metadata(reqs, cu_host, device, pin):
             to(conv_src, dtype=torch.int64))
 
 
-__all__ = ["FLAMetadata", "build_fla_metadata"]
+__all__ = ["FLAMetadata", "FLAPathMetadata", "build_fla_metadata"]

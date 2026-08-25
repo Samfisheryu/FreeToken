@@ -62,7 +62,7 @@ def _decode_batch(rows, positions):
             output_len=1, uid=i, sampling_params=SamplingParams(), cache_handle=None)
         for i, t in enumerate(rows)
     ]
-    batch = Batch(reqs=reqs, phase="decode")
+    batch = Batch(reqs=reqs, decode_size=len(reqs))
     batch.padded_reqs = reqs
     batch.active_table_idx = torch.tensor(rows, dtype=torch.int64)
     batch.positions = torch.tensor(positions, dtype=torch.int64)
@@ -92,7 +92,7 @@ def test_prefill_metadata_has_no_snapshot():
     backend, _, _ = _stack()
     reqs = [Req(input_ids=torch.zeros(5, dtype=torch.int32), table_idx=1, cached_len=0,
                 output_len=1, uid=0, sampling_params=SamplingParams(), cache_handle=None)]
-    batch = Batch(reqs=reqs, phase="prefill")
+    batch = Batch(reqs=reqs, decode_size=0)
     batch.padded_reqs = reqs
     backend.prepare_metadata(batch)
     assert batch.attn_metadata.full_snap is None
@@ -110,12 +110,30 @@ def test_prefill_metadata_carries_segments():
         Req(input_ids=torch.zeros(5, dtype=torch.int32), table_idx=1, cached_len=0,
             output_len=1, uid=1, sampling_params=SamplingParams(), cache_handle=None),
     ]
-    batch = Batch(reqs=reqs, phase="prefill")
+    batch = Batch(reqs=reqs, decode_size=0)
     batch.padded_reqs = reqs
     backend.prepare_metadata(batch)
     md = batch.attn_metadata
     assert md.segments == [(0, 44, 2, 256), (44, 5, 1, 0)]
     assert int(md.get_last_indices(2)[0]) == 43 and int(md.get_last_indices(2)[1]) == 48
+
+
+def test_mixed_metadata_carries_decode_and_prefill_segments():
+    backend, _, _ = _stack()
+    reqs = [
+        Req(input_ids=torch.zeros(257, dtype=torch.int32), table_idx=2, cached_len=256,
+            output_len=1, uid=0, sampling_params=SamplingParams(), cache_handle=None),
+        Req(input_ids=torch.zeros(5, dtype=torch.int32), table_idx=1, cached_len=0,
+            output_len=1, uid=1, sampling_params=SamplingParams(), cache_handle=None),
+    ]
+    batch = Batch(reqs=reqs, decode_size=1)
+    batch.padded_reqs = reqs
+
+    backend.prepare_metadata(batch)
+
+    md = batch.attn_metadata
+    assert md.segments == [(0, 1, 2, 256), (1, 5, 1, 0)]
+    assert md.get_last_indices(2).tolist() == [0, 5]
 
 
 def test_staging_width_tracks_the_engine_ceiling():

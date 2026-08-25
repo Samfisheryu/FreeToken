@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
@@ -112,7 +112,11 @@ class Req:
 @dataclass
 class Batch:
     reqs: List[Req]
-    phase: Literal["prefill", "decode"]
+    # Real requests are kept in one stable layout: decode first, then prefill. This
+    # separates each request's lifecycle role from the execution path selected for the
+    # whole forward. A batch containing any prefill rows uses the ragged extend path;
+    # only a decode-only batch is eligible for the specialized decode/CUDA-graph path.
+    decode_size: int = 0
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
@@ -133,12 +137,12 @@ class Batch:
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
-    # concatenated multimodal soft-token embeddings for a prefill batch (or None)
+    # concatenated multimodal soft-token embeddings for this batch's prefill subset (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the
-    # PrefillManager; 0 on decode batches.
+    # PrefillManager; 0 when the batch has no prefill requests.
     log_new_tokens: int = field(default=0, init=False)
     log_cached_tokens: int = field(default=0, init=False)
     # (uid, complete prompt length, prefix-cache hit) for requests entering their first
@@ -147,13 +151,36 @@ class Batch:
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
 
-    @property
-    def is_prefill(self) -> bool:
-        return self.phase == "prefill"
+    def __post_init__(self) -> None:
+        assert 0 <= self.decode_size <= len(self.reqs)
 
     @property
-    def is_decode(self) -> bool:
-        return self.phase == "decode"
+    def decode_reqs(self) -> List[Req]:
+        return self.reqs[: self.decode_size]
+
+    @property
+    def prefill_reqs(self) -> List[Req]:
+        return self.reqs[self.decode_size :]
+
+    @property
+    def has_decode(self) -> bool:
+        return self.decode_size > 0
+
+    @property
+    def has_prefill(self) -> bool:
+        return self.decode_size < len(self.reqs)
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.has_decode and self.has_prefill
+
+    @property
+    def is_decode_only(self) -> bool:
+        return self.has_decode and not self.has_prefill
+
+    @property
+    def uses_extend_path(self) -> bool:
+        return self.has_prefill
 
     @property
     def size(self) -> int:

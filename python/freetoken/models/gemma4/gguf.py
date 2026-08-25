@@ -331,7 +331,7 @@ class GGUFTiedLMHead:
         from freetoken.layers.gguf import fused_mul_mat_gguf
 
         batch = get_global_ctx().batch
-        if batch.is_prefill:
+        if batch.uses_extend_path:
             indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
         return fused_mul_mat_gguf(x, self._embedding.qweight, self._quant_type)

@@ -35,7 +35,7 @@ class SchedulerStatusReporter:
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
     ) -> None:
-        if batch.is_prefill:
+        if batch.has_prefill:
             self._report_prefill(
                 batch,
                 running_reqs=running_reqs,
@@ -45,7 +45,7 @@ class SchedulerStatusReporter:
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
             )
-        elif batch.is_decode:
+        if batch.has_decode:
             self._report_decode(
                 batch,
                 running_reqs=running_reqs,
@@ -78,8 +78,8 @@ class SchedulerStatusReporter:
         cached_tokens = batch.log_cached_tokens
         input_throughput = new_tokens / gap if gap > 0 else 0.0
         self.log(
-            f"Prefill batch, "
-            f"#new-seq: {len(batch.reqs)}, "
+            f"{'Mixed' if batch.is_mixed else 'Prefill'} batch, "
+            f"#new-seq: {len(batch.prompt_admissions)}, "
             f"#new-token: {new_tokens}, "
             f"#cached-token: {cached_tokens}, "
             f"token usage: {_usage_ratio(kv_used_pages, kv_total_pages):.2f}, "
@@ -103,7 +103,7 @@ class SchedulerStatusReporter:
         swa_tokens: tuple[int, int] | None = None,
     ) -> None:
         self._decode_forward_count += 1
-        self._decode_generated_tokens += len(batch.reqs)
+        self._decode_generated_tokens += len(batch.decode_reqs)
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 

@@ -311,6 +311,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--batching-policy",
+        type=str,
+        choices=["legacy", "mixed"],
+        default=ServerArgs.batching_policy,
+        help=(
+            "Batch scheduling policy: legacy runs prefill before decode; mixed combines "
+            "decode with chunked prefill in one forward."
+        ),
+    )
+
+    parser.add_argument(
         "--decode-log-interval",
         type=_positive_int,
         default=ServerArgs.decode_log_interval,

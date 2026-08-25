@@ -59,6 +59,22 @@ def _req(prompt_len: int, n_decode: int) -> Req:
     return r
 
 
+def test_decode_swa_reservation_counts_only_page_crossings():
+    cm = CacheManager.__new__(CacheManager)
+    cm.swa_paged = True
+    cm.page_size = 8
+    reqs = [
+        SimpleNamespace(cached_len=7, device_len=8),
+        SimpleNamespace(cached_len=8, device_len=9),
+        SimpleNamespace(cached_len=15, device_len=16),
+        SimpleNamespace(cached_len=16, device_len=17),
+    ]
+
+    assert cm.decode_swa_reservation(reqs) == 16
+    cm.swa_paged = False
+    assert cm.decode_swa_reservation(reqs) == 0
+
+
 def _run_lifecycle(cm: CacheManager, total_len: int, n_decode: int = 3,
                    abort_after: int | None = None) -> None:
     """Faithful scheduler order: match -> lock -> [extend-free, allocate, complete_one]* ->

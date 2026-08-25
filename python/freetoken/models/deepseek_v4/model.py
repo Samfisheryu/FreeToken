@@ -266,7 +266,7 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         batch = get_global_ctx().batch
         input_ids = batch.input_ids.long()
         md = batch.attn_metadata
-        if batch.is_prefill:
+        if batch.uses_extend_path:
             # Ragged batched prefill (bs >= 1): each request starts from its own cached_len.
             # A cold segment (start_pos == 0) re-seeds the compressor carry register inside its
             # own attention segment; a radix hit / chunk continuation (start_pos > 0) resumes it
