@@ -71,6 +71,7 @@ def _setup():
         _pending_abort_acks=set(),
         _last_data=None,
         _abort_layered_wave=lambda uid: None,
+        _abort_joint_wave=lambda uid: None,
     )
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
     return pool, cm, tm, dm, pm, sent, stub

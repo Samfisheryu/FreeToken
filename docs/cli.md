@@ -44,7 +44,10 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Per-forward query-token budget; `mixed` spends it on decode rows first and gives the remainder to chunked prefill |
-| `--batching-policy` | legacy | `legacy` runs the original prefill-priority policy; `mixed` combines decode and chunked prefill in one forward |
+| `--batching-policy` | legacy | `legacy` prioritizes prefill; `mixed` combines decode with one prefill chunk; `layered` runs separate decode and layer-group prefill forwards; `joint` carries decode with a bounded set of prefill chunks through resident layer groups |
+| `--prefill-layer-group-size` | 2 | Requested consecutive decoder layers per `layered`/`joint` group; `joint` reduces it when the MoE cache cannot retain the group plus one expert layer for decode |
+| `--prefill-wave-max-chunks` | 4 | Maximum prompt chunks retained in one `joint` group-resident wave |
+| `--prefill-execution` | serial | `layered` compute mode; `concurrent` is the explicit two-stream A/B mode |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
@@ -56,7 +59,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
-| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
+| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU. `joint` currently requires Triton for prefill |
 
 ### MoE offload
 

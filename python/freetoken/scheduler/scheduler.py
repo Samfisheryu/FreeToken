@@ -36,6 +36,12 @@ from .layered_batch import (
     LayeredPrefillChunk,
     LayeredPrefillWave,
 )
+from .joint_batch import (
+    JointBatchComposer,
+    JointExecutionStats,
+    JointPrefillChunk,
+    JointPrefillWave,
+)
 from .mixed_batch import LegacyBatchComposer, MixedBatchComposer
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
@@ -105,6 +111,9 @@ class Scheduler(SchedulerIOMixin):
         self.layered_composer: LayeredBatchComposer | None = None
         self.layered_wave: LayeredPrefillWave | None = None
         self.layered_stats = LayeredExecutionStats()
+        self.joint_composer: JointBatchComposer | None = None
+        self.joint_wave: JointPrefillWave | None = None
+        self.joint_stats = JointExecutionStats()
         if config.batching_policy == "legacy":
             composer_cls = LegacyBatchComposer
         elif config.batching_policy == "mixed":
@@ -115,6 +124,12 @@ class Scheduler(SchedulerIOMixin):
                 prefill_manager=self.prefill_manager,
                 decode_manager=self.decode_manager,
                 max_prefill_reqs=1,
+            )
+        elif config.batching_policy == "joint":
+            composer_cls = None
+            self.joint_composer = JointBatchComposer(
+                prefill_manager=self.prefill_manager,
+                decode_manager=self.decode_manager,
             )
         else:
             raise ValueError(f"Unknown batching policy: {config.batching_policy!r}")
@@ -197,6 +212,7 @@ class Scheduler(SchedulerIOMixin):
         finished requests. All TP ranks must call this with identical arguments.
         """
         assert self.layered_wave is None, "rebuild requires no active layered prefill"
+        assert self.joint_wave is None, "rebuild requires no active joint prefill"
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
         torch.cuda.synchronize(self.device)
@@ -682,6 +698,260 @@ class Scheduler(SchedulerIOMixin):
         self._finish_layered_wave()
         return owner
 
+    def joint_loop(self) -> None:
+        """Execute one resident layer group of a true mixed multi-chunk wave."""
+        blocking = not (
+            self.joint_wave is not None
+            or self.prefill_manager.runnable
+            or self.decode_manager.runnable
+            or self._pending_rebuild is not None
+        )
+        for msg in self.receive_msg(blocking=blocking):
+            self._process_one_msg(msg)
+
+        if self._pending_rebuild is not None and not (
+            self.joint_wave is not None
+            or self.prefill_manager.runnable
+            or self.decode_manager.runnable
+        ):
+            self._execute_pending_rebuild()
+
+        self.stream.wait_stream(self.engine.stream)
+        if self.joint_wave is None:
+            composer = self.joint_composer
+            assert composer is not None
+            batch = composer.schedule_first_batch(self.prefill_budget)
+            if batch is None:
+                self._flush_abort_acks()
+                return
+            if not batch.has_prefill:
+                forward_input = self._prepare_batch(batch)
+                self._report_prompt_admissions(batch)
+                with self.engine_stream_ctx:
+                    self.engine.stream.wait_stream(self.stream)
+                    self._restore_linear_states(batch)
+                    data = (forward_input, self._forward(forward_input))
+                self._process_last_data(data)
+                self._flush_abort_acks()
+                return
+            self._begin_joint_wave(batch)
+
+        self.engine.stream.wait_stream(self.stream)
+        outputs = self._run_joint_group()
+        for data in outputs:
+            self._process_last_data(data)
+        self._flush_abort_acks()
+
+    def _begin_joint_wave(self, first_batch: Batch) -> None:
+        """Prepare a bounded set of contiguous prompt chunks for one wave."""
+        if self.joint_wave is not None:
+            raise RuntimeError("a joint prefill wave is already active")
+        if len(first_batch.prefill_reqs) != 1:
+            raise RuntimeError("a joint wave requires exactly one first prefill request")
+
+        first = self._prepare_joint_chunk(first_batch)
+        uid = first_batch.prefill_reqs[0].uid
+        chunks = [first]
+        while (
+            len(chunks) < self.config.prefill_wave_max_chunks
+            and self.prefill_manager.has_pending_uid(uid)
+        ):
+            batch = self.prefill_manager.schedule_next_batch(
+                self.prefill_budget,
+                allowed_uids={uid},
+                max_reqs=1,
+            )
+            if batch is None:
+                break
+            chunks.append(self._prepare_joint_chunk(batch))
+
+        moe_cache = self.engine.moe_offload_cache
+        assert moe_cache is not None
+        group_size = moe_cache.effective_prefill_group_size
+        if group_size < 1:
+            raise RuntimeError("joint batching has no resident expert-layer capacity")
+        self.joint_wave = JointPrefillWave(
+            uid=uid,
+            num_layers=self.engine.layer_group_num_layers,
+            group_size=group_size,
+            chunks=chunks,
+            layer_prepares_at_start=moe_cache.prefill_layer_prepares,
+            h2d_bytes_at_start=moe_cache.prefill_h2d_bytes,
+        )
+        self.joint_stats.waves += 1
+        self.joint_stats.effective_group_size = group_size
+
+    def _prepare_joint_chunk(self, batch: Batch) -> JointPrefillChunk:
+        forward_input = self._prepare_batch(batch)
+        self._report_prompt_admissions(batch)
+        batch.input_ids = self.token_pool[forward_input.input_tuple]
+        for req in batch.prefill_reqs:
+            self.prefill_manager.reserve_layered_continuation(req)
+        return JointPrefillChunk(
+            forward_input=forward_input,
+        )
+
+    def _run_joint_group(self) -> list[ForwardData]:
+        wave = self.joint_wave
+        assert wave is not None and not wave.done
+        start_layer = wave.current_layer
+        end_layer = wave.current_group_end
+        moe_cache = self.engine.moe_offload_cache
+        assert moe_cache is not None
+
+        with self.engine_stream_ctx:
+            moe_cache.begin_resident_prefill_group(start_layer, end_layer)
+            try:
+                for chunk in wave.chunks:
+                    forward_input = chunk.forward_input
+                    if chunk.state is None:
+                        if start_layer != 0:
+                            raise RuntimeError(
+                                "joint state reached a later group without embedding"
+                            )
+                        self._restore_linear_states(forward_input.batch)
+                        chunk.state = self.engine.begin_layer_group_prefill(
+                            forward_input.batch
+                        )
+                    if chunk.state.next_layer != start_layer:
+                        raise RuntimeError(
+                            f"joint state is at layer {chunk.state.next_layer}, "
+                            f"group starts at {start_layer}"
+                        )
+                    chunk.state = self.engine.advance_layer_group_prefill(
+                        forward_input.batch,
+                        chunk.state,
+                        end_layer,
+                    )
+            finally:
+                moe_cache.end_prefill_group()
+
+            wave.finish_group()
+            self.joint_stats.group_steps += 1
+            if not wave.done:
+                return []
+
+            outputs: list[ForwardData] = []
+            first = wave.chunks[0]
+            last = wave.chunks[-1]
+            last_prompt_req = last.forward_input.batch.prefill_reqs[-1]
+            prompt_is_final = not isinstance(last_prompt_req, ChunkedReq)
+
+            # Every selected prompt chunk has now completed its final decoder
+            # layer.  Intermediate chunks commit that exact KV boundary without
+            # producing an output token; the final non-Chunked request is
+            # completed by finish_layer_group_prefill below.
+            for chunk in wave.chunks:
+                for req in chunk.forward_input.batch.prefill_reqs:
+                    if isinstance(req, ChunkedReq):
+                        req.commit_prefill_kv()
+
+            if len(wave.chunks) == 1 and prompt_is_final:
+                # The one state owns both decode and the final prompt request.
+                forward_input = first.forward_input
+                output = self.engine.finish_layer_group_prefill(
+                    forward_input.batch,
+                    first.state,
+                    forward_input.sample_args,
+                )
+                self.token_pool[forward_input.write_tuple] = output.next_tokens_gpu
+                self.decode_manager.filter_reqs(forward_input.batch.reqs)
+                outputs.append((forward_input, output))
+            else:
+                first_input = first.forward_input
+                if first_input.batch.has_decode:
+                    decode_end = first_input.batch.decode_size
+                    output = self.engine.finish_layer_group_prefill(
+                        first_input.batch,
+                        first.state,
+                        first_input.sample_args,
+                        request_slice=slice(0, decode_end),
+                    )
+                    decode_input = self._joint_output_view(
+                        first_input,
+                        slice(0, decode_end),
+                        decode_size=decode_end,
+                    )
+                    self.token_pool[decode_input.write_tuple] = output.next_tokens_gpu
+                    self.decode_manager.filter_reqs(decode_input.batch.reqs)
+                    outputs.append((decode_input, output))
+
+                if prompt_is_final:
+                    prompt_input = last.forward_input
+                    output = self.engine.finish_layer_group_prefill(
+                        prompt_input.batch,
+                        last.state,
+                        prompt_input.sample_args,
+                    )
+                    self.token_pool[prompt_input.write_tuple] = output.next_tokens_gpu
+                    self.decode_manager.filter_reqs(prompt_input.batch.reqs)
+                    outputs.append((prompt_input, output))
+                elif last_prompt_req.aborted:
+                    # No sampled output owns this intermediate chunk.  Wait for
+                    # the final group before returning its shared KV/table once.
+                    self.engine.stream.synchronize()
+                    self._free_req_resources(last_prompt_req)
+
+            for chunk in wave.chunks:
+                chunk.state = None
+
+        layer_prepares = (
+            moe_cache.prefill_layer_prepares - wave.layer_prepares_at_start
+        )
+        h2d_bytes = (
+            moe_cache.prefill_h2d_bytes - wave.h2d_bytes_at_start
+        )
+        logger.info_rank0(
+            "Joint wave complete: "
+            f"chunks={len(wave.chunks)}, groups="
+            f"{(wave.num_layers + wave.group_size - 1) // wave.group_size}, "
+            f"effective_group_size={wave.group_size}, "
+            f"prefill_layer_prepares={layer_prepares}, "
+            f"prefill_h2d_bytes={h2d_bytes}"
+        )
+        self.joint_wave = None
+        return outputs
+
+    @staticmethod
+    def _joint_output_view(
+        forward_input: ForwardInput,
+        request_slice: slice,
+        *,
+        decode_size: int,
+    ) -> ForwardInput:
+        """Match result processing to the requests selectively finalized."""
+        selected_reqs = forward_input.batch.reqs[request_slice]
+        batch = Batch(reqs=list(selected_reqs), decode_size=decode_size)
+        write_tuple = (
+            forward_input.write_tuple[0][request_slice],
+            forward_input.write_tuple[1][request_slice],
+        )
+        return ForwardInput(
+            batch=batch,
+            sample_args=forward_input.sample_args,
+            input_tuple=forward_input.input_tuple,
+            write_tuple=write_tuple,
+        )
+
+    def _abort_joint_wave(self, uid: int) -> Req | None:
+        """Mark active joint work for deferred cleanup at final-group drain."""
+        wave = self.joint_wave
+        if wave is None:
+            return None
+        for chunk in wave.chunks:
+            for req in chunk.forward_input.batch.decode_reqs:
+                if req.uid == uid:
+                    req.aborted = True
+                    return req
+        if wave.uid != uid:
+            return None
+        # All chunks share one table/cache handle.  Only the last chunk owns
+        # cleanup so the common resources are returned exactly once and at the
+        # furthest allocated prompt boundary.
+        owner = wave.chunks[-1].forward_input.batch.prefill_reqs[-1]
+        owner.aborted = True
+        return owner
+
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
         # DSV4 (owned-KV) decode reads its per-token window/cmp/idx slot maps off the attention
@@ -692,6 +962,10 @@ class Scheduler(SchedulerIOMixin):
             assert torch.cuda.current_stream() == self.stream
             while True:
                 self.layered_loop()
+        elif self.config.batching_policy == "joint":
+            assert torch.cuda.current_stream() == self.stream
+            while True:
+                self.joint_loop()
         elif ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -944,8 +1218,13 @@ class Scheduler(SchedulerIOMixin):
                 tombstones.pop(next(iter(tombstones)))
             pending_req = self.prefill_manager.abort_req(msg.uid)
             layered_req = self._abort_layered_wave(msg.uid)
+            joint_req = self._abort_joint_wave(msg.uid)
             decode_req = self.decode_manager.abort_req(msg.uid)
-            req_to_free = layered_req or pending_req or decode_req
+            req_to_free = (
+                None
+                if joint_req is not None
+                else layered_req or pending_req or decode_req
+            )
             if req_to_free is not None:
                 # SGLang-style abort: never free resources under an in-flight forward. If the
                 # request is in the launched-but-not-drained batch (overlap), only mark it;
@@ -986,6 +1265,7 @@ class Scheduler(SchedulerIOMixin):
                 )
             elif (
                 self.layered_wave is not None
+                or self.joint_wave is not None
                 or self.prefill_manager.runnable
                 or self.decode_manager.runnable
             ):
@@ -1171,6 +1451,12 @@ class Scheduler(SchedulerIOMixin):
                     f"MoE cache {moe.cache_size}/{moe.num_layers * moe.num_experts}"
                     f" ({_gib(moe.cache_size * unit['moe_bytes_per_expert'])})"
                 )
+                if self.config.batching_policy == "joint":
+                    parts.append(
+                        f"joint group {moe.effective_prefill_group_size} layers "
+                        f"({moe.prefill_buffer_slots} prefill slots, "
+                        f"{moe.decode_cache_size} decode slots)"
+                    )
             logger.info_rank0(f"{event}: " + ", ".join(parts))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"could not log cache geometry: {e!r}")

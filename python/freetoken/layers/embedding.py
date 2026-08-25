@@ -103,11 +103,16 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
-        bs = batch.size
         if batch.uses_extend_path:
-            indices = batch.attn_metadata.get_last_indices(bs)
+            indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
             del indices
+
+        return self.forward_selected(x)
+
+    def forward_selected(self, x: torch.Tensor) -> torch.Tensor:
+        """Project rows already selected as one output position per request."""
+        bs = x.shape[0]
 
         module = self.tied_embedding or self
         logits = F.linear(x, module.weight, self.bias)

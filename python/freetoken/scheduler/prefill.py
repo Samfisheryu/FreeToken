@@ -32,6 +32,10 @@ class ChunkedReq(Req):
     def append_host(self, next_token: torch.Tensor) -> None:
         raise NotImplementedError("ChunkedReq should not be sampled")
 
+    def commit_prefill_kv(self) -> None:
+        """Mark this chunk's fully-computed KV boundary without sampling."""
+        self.cached_len = self.device_len
+
     @property
     def can_decode(self) -> bool:
         return False  # avoid being added to decode manager

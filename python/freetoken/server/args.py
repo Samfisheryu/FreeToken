@@ -313,12 +313,14 @@ def parse_args(
     parser.add_argument(
         "--batching-policy",
         type=str,
-        choices=["legacy", "mixed", "layered"],
+        choices=["legacy", "mixed", "layered", "joint"],
         default=ServerArgs.batching_policy,
         help=(
             "Batch scheduling policy: legacy runs prefill before decode; mixed combines "
             "decode with chunked prefill in one forward; layered jointly schedules two "
-            "independent forwards and advances prefill by layer group."
+            "independent forwards and advances prefill by layer group; joint keeps a "
+            "whole layer group resident while one mixed decode/prefill state and its "
+            "remaining prefill chunks traverse it."
         ),
     )
 
@@ -326,7 +328,14 @@ def parse_args(
         "--prefill-layer-group-size",
         type=_positive_int,
         default=ServerArgs.prefill_layer_group_size,
-        help="Decoder layers advanced by each layered-prefill step.",
+        help="Requested decoder layers per layered/joint group step.",
+    )
+
+    parser.add_argument(
+        "--prefill-wave-max-chunks",
+        type=_positive_int,
+        default=ServerArgs.prefill_wave_max_chunks,
+        help="Maximum prompt chunks admitted into one joint group-resident wave.",
     )
 
     parser.add_argument(

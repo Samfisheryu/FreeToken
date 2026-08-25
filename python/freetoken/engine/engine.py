@@ -321,7 +321,7 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         if (
-            getattr(config, "batching_policy", "legacy") == "layered"
+            getattr(config, "batching_policy", "legacy") in ("layered", "joint")
             and not getattr(self.model, "supports_layer_group_prefill", False)
         ):
             raise ValueError(
@@ -559,6 +559,14 @@ class Engine:
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+            if getattr(config, "batching_policy", "legacy") == "joint" and (
+                not config.moe_prefill_overlap
+                or config.moe_cache_size < 2 * config.model_config.num_experts
+            ):
+                raise ValueError(
+                    "joint batching needs room for one resident expert layer and one "
+                    "decode-cache layer after --moe-cache-auto is resolved"
+                )
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -569,7 +577,12 @@ class Engine:
                 cache_policy=config.moe_cache_policy,
                 prefill_overlap=config.moe_prefill_overlap,
                 separate_prefill_buffer=(
-                    getattr(config, "batching_policy", "legacy") == "layered"
+                    getattr(config, "batching_policy", "legacy") in ("layered", "joint")
+                ),
+                prefill_group_size=(
+                    getattr(config, "prefill_layer_group_size", 1)
+                    if getattr(config, "batching_policy", "legacy") == "joint"
+                    else 0
                 ),
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 quant_format=banks.quant_format,
@@ -579,6 +592,14 @@ class Engine:
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
             cache.set_codebook(banks.codebook)
+            if getattr(config, "batching_policy", "legacy") == "joint":
+                logger.info_rank0(
+                    "Joint group-resident batching: "
+                    f"requested_group_size={config.prefill_layer_group_size}, "
+                    f"effective_group_size={cache.effective_prefill_group_size}, "
+                    f"prefill_slots={cache.prefill_buffer_slots}, "
+                    f"decode_slots={cache.decode_cache_size}"
+                )
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -902,9 +923,9 @@ class Engine:
         return self.model.layer_group_num_layers
 
     def begin_layer_group_prefill(self, batch: Batch):
-        """Embed one prefill chunk without entering the decoder layer loop."""
-        if not batch.has_prefill or batch.has_decode:
-            raise ValueError("layer-group prefill requires a prefill-only batch")
+        """Embed one prefill or mixed state without entering decoder layers."""
+        if not batch.has_prefill:
+            raise ValueError("layer-group execution requires at least one prefill request")
         with self.ctx.forward_batch(batch):
             return self.model.begin_layer_group_prefill(batch.input_ids)
 
@@ -918,15 +939,33 @@ class Engine:
         batch: Batch,
         state,
         args: BatchSamplingArgs,
+        request_slice: slice | None = None,
     ) -> ForwardOutput:
-        """Run the final norm/head and sample after every decoder layer completed."""
+        """Finalize all requests, or only a contiguous request subset."""
         with self.ctx.forward_batch(batch):
-            logits = self.model.finish_layer_group_prefill(state)
+            if request_slice is None:
+                selected_reqs = batch.reqs
+                selected_args = args
+                output_indices = None
+            else:
+                selected_reqs = batch.reqs[request_slice]
+                last_indices = batch.attn_metadata.get_last_indices(batch.size)
+                output_indices = last_indices[request_slice].contiguous()
+                selected_args = BatchSamplingArgs(
+                    temperatures=(
+                        args.temperatures[request_slice]
+                        if args.temperatures is not None
+                        else None
+                    ),
+                    top_k=(args.top_k[request_slice] if args.top_k is not None else None),
+                    top_p=(args.top_p[request_slice] if args.top_p is not None else None),
+                )
+            logits = self.model.finish_layer_group_prefill(state, output_indices)
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()
-        for req in batch.reqs:
+        for req in selected_reqs:
             req.complete_one()
-        next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+        next_tokens_gpu = self.sampler.sample(logits, selected_args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(torch.cuda.current_stream(self.device))
@@ -1416,15 +1455,20 @@ def _adjust_config(config: EngineConfig):
             f"{config.moe_backend!r}); use --moe-backend cpu to run all layers on CPU"
         )
 
-    if getattr(config, "batching_policy", "legacy") == "layered":
+    batching_policy = getattr(config, "batching_policy", "legacy")
+    if batching_policy in ("layered", "joint"):
         if not is_moe or config.moe_backend not in ("offload", "hybrid"):
             raise ValueError(
-                "layered batching requires an offloaded MoE model "
+                f"{batching_policy} batching requires an offloaded MoE model "
                 "(--moe-backend offload or hybrid)"
             )
         if not config.moe_prefill_overlap:
-            raise ValueError("layered batching requires MoE prefill overlap")
+            raise ValueError(
+                f"{batching_policy} batching requires MoE prefill overlap"
+            )
         if (
+            batching_policy == "layered"
+            and
             getattr(config, "prefill_execution", "serial") == "concurrent"
             and config.tp_info.size > 1
         ):
@@ -1432,6 +1476,8 @@ def _adjust_config(config: EngineConfig):
                 "concurrent layered prefill requires tensor_parallel_size=1"
             )
         if (
+            batching_policy == "layered"
+            and
             getattr(config, "prefill_execution", "serial") == "concurrent"
             and config.attention_backend != "triton"
         ):
@@ -1440,6 +1486,8 @@ def _adjust_config(config: EngineConfig):
                 "use --attention-backend triton"
             )
         if (
+            batching_policy == "layered"
+            and
             not config.moe_cache_auto
             and config.moe_cache_size < 3 * model_config.num_experts
         ):
@@ -1447,6 +1495,26 @@ def _adjust_config(config: EngineConfig):
                 "layered batching requires at least 3 * num_experts expert slots: "
                 f"got moe_cache_size={config.moe_cache_size}, "
                 f"num_experts={model_config.num_experts}"
+            )
+        if (
+            batching_policy == "joint"
+            and not config.moe_cache_auto
+            and config.moe_cache_size < 2 * model_config.num_experts
+        ):
+            raise ValueError(
+                "joint batching requires at least 2 * num_experts expert slots: "
+                f"got moe_cache_size={config.moe_cache_size}, "
+                f"num_experts={model_config.num_experts}"
+            )
+        if (
+            batching_policy == "joint"
+            and config.attention_backend.split(",")[0].strip() != "triton"
+        ):
+            raise ValueError(
+                "joint batching prepares several prefill batches before execution, "
+                "which requires independent Triton prefill metadata; use "
+                "--attention-backend triton (or a hybrid string whose prefill "
+                f"backend is triton), got {config.attention_backend!r}"
             )
 
     if is_moe:

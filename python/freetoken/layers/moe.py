@@ -422,7 +422,8 @@ class OffloadMoELayer(MoELayer):
         if self.layer_id == 0:
             cache.begin_prefill()
         cache.prefetch_prefill_layer(self.layer_id)
-        cache.prefetch_prefill_layer(self.layer_id + 1)
+        if cache.prefill_buffer_count > 1:
+            cache.prefetch_prefill_layer(self.layer_id + 1)
         return cache.wait_prefill_layer(self.layer_id)
 
     # ------------------------------------------------------------------

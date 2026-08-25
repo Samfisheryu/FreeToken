@@ -66,13 +66,26 @@ class ResidualLayerGroupCausalLM(BaseLLMModel):
         state.next_layer = end_layer
         return state
 
-    def finish_layer_group_prefill(self, state: LayerGroupState) -> torch.Tensor:
+    def finish_layer_group_prefill(
+        self,
+        state: LayerGroupState,
+        output_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if state.next_layer != self.layer_group_num_layers:
             raise ValueError(
                 "cannot finish layer-group prefill before every decoder layer ran"
             )
-        hidden = self.model.norm.forward(state.hidden, state.residual)[0]
-        return self.lm_head.forward(hidden)
+        if output_indices is None:
+            hidden = self.model.norm.forward(state.hidden, state.residual)[0]
+            return self.lm_head.forward(hidden)
+        hidden = state.hidden[output_indices].contiguous()
+        residual = (
+            state.residual[output_indices].contiguous()
+            if state.residual is not None
+            else None
+        )
+        hidden = self.model.norm.forward(hidden, residual)[0]
+        return self.lm_head.forward_selected(hidden)
 
 
 class GatedMLP(BaseOP):
