@@ -341,6 +341,28 @@ class CacheManager:
             req.cache_handle = new_handle
             self.lock(new_handle)
 
+    def discard_incomplete_layered_wave(
+        self,
+        handle: BaseCacheHandle,
+        table_idx: int,
+        allocated_device_len: int,
+    ) -> None:
+        """Discard an unfinished full-KV layered prompt without caching it.
+
+        Layer-major prefill keeps the original prefix handle locked while several
+        prompt chunks share one page-table row.  None of that new KV is a complete
+        model prefix until the wave reaches the final layer, so abort must return
+        only the request-owned pages and must never call ``insert_prefix``.
+        """
+        if self.is_hybrid or self.swa_paged:
+            raise RuntimeError(
+                "incomplete layered-wave discard supports full-KV models only"
+            )
+        start = div_ceil(handle.cached_len, self.page_size) * self.page_size
+        end = div_ceil(allocated_device_len, self.page_size) * self.page_size
+        self.unlock(handle)
+        self._free(self.page_table[table_idx, start:end])
+
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
         Prefill chunk commit: DONATE the frozen ping-pong slot (the snapshot the forward wrote

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from freetoken.layers import (
@@ -20,8 +21,58 @@ if TYPE_CHECKING:
 
 
 class BaseLLMModel(ABC, BaseOP):
+    supports_layer_group_prefill = False
+
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
+
+
+@dataclass
+class LayerGroupState:
+    hidden: torch.Tensor
+    residual: torch.Tensor | None
+    next_layer: int = 0
+
+
+class ResidualLayerGroupCausalLM(BaseLLMModel):
+    """Explicit opt-in for the common hidden/residual decoder-layer interface."""
+
+    supports_layer_group_prefill = True
+
+    @property
+    def layer_group_num_layers(self) -> int:
+        return len(self.model.layers.op_list)
+
+    def begin_layer_group_prefill(self, input_ids: torch.Tensor) -> LayerGroupState:
+        return LayerGroupState(
+            hidden=self.model.embed_tokens.forward(input_ids),
+            residual=None,
+        )
+
+    def advance_layer_group_prefill(
+        self,
+        state: LayerGroupState,
+        end_layer: int,
+    ) -> LayerGroupState:
+        if not state.next_layer < end_layer <= self.layer_group_num_layers:
+            raise ValueError(
+                f"invalid layer-group range [{state.next_layer}, {end_layer}) for "
+                f"{self.layer_group_num_layers} layers"
+            )
+        for layer_id in range(state.next_layer, end_layer):
+            state.hidden, state.residual = self.model.layers.op_list[layer_id].forward(
+                state.hidden, state.residual
+            )
+        state.next_layer = end_layer
+        return state
+
+    def finish_layer_group_prefill(self, state: LayerGroupState) -> torch.Tensor:
+        if state.next_layer != self.layer_group_num_layers:
+            raise ValueError(
+                "cannot finish layer-group prefill before every decoder layer ran"
+            )
+        hidden = self.model.norm.forward(state.hidden, state.residual)[0]
+        return self.lm_head.forward(hidden)
 
 
 class GatedMLP(BaseOP):
@@ -52,4 +103,9 @@ class GatedMLP(BaseOP):
         return self.down_proj.forward(y)
 
 
-__all__ = ["BaseLLMModel", "GatedMLP"]
+__all__ = [
+    "BaseLLMModel",
+    "GatedMLP",
+    "LayerGroupState",
+    "ResidualLayerGroupCausalLM",
+]

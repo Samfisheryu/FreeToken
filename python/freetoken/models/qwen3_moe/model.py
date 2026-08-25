@@ -7,7 +7,7 @@ from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused, VocabParallelEmbedding
 from freetoken.utils import nvtx_annotate
 
-from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import ResidualLayerGroupCausalLM
 
 from .attention import Qwen3MoeAttention as Qwen3Attn
 from .moe import Qwen3MoeMLP as Qwen3MLP
@@ -64,7 +64,7 @@ class Qwen3Model(BaseOP):
         return self.norm.forward(x, residual)[0]
 
 
-class Qwen3MoeForCausalLM(BaseLLMModel):
+class Qwen3MoeForCausalLM(ResidualLayerGroupCausalLM):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(

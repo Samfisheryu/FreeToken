@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -29,6 +30,12 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .layered_batch import (
+    LayeredBatchComposer,
+    LayeredExecutionStats,
+    LayeredPrefillChunk,
+    LayeredPrefillWave,
+)
 from .mixed_batch import LegacyBatchComposer, MixedBatchComposer
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
@@ -68,6 +75,12 @@ class Scheduler(SchedulerIOMixin):
         self.device = self.engine.device
         self.stream = torch.cuda.Stream(device=self.device)
         self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
+        self.layered_prefill_stream = (
+            torch.cuda.Stream(device=self.device)
+            if config.batching_policy == "layered"
+            and config.prefill_execution == "concurrent"
+            else None
+        )
         torch.cuda.set_stream(self.stream)
 
         # initialize other managers
@@ -89,15 +102,29 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+        self.layered_composer: LayeredBatchComposer | None = None
+        self.layered_wave: LayeredPrefillWave | None = None
+        self.layered_stats = LayeredExecutionStats()
         if config.batching_policy == "legacy":
             composer_cls = LegacyBatchComposer
         elif config.batching_policy == "mixed":
             composer_cls = MixedBatchComposer
+        elif config.batching_policy == "layered":
+            composer_cls = None
+            self.layered_composer = LayeredBatchComposer(
+                prefill_manager=self.prefill_manager,
+                decode_manager=self.decode_manager,
+                max_prefill_reqs=1,
+            )
         else:
             raise ValueError(f"Unknown batching policy: {config.batching_policy!r}")
-        self.batch_composer = composer_cls(
-            prefill_manager=self.prefill_manager,
-            decode_manager=self.decode_manager,
+        self.batch_composer = (
+            composer_cls(
+                prefill_manager=self.prefill_manager,
+                decode_manager=self.decode_manager,
+            )
+            if composer_cls is not None
+            else None
         )
 
         # some alias for easy access
@@ -169,6 +196,7 @@ class Scheduler(SchedulerIOMixin):
         guarantee the scheduler is idle — no pending prefill, no running decode, no in-flight
         finished requests. All TP ranks must call this with identical arguments.
         """
+        assert self.layered_wave is None, "rebuild requires no active layered prefill"
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
         torch.cuda.synchronize(self.device)
@@ -285,13 +313,386 @@ class Scheduler(SchedulerIOMixin):
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
 
+    def layered_loop(self) -> None:
+        """Run one decode, then finish the active prefill layer group."""
+        blocking = not (
+            self.layered_wave is not None
+            or self.prefill_manager.runnable
+            or self.decode_manager.runnable
+            or self._pending_rebuild is not None
+        )
+        for msg in self.receive_msg(blocking=blocking):
+            self._process_one_msg(msg)
+
+        if self._pending_rebuild is not None and not (
+            self.layered_wave is not None
+            or self.prefill_manager.runnable
+            or self.decode_manager.runnable
+        ):
+            self._execute_pending_rebuild()
+
+        self.stream.wait_stream(self.engine.stream)
+        decode_input, prefill_chunk = self._schedule_layered_work()
+        if decode_input is None and prefill_chunk is None:
+            self._flush_abort_acks()
+            return
+
+        decode_started = decode_ended = None
+        decode_data: ForwardData | None = None
+        both = decode_input is not None and prefill_chunk is not None
+        wall_started = time.perf_counter()
+
+        # Metadata/token copies are issued on the scheduler stream.  Both compute
+        # streams wait for them, but never wait for each other in the explicit
+        # concurrent A/B mode.
+        self.engine.stream.wait_stream(self.stream)
+        if self.layered_prefill_stream is not None:
+            self.layered_prefill_stream.wait_stream(self.stream)
+
+        # Start the current expert-layer copy before decode.  The copy stream is
+        # independent; prefill's MoE call waits on its ready event later.
+        with self.engine_stream_ctx:
+            if prefill_chunk is not None:
+                moe_cache = self.engine.moe_offload_cache
+                assert moe_cache is not None
+                if not moe_cache._prefill_group_active:
+                    moe_cache.begin_prefill_group()
+                target_layer = (
+                    0 if self.layered_wave is None else self.layered_wave.current_layer
+                )
+                moe_cache.prepare_prefill_group_layer(target_layer)
+
+            if decode_input is not None:
+                decode_started = torch.cuda.Event(enable_timing=True)
+                decode_ended = torch.cuda.Event(enable_timing=True)
+                decode_started.record(self.engine.stream)
+                decode_data = (decode_input, self._forward(decode_input))
+                decode_ended.record(self.engine.stream)
+
+        prefill_data: list[ForwardData] = []
+        prefill_started = prefill_ended = None
+        if prefill_chunk is not None:
+            wave = self.layered_wave
+            assert wave is not None
+            group_end = wave.current_group_end
+            compute_stream = self.layered_prefill_stream or self.engine.stream
+            prefill_started = torch.cuda.Event(enable_timing=True)
+            prefill_ended = torch.cuda.Event(enable_timing=True)
+            prefill_started.record(compute_stream)
+
+            if self.layered_prefill_stream is not None and decode_ended is not None:
+                # Launch one prefill token-layer before waiting for decode so the
+                # explicit concurrent A/B path actually overlaps useful compute.
+                produced, next_chunk, prefetched_from = self._run_layered_group_sweep(
+                    prefill_chunk,
+                    group_end,
+                    compute_stream,
+                    max_steps=1,
+                    prefetch_next=False,
+                )
+                prefill_data.extend(produced)
+                self._drain_layered_decode(decode_data, decode_started, decode_ended)
+                decode_data = None
+                if next_chunk is not None:
+                    wave = self.layered_wave
+                    assert wave is not None
+                    self._prepare_layered_expert_layer(wave.current_layer)
+                    produced, _, _ = self._run_layered_group_sweep(
+                        next_chunk,
+                        group_end,
+                        compute_stream,
+                        prefetched_from=prefetched_from,
+                    )
+                    prefill_data.extend(produced)
+            else:
+                # Serial compute keeps decode priority: publish its sampled token
+                # before the potentially long group sweep.  The current layer's
+                # H2D copy was already started above and overlapped the decode.
+                self._drain_layered_decode(decode_data, decode_started, decode_ended)
+                decode_data = None
+                produced, _, _ = self._run_layered_group_sweep(
+                    prefill_chunk,
+                    group_end,
+                    compute_stream,
+                )
+                prefill_data.extend(produced)
+            prefill_ended.record(compute_stream)
+        else:
+            self._drain_layered_decode(decode_data, decode_started, decode_ended)
+            decode_data = None
+
+        if prefill_ended is not None:
+            prefill_ended.synchronize()
+            self.layered_stats.prefill_gpu_ms += prefill_started.elapsed_time(prefill_ended)
+
+        if both:
+            self.layered_stats.joint_rounds += 1
+            self.layered_stats.joint_wall_ms += (time.perf_counter() - wall_started) * 1000.0
+
+        for data in prefill_data:
+            self._process_last_data(data)
+        self._flush_abort_acks()
+
+    def _drain_layered_decode(
+        self,
+        decode_data: ForwardData | None,
+        started: torch.cuda.Event | None,
+        ended: torch.cuda.Event | None,
+    ) -> None:
+        """Publish this round's decode result without waiting for prefill compute."""
+        if ended is None:
+            return
+        ended.synchronize()
+        assert started is not None
+        self.layered_stats.decode_forwards += 1
+        self.layered_stats.decode_gpu_ms += started.elapsed_time(ended)
+        self._process_last_data(decode_data)
+
+    def _run_layered_group_sweep(
+        self,
+        first_chunk: LayeredPrefillChunk,
+        group_end: int,
+        compute_stream: torch.cuda.Stream,
+        *,
+        max_steps: int | None = None,
+        prefetched_from: int | None = None,
+        prefetch_next: bool = True,
+    ) -> tuple[list[ForwardData], LayeredPrefillChunk | None, int | None]:
+        """Run layer-major token chunks through the current group.
+
+        Serial mode stages the next expert layer before computing the current
+        layer.  Concurrent mode stages it immediately after the first current-
+        layer chunk is enqueued, so its copy can overlap the remaining prefill
+        work without delaying the decode launch.
+        """
+        outputs: list[ForwardData] = []
+        chunk: LayeredPrefillChunk | None = first_chunk
+        steps = 0
+        concurrent = compute_stream is self.layered_prefill_stream
+
+        while chunk is not None:
+            wave = self.layered_wave
+            assert wave is not None
+            layer = wave.current_layer
+            can_prefetch_next = (
+                layer + 1 < group_end
+                and (
+                    not wave.admitting
+                    or not self.prefill_manager.has_pending_uid(wave.uid)
+                )
+            )
+            if (
+                not concurrent
+                and prefetch_next
+                and can_prefetch_next
+                and prefetched_from != layer
+            ):
+                self._prepare_layered_expert_layer(layer + 1)
+                prefetched_from = layer
+
+            with torch.cuda.stream(compute_stream):
+                data = self._run_layered_prefill_chunk(chunk)
+            if data is not None:
+                outputs.append(data)
+
+            stop = self._complete_layered_prefill_step()
+            if (
+                concurrent
+                and prefetch_next
+                and can_prefetch_next
+                and prefetched_from != layer
+            ):
+                self._prepare_layered_expert_layer(layer + 1)
+                prefetched_from = layer
+
+            steps += 1
+            if stop:
+                chunk = None
+            else:
+                wave = self.layered_wave
+                assert wave is not None
+                chunk = wave.current_chunk()
+
+            if max_steps is not None and steps >= max_steps:
+                return outputs, chunk, prefetched_from
+
+        return outputs, None, prefetched_from
+
+    def _prepare_layered_expert_layer(self, layer_id: int) -> None:
+        moe_cache = self.engine.moe_offload_cache
+        assert moe_cache is not None
+        with self.engine_stream_ctx:
+            moe_cache.prepare_prefill_group_layer(layer_id)
+
+    def _schedule_layered_work(
+        self,
+    ) -> tuple[ForwardInput | None, LayeredPrefillChunk | None]:
+        composer = self.layered_composer
+        assert composer is not None
+
+        decode_batch = None
+        prefill_batch = None
+        if self.layered_wave is None:
+            plan = composer.schedule_next_plan(self.prefill_budget)
+            if plan is not None:
+                decode_batch = plan.decode_batch
+                prefill_batch = plan.prefill_batch
+        else:
+            decode_batch = self.decode_manager.schedule_next_batch()
+            wave = self.layered_wave
+            if wave.admitting:
+                prefill_batch = self.prefill_manager.schedule_next_batch(
+                    self.prefill_budget,
+                    allowed_uids={wave.uid},
+                    max_reqs=1,
+                )
+                if (
+                    prefill_batch is None
+                    and not self.prefill_manager.has_pending_uid(wave.uid)
+                ):
+                    wave.finish_admission()
+
+        decode_input = self._prepare_batch(decode_batch) if decode_batch is not None else None
+        if decode_input is not None:
+            self._report_prompt_admissions(decode_input.batch)
+
+        if prefill_batch is not None:
+            prefill_chunk = self._prepare_layered_prefill_chunk(prefill_batch)
+        elif (
+            self.layered_wave is not None
+            and not self.layered_wave.admitting
+            and not self.layered_wave.done
+        ):
+            prefill_chunk = self.layered_wave.current_chunk()
+        else:
+            prefill_chunk = None
+
+        if self.layered_wave is not None and self.layered_wave.done:
+            self._finish_layered_wave()
+        return decode_input, prefill_chunk
+
+    def _prepare_layered_prefill_chunk(self, batch: Batch) -> LayeredPrefillChunk:
+        forward_input = self._prepare_batch(batch)
+        self._report_prompt_admissions(batch)
+        batch.input_ids = self.token_pool[forward_input.input_tuple]
+
+        if self.layered_wave is None:
+            assert len(batch.reqs) == 1
+            self.layered_wave = LayeredPrefillWave(
+                uid=batch.reqs[0].uid,
+                num_layers=self.engine.layer_group_num_layers,
+                group_size=self.config.prefill_layer_group_size,
+            )
+        wave = self.layered_wave
+        assert wave is not None
+        if any(req.uid != wave.uid for req in batch.reqs):
+            raise RuntimeError("a layered prefill wave cannot admit a different request")
+
+        # Reserve only the next original-token boundary.  Request completion stays
+        # untouched until this chunk reaches the final decoder layer.
+        for req in batch.reqs:
+            self.prefill_manager.reserve_layered_continuation(req)
+        chunk = LayeredPrefillChunk(
+            forward_input=forward_input,
+            allocated_device_len=max(req.device_len for req in batch.reqs),
+        )
+        wave.add_chunk(chunk)
+        return chunk
+
+    def _run_layered_prefill_chunk(
+        self, chunk: LayeredPrefillChunk
+    ) -> ForwardData | None:
+        wave = self.layered_wave
+        assert wave is not None
+        forward_input = chunk.forward_input
+        batch = forward_input.batch
+        target_layer = wave.current_layer
+        if chunk.state is None:
+            if target_layer != 0:
+                raise RuntimeError("a prefill chunk reached a later layer without embedding")
+            chunk.state = self.engine.begin_layer_group_prefill(batch)
+        if chunk.state.next_layer != target_layer:
+            raise RuntimeError(
+                f"chunk is at layer {chunk.state.next_layer}, wave is at {target_layer}"
+            )
+        chunk.state = self.engine.advance_layer_group_prefill(
+            batch, chunk.state, target_layer + 1
+        )
+        if chunk.state.next_layer != wave.num_layers:
+            return None
+
+        output = self.engine.finish_layer_group_prefill(
+            batch, chunk.state, forward_input.sample_args
+        )
+        self.token_pool[forward_input.write_tuple] = output.next_tokens_gpu
+        self.decode_manager.filter_reqs(batch.reqs)
+        return forward_input, output
+
+    def _complete_layered_prefill_step(self) -> bool:
+        """Advance the token-layer cursor; return whether this round must stop."""
+        wave = self.layered_wave
+        assert wave is not None
+        if wave.admitting:
+            if not self.prefill_manager.has_pending_uid(wave.uid):
+                wave.finish_admission()
+                if 1 % wave.group_size == 0 or 1 == wave.num_layers:
+                    self.layered_stats.prefill_group_steps += 1
+                if wave.done:
+                    self._finish_layered_wave()
+                    return True
+                return 1 % wave.group_size == 0
+            # The admission cursor has not reached the prompt's last original
+            # chunk.  Keep layer 0 resident and admit the next chunk next round.
+            return True
+
+        group_done = wave.complete_replay_chunk()
+        if group_done:
+            self.layered_stats.prefill_group_steps += 1
+        if wave.done:
+            self._finish_layered_wave()
+            return True
+        return group_done
+
+    def _finish_layered_wave(self) -> None:
+        wave = self.layered_wave
+        if wave is None:
+            return
+        moe_cache = self.engine.moe_offload_cache
+        assert moe_cache is not None
+        if moe_cache._prefill_group_active:
+            moe_cache.end_prefill_group()
+        self.layered_wave = None
+
+    def _abort_layered_wave(self, uid: int) -> Req | None:
+        wave = self.layered_wave
+        if wave is None or wave.uid != uid:
+            return None
+        reqs = [req for chunk in wave.chunks for req in chunk.forward_input.batch.reqs]
+        owner = reqs[-1] if reqs else None
+        assert owner is not None
+        table_idx = owner.table_idx
+        self.cache_manager.discard_incomplete_layered_wave(
+            owner.cache_handle,
+            table_idx,
+            max(chunk.allocated_device_len for chunk in wave.chunks),
+        )
+        self.table_manager.free(table_idx)
+        for req in reqs:
+            req.table_idx = -1
+        self._finish_layered_wave()
+        return owner
+
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
         # DSV4 (owned-KV) decode reads its per-token window/cmp/idx slot maps off the attention
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if self.config.batching_policy == "layered":
+            assert torch.cuda.current_stream() == self.stream
+            while True:
+                self.layered_loop()
+        elif ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -541,8 +942,10 @@ class Scheduler(SchedulerIOMixin):
             # in-flight concurrency.
             while len(tombstones) > 65_536:
                 tombstones.pop(next(iter(tombstones)))
-            req_to_free = self.prefill_manager.abort_req(msg.uid)
-            req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            pending_req = self.prefill_manager.abort_req(msg.uid)
+            layered_req = self._abort_layered_wave(msg.uid)
+            decode_req = self.decode_manager.abort_req(msg.uid)
+            req_to_free = layered_req or pending_req or decode_req
             if req_to_free is not None:
                 # SGLang-style abort: never free resources under an in-flight forward. If the
                 # request is in the launched-but-not-drained batch (overlap), only mark it;
@@ -581,7 +984,11 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(
                     msg.request_id, "unsupported", "runtime rebuild unsupported under TP > 1"
                 )
-            elif self.prefill_manager.runnable or self.decode_manager.runnable:
+            elif (
+                self.layered_wave is not None
+                or self.prefill_manager.runnable
+                or self.decode_manager.runnable
+            ):
                 # if_idle: refuse rather than wait. (finished_reqs hold no resources — they
                 # are already freed — so they do not block a rebuild.)
                 self._reply_rebuild(msg.request_id, "busy")
@@ -838,6 +1245,7 @@ class Scheduler(SchedulerIOMixin):
             batch.mm_embeds = torch.cat(parts, dim=0)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
+        assert self.batch_composer is not None
         batch = self.batch_composer.schedule_next_batch(self.prefill_budget)
         if batch is None:
             return None

@@ -313,11 +313,29 @@ def parse_args(
     parser.add_argument(
         "--batching-policy",
         type=str,
-        choices=["legacy", "mixed"],
+        choices=["legacy", "mixed", "layered"],
         default=ServerArgs.batching_policy,
         help=(
             "Batch scheduling policy: legacy runs prefill before decode; mixed combines "
-            "decode with chunked prefill in one forward."
+            "decode with chunked prefill in one forward; layered jointly schedules two "
+            "independent forwards and advances prefill by layer group."
+        ),
+    )
+
+    parser.add_argument(
+        "--prefill-layer-group-size",
+        type=_positive_int,
+        default=ServerArgs.prefill_layer_group_size,
+        help="Decoder layers advanced by each layered-prefill step.",
+    )
+
+    parser.add_argument(
+        "--prefill-execution",
+        choices=["serial", "concurrent"],
+        default=ServerArgs.prefill_execution,
+        help=(
+            "Layered-prefill execution: serial keeps decode/prefill compute ordered while "
+            "expert copies may overlap decode; concurrent is an explicit two-stream A/B."
         ),
     )
 

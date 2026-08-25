@@ -320,6 +320,13 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        if (
+            getattr(config, "batching_policy", "legacy") == "layered"
+            and not getattr(self.model, "supports_layer_group_prefill", False)
+        ):
+            raise ValueError(
+                f"model {type(self.model).__name__} does not support layer-group prefill"
+            )
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
@@ -561,6 +568,9 @@ class Engine:
                 device=self.device,
                 cache_policy=config.moe_cache_policy,
                 prefill_overlap=config.moe_prefill_overlap,
+                separate_prefill_buffer=(
+                    getattr(config, "batching_policy", "legacy") == "layered"
+                ),
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
@@ -881,6 +891,45 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    @property
+    def layer_group_num_layers(self) -> int:
+        if not getattr(self.model, "supports_layer_group_prefill", False):
+            raise ValueError(
+                f"model {type(self.model).__name__} does not support layer-group prefill"
+            )
+        return self.model.layer_group_num_layers
+
+    def begin_layer_group_prefill(self, batch: Batch):
+        """Embed one prefill chunk without entering the decoder layer loop."""
+        if not batch.has_prefill or batch.has_decode:
+            raise ValueError("layer-group prefill requires a prefill-only batch")
+        with self.ctx.forward_batch(batch):
+            return self.model.begin_layer_group_prefill(batch.input_ids)
+
+    def advance_layer_group_prefill(self, batch: Batch, state, end_layer: int):
+        """Advance one chunk from ``state.next_layer`` up to ``end_layer``."""
+        with self.ctx.forward_batch(batch):
+            return self.model.advance_layer_group_prefill(state, end_layer)
+
+    def finish_layer_group_prefill(
+        self,
+        batch: Batch,
+        state,
+        args: BatchSamplingArgs,
+    ) -> ForwardOutput:
+        """Run the final norm/head and sample after every decoder layer completed."""
+        with self.ctx.forward_batch(batch):
+            logits = self.model.finish_layer_group_prefill(state)
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.raise_if_unhealthy()
+        for req in batch.reqs:
+            req.complete_one()
+        next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(torch.cuda.current_stream(self.device))
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
@@ -1366,6 +1415,39 @@ def _adjust_config(config: EngineConfig):
             "--moe-cpu-layers requires --moe-backend offload (got "
             f"{config.moe_backend!r}); use --moe-backend cpu to run all layers on CPU"
         )
+
+    if getattr(config, "batching_policy", "legacy") == "layered":
+        if not is_moe or config.moe_backend not in ("offload", "hybrid"):
+            raise ValueError(
+                "layered batching requires an offloaded MoE model "
+                "(--moe-backend offload or hybrid)"
+            )
+        if not config.moe_prefill_overlap:
+            raise ValueError("layered batching requires MoE prefill overlap")
+        if (
+            getattr(config, "prefill_execution", "serial") == "concurrent"
+            and config.tp_info.size > 1
+        ):
+            raise ValueError(
+                "concurrent layered prefill requires tensor_parallel_size=1"
+            )
+        if (
+            getattr(config, "prefill_execution", "serial") == "concurrent"
+            and config.attention_backend != "triton"
+        ):
+            raise ValueError(
+                "concurrent layered prefill requires independent attention scratch; "
+                "use --attention-backend triton"
+            )
+        if (
+            not config.moe_cache_auto
+            and config.moe_cache_size < 3 * model_config.num_experts
+        ):
+            raise ValueError(
+                "layered batching requires at least 3 * num_experts expert slots: "
+                f"got moe_cache_size={config.moe_cache_size}, "
+                f"num_experts={model_config.num_experts}"
+            )
 
     if is_moe:
         object.__setattr__(model_config, "moe_backend", config.moe_backend)

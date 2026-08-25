@@ -70,6 +70,7 @@ def _stub_scheduler(*, prefill_runnable: bool, decode_runnable: bool, pending: o
     sched = Scheduler.__new__(Scheduler)
     sched.prefill_manager = SimpleNamespace(runnable=prefill_runnable)
     sched.decode_manager = SimpleNamespace(runnable=decode_runnable)
+    sched.layered_wave = None
     sched._pending_rebuild = pending
     sched.receive_msg = lambda blocking: []
     sched._schedule_next_batch = lambda: None
@@ -148,6 +149,7 @@ def test_rebuild_cache_refreshes_prefill_budget(monkeypatch):
     sched = Scheduler.__new__(Scheduler)
     sched.prefill_manager = SimpleNamespace(runnable=False)
     sched.decode_manager = SimpleNamespace(runnable=False)
+    sched.layered_wave = None
     sched.device = torch.device("cpu")
     sched.config = SimpleNamespace(tp_info=SimpleNamespace(size=1), max_extend_tokens=100_000)
     sched.engine = SimpleNamespace(

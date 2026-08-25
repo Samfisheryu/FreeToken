@@ -17,6 +17,10 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
+    # Layer-major prefill must cut the next original-token chunk before the
+    # previous chunk reaches the model's final layer.  This cursor records only
+    # that admission boundary; it is not request completion state.
+    layered_cached_len: int | None = None
     mm_embeds: torch.Tensor | None = None
 
     @property

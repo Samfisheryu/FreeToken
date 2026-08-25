@@ -63,9 +63,10 @@ def ensure_experts_hybrid(
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     """Compact this layer's cache-resident experts into gather indices, device-side.
 
-    hit = slot_for_id[layer_id][e] >= 2 * num_experts (the double buffer owns the
-    slots below, so those bytes are volatile within a prefill chunk and classify
-    as miss). Writes fixed-shape ``_prefill_hit_dst``/``_prefill_hit_src`` (buffer
+    With a separate prefill buffer every non-negative decode slot is stable.  In
+    the legacy aliasing layout only slots >= 2 * num_experts are stable because
+    the lower rows are volatile. Writes fixed-shape ``_prefill_hit_dst`` /
+    ``_prefill_hit_src`` (buffer
     row / cache slot) and the count into ``_prefill_hit_num``; one launch on the
     current stream, no host sync. Safe against the concurrent buffer invalidation
     on the copy stream: that only rewrites entries already below the threshold."""
@@ -76,7 +77,7 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
         cache._prefill_hit_src,
         cache._prefill_hit_num,
         buffer_id * num_experts,
-        2 * num_experts,
+        0 if cache.separate_prefill_buffer else 2 * num_experts,
         num_experts,
         BLOCK=triton.next_power_of_2(num_experts),
     )
@@ -98,7 +99,7 @@ def _ensure_experts_hybrid_gpu(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
-    block_c = triton.next_power_of_2(cache.cache_size)
+    block_c = triton.next_power_of_2(cache.decode_cache_size)
     num_warps = 8 if block_c >= 2048 else 4
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
@@ -117,7 +118,7 @@ def _ensure_experts_hybrid_gpu(
         int(max_fetch),
         int(frac_q16),
         cache.num_experts,
-        cache.cache_size,
+        cache.decode_cache_size,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
@@ -167,7 +168,7 @@ def _ensure_experts_hybrid_cpu(
     usage = cache.usage.tolist()
     for idx in range(num_fetch):
         expert = missing[idx]
-        victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
+        victim = min(range(cache.decode_cache_size), key=lambda s: (usage[s], s))
         old_id = int(cache.id_of_slot[victim].item())
         if old_id >= 0:
             cache.slot_for_id.view(-1)[old_id] = -1
@@ -189,7 +190,7 @@ def _ensure_experts_hybrid_cpu(
 
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:
-    block = triton.next_power_of_2(max(cache.num_experts, cache.cache_size))
+    block = triton.next_power_of_2(max(cache.num_experts, cache.decode_cache_size))
     _materialize_layer_kernel[(1,)](
         cache.slot_for_id,
         cache.id_of_slot,
@@ -200,7 +201,7 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
         cache.num_indices,
         layer_id,
         cache.num_experts,
-        cache.cache_size,
+        cache.decode_cache_size,
         BLOCK=block,
     )
 
@@ -208,7 +209,7 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
 def _reset_cache_gpu(cache) -> None:
     block = 256
     total_ids = cache.num_layers * cache.num_experts
-    grid = (triton.cdiv(max(total_ids, cache.cache_size), block),)
+    grid = (triton.cdiv(max(total_ids, cache.decode_cache_size), block),)
     _reset_cache_kernel[grid](
         cache.slot_for_id,
         cache.id_of_slot,
@@ -218,7 +219,7 @@ def _reset_cache_gpu(cache) -> None:
         cache.num_indices,
         total_ids,
         cache.num_experts,
-        cache.cache_size,
+        cache.decode_cache_size,
         BLOCK=block,
     )
 

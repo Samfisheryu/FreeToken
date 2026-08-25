@@ -96,6 +96,36 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
 MARLIN_MAX_CACHE_SIZE = 992
 
 
+def plan_expert_cache_partition(
+    total_slots: int,
+    num_experts: int,
+    prefill_buffers: int = 2,
+) -> dict[str, int]:
+    """Split one HBM expert-row budget into decode cache and prefill buffers."""
+    if num_experts < 1:
+        raise ValueError("num_experts must be >= 1")
+    if prefill_buffers < 0:
+        raise ValueError("prefill_buffers must be >= 0")
+    prefill_slots = prefill_buffers * num_experts
+    decode_slots = total_slots - prefill_slots
+    if decode_slots < num_experts:
+        if prefill_buffers == 2:
+            raise ValueError(
+                "layered batching requires at least 3 * num_experts expert slots: "
+                f"got total_slots={total_slots}, num_experts={num_experts}"
+            )
+        raise ValueError(
+            "expert cache partition must leave at least num_experts decode slots: "
+            f"got total_slots={total_slots}, num_experts={num_experts}, "
+            f"prefill_buffers={prefill_buffers}"
+        )
+    return {
+        "total_slots": total_slots,
+        "decode_slots": decode_slots,
+        "prefill_buffer_slots": prefill_slots,
+    }
+
+
 @dataclass
 class OffloadMoeCache:
     num_layers: int
@@ -104,6 +134,12 @@ class OffloadMoeCache:
     device: torch.device
     cache_policy: str = "lru"
     prefill_overlap: bool = False
+    # Keep the two full-layer prefill buffers outside the decode slot cache while
+    # preserving ``cache_size`` as the total HBM expert-row budget.  The decode LRU
+    # then owns exactly ``cache_size - 2 * num_experts`` rows and prefill can never
+    # invalidate a resident decode expert.  This is a movement/cache property shared
+    # by every quant format; model kernels still receive ordinary tensor views.
+    separate_prefill_buffer: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
     # of re-crossing PCIe; only the misses are H2D'd (one cudaMemcpyBatchAsync of
@@ -152,6 +188,9 @@ class OffloadMoeCache:
         self.cpu_layer_ids: frozenset = frozenset()
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
+        assert not self.separate_prefill_buffer or self.prefill_overlap, (
+            "separate_prefill_buffer requires prefill_overlap"
+        )
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
             "Prefill overlap borrows two full expert-layer buffers from the unified MoE "
             "cache, so cache_size must be at least 2 * num_experts "
@@ -168,12 +207,14 @@ class OffloadMoeCache:
         # id == layer_id * num_experts + expert, so one array replaces the (layer,
         # expert) pair and evicting a slot needs no decode.
         self.id_of_slot = torch.full(
-            (self.cache_size,),
+            (self.decode_cache_size,),
             -1,
             dtype=torch.int32,
             device=self.device,
         )
-        self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
+        self.usage = torch.zeros(
+            (self.decode_cache_size,), dtype=torch.int64, device=self.device
+        )
         self.step = torch.zeros((), dtype=torch.int64, device=self.device)
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
         self.evict_slots = torch.empty((self.num_experts,), dtype=torch.int32, device=self.device)
@@ -253,16 +294,21 @@ class OffloadMoeCache:
         # by copy_missing to pick the per-layer source (part of the same pending-copy
         # state as evict_slots/src_indices/num_indices).
         self._pending_src_layer: int | None = None
-        # Per-bank [2, num_experts, ...] double-buffer views over the slot cache's
-        # first 2 * num_experts slots (set up when prefill_overlap is enabled).
+        # Per-bank [2, num_experts, ...] prefill buffers.  In the legacy layout these
+        # alias the slot cache's first 2E rows; with separate_prefill_buffer they are
+        # independent allocations charged against the same total ``cache_size`` budget.
         self.prefill_bank_buffers: list[torch.Tensor] = []
         self.prefill_copy_stream: torch.cuda.Stream | None = None
         self.prefill_begin_event: torch.cuda.Event | None = None
         self.prefill_ready_events: list[torch.cuda.Event] = []
+        self.prefill_hit_ready_events: list[torch.cuda.Event] = []
         self.prefill_release_events: list[torch.cuda.Event] = []
         self._prefill_buffer_layer: list[int | None] = [None, None]
         self._prefill_buffer_released: list[bool] = [True, True]
         self._prefill_buffer_has_release_event: list[bool] = [False, False]
+        self._prefill_buffer_has_hit_ready_event: list[bool] = [False, False]
+        self._prefill_group_active = False
+        self._prefill_group_target_layer: int | None = None
         # hit-D2D split state: pinned begin-of-chunk snapshot of slot_for_id (the
         # classification input; frozen for the chunk -- no decode runs inside one,
         # and buffer invalidation only clears slot < 2E entries, which classify as
@@ -275,6 +321,23 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+
+    @property
+    def prefill_buffer_slots(self) -> int:
+        return 2 * self.num_experts if self.separate_prefill_buffer else 0
+
+    @property
+    def decode_cache_size(self) -> int:
+        """Number of physical rows visible to decode's slot map and LRU."""
+        return self.cache_size - self.prefill_buffer_slots
+
+    def cache_partition(self) -> dict[str, int]:
+        """Public HBM expert-row geometry for scheduler/status reporting."""
+        return plan_expert_cache_partition(
+            self.cache_size,
+            self.num_experts,
+            2 if self.separate_prefill_buffer else 0,
+        )
 
     def set_bank_sources(
         self,
@@ -322,7 +385,7 @@ class OffloadMoeCache:
                 )
             self.bank_sources[name] = list(per_layer)
             self.bank_caches[name] = torch.empty(
-                (self.cache_size, *head.shape[1:]),
+                (self.decode_cache_size, *head.shape[1:]),
                 dtype=head.dtype,
                 device=self.device,
             )
@@ -397,11 +460,15 @@ class OffloadMoeCache:
         pre-teardown check, so an invalid target rejects with the old cache intact
         (no destructive free first).
         """
-        if cache_size < self.num_experts:
-            raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
-        if self.quant_format == "nvfp4_marlin" and cache_size > MARLIN_MAX_CACHE_SIZE:
+        partition = plan_expert_cache_partition(
+            cache_size,
+            self.num_experts,
+            2 if self.separate_prefill_buffer else 0,
+        )
+        decode_size = partition["decode_slots"]
+        if self.quant_format == "nvfp4_marlin" and decode_size > MARLIN_MAX_CACHE_SIZE:
             raise ValueError(
-                f"moe_cache_size={cache_size} exceeds the marlin backend's slot limit of "
+                f"decode expert cache size {decode_size} exceeds the marlin backend's slot limit of "
                 f"{MARLIN_MAX_CACHE_SIZE} (vLLM moe_align_block_size caps padded experts at "
                 "1024); reduce moe_cache_size or force --nvfp4-backend triton"
             )
@@ -422,10 +489,14 @@ class OffloadMoeCache:
         self.prefill_copy_stream = None
         self.prefill_begin_event = None
         self.prefill_ready_events = []
+        self.prefill_hit_ready_events = []
         self.prefill_release_events = []
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
+        self._prefill_buffer_has_hit_ready_event = [False, False]
+        self._prefill_group_active = False
+        self._prefill_group_target_layer = None
         # 2. Drop old GPU tensors (free-before-alloc).
         self.banks = []
         self.bank_caches = {}
@@ -437,14 +508,18 @@ class OffloadMoeCache:
         for name in self.bank_schema:
             head = self.bank_sources[name][0]
             self.bank_caches[name] = torch.empty(
-                (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
+                (self.decode_cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
-        self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
-        self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
+        self.id_of_slot = torch.full(
+            (self.decode_cache_size,), -1, dtype=torch.int32, device=self.device
+        )
+        self.usage = torch.zeros(
+            (self.decode_cache_size,), dtype=torch.int64, device=self.device
+        )
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()
@@ -552,15 +627,43 @@ class OffloadMoeCache:
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
-        # The double buffers borrow the slot cache's first 2 * num_experts slots
-        # (one full expert layer per buffer), one view per registered bank.
-        self.prefill_bank_buffers = [
-            cache[: 2 * self.num_experts].view(2, self.num_experts, *cache.shape[1:])
-            for _, cache in self.banks
+        # One full expert layer per buffer, one tensor per registered bank.  Layered
+        # serving uses disjoint allocations so decode residency remains stable; the
+        # legacy prefill path retains its aliasing layout and memory behavior.
+        if self.separate_prefill_buffer:
+            self.prefill_bank_buffers = [
+                torch.empty(
+                    (2, self.num_experts, *cache.shape[1:]),
+                    dtype=cache.dtype,
+                    device=self.device,
+                )
+                for _, cache in self.banks
+            ]
+        else:
+            self.prefill_bank_buffers = [
+                cache[: 2 * self.num_experts].view(
+                    2, self.num_experts, *cache.shape[1:]
+                )
+                for _, cache in self.banks
+            ]
+
+        # Raw bases used by the hit/miss split.  Source indices are decode-cache
+        # relative in both layouts; destinations index the flattened 2E prefill rows.
+        self._prefill_dst_ptrs_host = [
+            buffer.data_ptr() for buffer in self.prefill_bank_buffers
         ]
+        if self.device.type == "cuda" and self._copy_fused_ok:
+            self._prefill_gather_dst_ptrs = torch.tensor(
+                [self._prefill_dst_ptrs_host[i] for i in self._gather_bank_ids],
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            self._prefill_gather_dst_ptrs = None
         if self.device.type == "cuda":
             self.prefill_copy_stream = torch.cuda.Stream(device=self.device)
             self.prefill_ready_events = [torch.cuda.Event() for _ in range(2)]
+            self.prefill_hit_ready_events = [torch.cuda.Event() for _ in range(2)]
             self.prefill_release_events = [torch.cuda.Event() for _ in range(2)]
             self.prefill_begin_event = torch.cuda.Event()
         if self.prefill_hit_d2d and self.device.type == "cuda":
@@ -577,6 +680,8 @@ class OffloadMoeCache:
             self._prefill_hit_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
 
     def _invalidate_prefill_buffer(self, buffer_id: int) -> None:
+        if self.separate_prefill_buffer:
+            return
         slot_start = buffer_id * self.num_experts
         slot_end = slot_start + self.num_experts
         old_ids = self.id_of_slot[slot_start:slot_end]
@@ -589,8 +694,56 @@ class OffloadMoeCache:
     def begin_prefill(self) -> None:
         if not self.prefill_overlap:
             return
+        if self._prefill_group_active:
+            return
+        self._begin_prefill_buffers()
+
+    def begin_prefill_group(self) -> None:
+        """Start one multi-chunk layer-ordered prefill wave."""
+        if not self.prefill_overlap:
+            return
+        if self._prefill_group_active:
+            raise RuntimeError("a layer-group prefill wave is already active")
+        self._prefill_group_active = True
+        self._prefill_group_target_layer = None
+        self._begin_prefill_buffers()
+
+    def prepare_prefill_group_layer(self, layer_id: int) -> None:
+        """Start this layer's expert copy before the paired decode forward."""
+        if not self._prefill_group_active:
+            raise RuntimeError("no layer-group prefill wave is active")
+        buffer_id = layer_id % 2
+        if self._prefill_buffer_layer[buffer_id] == layer_id:
+            self._prefill_group_target_layer = layer_id
+            return
+        if (
+            self._prefill_group_target_layer is not None
+            and self._prefill_hit_d2d_active
+            and self.prefill_copy_stream is not None
+        ):
+            # Decode may have changed the slot map since the prior layer.  Snapshot
+            # only at this safe scheduler boundary; the hit gather is enqueued on
+            # the current stream before decode mutates the LRU again.
+            self.prefill_begin_event.record(torch.cuda.current_stream(self.device))
+            self.prefill_copy_stream.wait_event(self.prefill_begin_event)
+            with torch.cuda.stream(self.prefill_copy_stream):
+                self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
+            self.prefill_copy_stream.synchronize()
+        self._prefill_group_target_layer = layer_id
+        self.prefetch_prefill_layer(layer_id)
+
+    def end_prefill_group(self) -> None:
+        if not self.prefill_overlap:
+            return
+        if not self._prefill_group_active:
+            raise RuntimeError("no layer-group prefill wave is active")
+        self._prefill_group_active = False
+        self._prefill_group_target_layer = None
+
+    def _begin_prefill_buffers(self) -> None:
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        self._prefill_buffer_has_hit_ready_event = [False, False]
         if self.prefill_copy_stream is not None:
             # Fence this prefill's copy-stream work behind everything already enqueued
             # on the compute stream. The release/ready events only order against the
@@ -614,6 +767,11 @@ class OffloadMoeCache:
             return
         if layer_id < 0:
             raise ValueError(f"Invalid prefill layer id: {layer_id}")
+        if (
+            self._prefill_group_active
+            and layer_id != self._prefill_group_target_layer
+        ):
+            return
 
         assert self.banks and self.prefill_bank_buffers
 
@@ -630,6 +788,7 @@ class OffloadMoeCache:
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
 
+        self._prefill_buffer_has_hit_ready_event[buffer_id] = False
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
@@ -659,7 +818,7 @@ class OffloadMoeCache:
             reason = "FREETOKEN_SKIP_FAST_INDEX_COPY is set (the hit gather would be a no-op)"
         elif not self._copy_fused_ok:
             reason = "the fused copy plan is unavailable (bank alignment or FREETOKEN_FUSED_COPY=0)"
-        elif self.cache_size <= 2 * self.num_experts:
+        elif not self.separate_prefill_buffer and self.cache_size <= 2 * self.num_experts:
             reason = (
                 f"cache_size {self.cache_size} leaves no hit region "
                 f"(needs > {2 * self.num_experts} slots)"
@@ -712,15 +871,19 @@ class OffloadMoeCache:
 
         E = self.num_experts
         snap = self._prefill_snapshot_np[layer_id]
-        hit_mask = snap >= 2 * E
+        hit_floor = 0 if self.separate_prefill_buffer else 2 * E
+        hit_mask = snap >= hit_floor
         self.prefill_hit_rows += int(hit_mask.sum())
         self.prefill_total_rows += E
         if self._gather_dst_ptrs is not None:
+            current_stream = torch.cuda.current_stream(self.device)
+            if self._prefill_buffer_has_release_event[buffer_id]:
+                current_stream.wait_event(self.prefill_release_events[buffer_id])
             prefill_hit_compact(self, layer_id, buffer_id)
             # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
             # wider grid (~22 GB/s per 1024-thread block on H100).
             fast_index_copy_multi_jit(
-                self._gather_dst_ptrs,
+                self._prefill_gather_dst_ptrs,
                 self._gather_dst_ptrs,
                 self._gather_feat_bytes,
                 self._prefill_hit_dst,
@@ -728,6 +891,8 @@ class OffloadMoeCache:
                 self._prefill_hit_num,
                 blocks_per_bank=64,
             )
+            self.prefill_hit_ready_events[buffer_id].record(current_stream)
+            self._prefill_buffer_has_hit_ready_event[buffer_id] = True
         miss = np.nonzero(~hit_mask)[0]
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
@@ -743,11 +908,13 @@ class OffloadMoeCache:
                     # Whole layer as one entry, EVEN with zero misses: it keeps every
                     # batch entry above the driver's async floor and covers the hit
                     # rows the gather skips for these banks.
-                    dst.append(self._copy_dst_ptrs_host[b] + buffer_id * E * feat)
+                    dst.append(self._prefill_dst_ptrs_host[b] + buffer_id * E * feat)
                     src.append(self._copy_src_ptrs_host[layer_id][b])
                     nbytes.append(E * feat)
                 elif miss.size:
-                    dst.extend(self._copy_dst_ptrs_host[b] + (buffer_id * E + starts) * feat)
+                    dst.extend(
+                        self._prefill_dst_ptrs_host[b] + (buffer_id * E + starts) * feat
+                    )
                     src.extend(self._copy_src_ptrs_host[layer_id][b] + starts * feat)
                     nbytes.extend(lengths * feat)
             if dst:
@@ -771,6 +938,10 @@ class OffloadMoeCache:
         assert self._prefill_buffer_layer[buffer_id] == layer_id
         if self.prefill_ready_events:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
+        if self._prefill_buffer_has_hit_ready_event[buffer_id]:
+            torch.cuda.current_stream(self.device).wait_event(
+                self.prefill_hit_ready_events[buffer_id]
+            )
         return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
 
     def release_prefill_layer(self, layer_id: int) -> None:
@@ -930,7 +1101,7 @@ class OffloadMoeCache:
         valid = total > 0
         if int(valid.sum()) == 0:
             return {}
-        slots_per_layer = self.cache_size / self.num_layers
+        slots_per_layer = self.decode_cache_size / self.num_layers
         C = max(1, int(round(slots_per_layer)))
         sorted_f, _ = torch.sort(freq, dim=1, descending=True)
         oracle_hit = (sorted_f[:, :C].sum(dim=1)[valid] / total[valid]).mean().item()

@@ -197,7 +197,11 @@ class PrefillAdder:
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
                 table_idx=chunked_req.table_idx,
-                cached_len=chunked_req.cached_len,
+                cached_len=(
+                    pending_req.layered_cached_len
+                    if pending_req.layered_cached_len is not None
+                    else chunked_req.cached_len
+                ),
                 linear_slot_idx=chunked_req.linear_slot_idx,
                 ping_pong=chunked_req.mamba_ping_pong,
                 next_track_idx=chunked_req.mamba_next_track_idx,
@@ -241,7 +245,13 @@ class PrefillManager:
             PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
         )
 
-    def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
+    def schedule_next_batch(
+        self,
+        prefill_budget: int,
+        *,
+        allowed_uids: set[int] | None = None,
+        max_reqs: int | None = None,
+    ) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
 
@@ -264,9 +274,14 @@ class PrefillManager:
         log_new_tokens = 0
         log_cached_tokens = 0
         for pending_req in self.pending_list:
+            if allowed_uids is not None and pending_req.uid not in allowed_uids:
+                break
+            if max_reqs is not None and len(reqs) >= max_reqs:
+                break
             is_continuation = pending_req.chunked_req is not None
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
+                pending_req.layered_cached_len = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
@@ -291,6 +306,16 @@ class PrefillManager:
         batch.log_cached_tokens = log_cached_tokens
         batch.prompt_admissions = prompt_admissions
         return batch
+
+    def has_pending_uid(self, uid: int) -> bool:
+        return any(req.uid == uid for req in self.pending_list)
+
+    def reserve_layered_continuation(self, req: Req) -> None:
+        """Advance chunk cutting without marking any model layer complete."""
+        for pending in self.pending_list:
+            if pending.uid == req.uid and pending.chunked_req is req:
+                pending.layered_cached_len = req.device_len
+                return
 
     def abort_req(self, uid: int) -> Req | None:
         for i, req in enumerate(self.pending_list):
