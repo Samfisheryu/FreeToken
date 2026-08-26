@@ -1,8 +1,15 @@
 # Joint batching sweet spot under a 24-slot expert-cache budget
 
-## Conclusion
+> **Historical result.** This experiment measured the retired design that hard-partitioned
+> HBM into protected prefill slots and decode slots. Its `G=2, W=7` result must not be
+> used to configure the unified expert pool. See
+> [Joint unified expert pool](../../docs/joint-unified-expert-pool.md) for the current
+> formulation. The optimized unified `W1` result is available, but selecting a new
+> multi-chunk sweet spot still requires a full group/wave sweep.
 
-For this small-lab workload, use joint batching with:
+## Historical conclusion for the partitioned design
+
+For this small-lab workload, the partitioned design selected:
 
 ```text
 prefill_layer_group_size = 2

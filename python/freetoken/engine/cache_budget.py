@@ -54,31 +54,33 @@ def plan_cache_budget(
     prefill_overlap: bool,
     kv_reserve_pages: int,
     max_slots: int,
+    prefill_overlap_min_layers: int = 2,
 ) -> tuple[int, int, bool]:
     """Split ``budget_bytes`` MoE-first into (moe_cache_size, num_pages, prefill_overlap).
 
     ``budget_bytes`` is the net pool for MoE cache + KV cache (caller already subtracted
     weights + fixed_cache_size; the (1-memory_ratio) remainder is the graph headroom).
-    Experts greedily fill the budget after reserving ``kv_reserve_pages`` for KV, clamped
-    to ``[floor, min(total_experts, max_slots)]`` (floor is ``2*num_experts`` when prefill
-    overlap is feasible else ``num_experts``); KV pages take whatever remains.
+    Experts greedily fill the budget after reserving ``kv_reserve_pages`` for KV,
+    clamped to ``[floor, min(total_experts, max_slots)]``.  Ordinary streaming
+    overlap needs two expert layers; joint's canonical pool needs one.  KV pages
+    take whatever remains.
     """
     assert per_expert_bytes > 0, "per_expert_bytes must be positive"
     assert cache_per_page > 0, "cache_per_page must be positive (owned-KV models unsupported here)"
+    assert prefill_overlap_min_layers >= 1
 
     hi = min(total_experts, max_slots)
-    # Prefill overlap borrows two full expert-layer buffers, so it needs >= 2*num_experts
-    # slots; disable it (and lower the floor) if the cap cannot fit that.
-    overlap = prefill_overlap and hi >= 2 * num_experts
-    lo = 2 * num_experts if overlap else num_experts
+    overlap_slots = prefill_overlap_min_layers * num_experts
+    overlap = prefill_overlap and hi >= overlap_slots
+    lo = overlap_slots if overlap else num_experts
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
 
     kv_reserve_bytes = kv_reserve_pages * cache_per_page
     # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
     raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
     moe_cache_size = max(lo, min(raw, hi))
-    # A tiny budget may have forced moe_cache_size below 2*num_experts even with overlap on.
-    overlap = overlap and moe_cache_size >= 2 * num_experts
+    # A tiny budget may have forced the cache below the policy's overlap floor.
+    overlap = overlap and moe_cache_size >= overlap_slots
 
     remaining = budget_bytes - moe_cache_size * per_expert_bytes
     num_pages = max(remaining // cache_per_page, kv_reserve_pages)
@@ -109,6 +111,7 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     quant_format: str,
+    prefill_overlap_min_layers: int = 2,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -128,4 +131,5 @@ def resolve_moe_cache_auto(
         prefill_overlap=prefill_overlap,
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
+        prefill_overlap_min_layers=prefill_overlap_min_layers,
     )

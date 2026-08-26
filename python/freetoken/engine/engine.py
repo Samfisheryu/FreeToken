@@ -500,6 +500,9 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             quant_format=banks.quant_format,
+            prefill_overlap_min_layers=(
+                1 if getattr(config, "batching_policy", "legacy") == "joint" else 2
+            ),
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -563,11 +566,11 @@ class Engine:
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
             if getattr(config, "batching_policy", "legacy") == "joint" and (
                 not config.moe_prefill_overlap
-                or config.moe_cache_size < 2 * config.model_config.num_experts
+                or config.moe_cache_size < config.model_config.num_experts
             ):
                 raise ValueError(
-                    "joint batching needs room for one resident expert layer and one "
-                    "decode-cache layer after --moe-cache-auto is resolved"
+                    "joint batching needs room for one complete resident expert layer "
+                    "after --moe-cache-auto is resolved"
                 )
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
@@ -579,7 +582,7 @@ class Engine:
                 cache_policy=config.moe_cache_policy,
                 prefill_overlap=config.moe_prefill_overlap,
                 separate_prefill_buffer=(
-                    getattr(config, "batching_policy", "legacy") in ("layered", "joint")
+                    getattr(config, "batching_policy", "legacy") == "layered"
                 ),
                 prefill_group_size=(
                     getattr(config, "prefill_layer_group_size", 1)
@@ -600,8 +603,8 @@ class Engine:
                     f"requested_group_size={config.prefill_layer_group_size}, "
                     f"effective_group_size={cache.effective_prefill_group_size}, "
                     f"prefill_wave_max_chunks={config.prefill_wave_max_chunks}, "
-                    f"prefill_slots={cache.prefill_buffer_slots}, "
-                    f"decode_slots={cache.decode_cache_size}"
+                    f"pool_slots={cache.decode_cache_size}, "
+                    "mapping=logical-expert-to-physical-slot"
                 )
         else:
             cache = cache_factory(config, self.device)
@@ -1513,10 +1516,10 @@ def _adjust_config(config: EngineConfig):
         if (
             batching_policy == "joint"
             and not config.moe_cache_auto
-            and config.moe_cache_size < 2 * model_config.num_experts
+            and config.moe_cache_size < model_config.num_experts
         ):
             raise ValueError(
-                "joint batching requires at least 2 * num_experts expert slots: "
+                "joint batching requires at least num_experts expert slots: "
                 f"got moe_cache_size={config.moe_cache_size}, "
                 f"num_experts={model_config.num_experts}"
             )

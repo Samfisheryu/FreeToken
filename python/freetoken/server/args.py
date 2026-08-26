@@ -347,7 +347,10 @@ def parse_args(
         "--prefill-layer-group-size",
         type=_positive_int,
         default=ServerArgs.prefill_layer_group_size,
-        help="Requested decoder layers per layered/joint group step.",
+        help=(
+            "Requested decoder layers per layered/joint group step. Joint caps "
+            "the value at floor(shared expert-cache slots / experts per layer)."
+        ),
     )
 
     parser.add_argument(
@@ -621,9 +624,9 @@ def parse_args(
         dest="moe_prefill_overlap",
         default=ServerArgs.moe_prefill_overlap,
         help=(
-            "Disable two-buffer overlap for prefill MoE expert copies. "
-            "By default, prefill overlap is enabled and requires "
-            "--moe-cache-size >= 2 * num_experts."
+            "Disable overlap for prefill MoE expert copies. Ordinary streaming "
+            "uses two full-layer buffers; joint requires overlap and admits one or "
+            "more complete layers into its shared expert pool."
         ),
     )
 
@@ -651,7 +654,8 @@ def parse_args(
             "During prefill prefetch, copy cache-resident experts device-side into "
             "the double buffer and stream only the misses over PCIe "
             "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
-            "--moe-cache-size > 2 * num_experts."
+            "--moe-cache-size > 2 * num_experts; joint directly reuses the shared "
+            "pool and does not use this gather."
         ),
     )
 

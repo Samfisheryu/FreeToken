@@ -38,7 +38,6 @@ class _JointPrefillWave:
     chunks: list[_JointPrefillChunk]
     current_layer: int = 0
     layer_prepares_at_start: int = 0
-    h2d_bytes_at_start: int = 0
 
     @property
     def current_group_end(self) -> int:
@@ -131,7 +130,6 @@ class JointWaveExecutor:
             group_size=group_size,
             chunks=chunks,
             layer_prepares_at_start=moe_cache.prefill_layer_prepares,
-            h2d_bytes_at_start=moe_cache.prefill_h2d_bytes,
         )
 
     def _prepare_chunk(self, batch: Batch) -> _JointPrefillChunk:
@@ -285,14 +283,12 @@ class JointWaveExecutor:
         layer_prepares = (
             moe_cache.prefill_layer_prepares - wave.layer_prepares_at_start
         )
-        h2d_bytes = moe_cache.prefill_h2d_bytes - wave.h2d_bytes_at_start
         groups = (wave.num_layers + wave.group_size - 1) // wave.group_size
         logger.info_rank0(
             "Joint wave complete: "
             f"chunks={len(wave.chunks)}, groups={groups}, "
             f"effective_group_size={wave.group_size}, "
-            f"prefill_layer_prepares={layer_prepares}, "
-            f"prefill_h2d_bytes={h2d_bytes}"
+            f"prefill_layer_prepares={layer_prepares}"
         )
 
     def abort(self, uid: int) -> Req | None:

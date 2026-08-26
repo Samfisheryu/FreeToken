@@ -47,11 +47,14 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Per-forward query-token budget; `mixed` spends it on decode rows first and gives the remainder to chunked prefill |
 | `--batching-policy` | legacy | `legacy` prioritizes prefill; `mixed` combines decode with one prefill chunk; `layered` runs separate decode and layer-group prefill forwards; `joint` carries decode with a bounded set of prefill chunks through resident layer groups |
-| `--prefill-layer-group-size` | 2 | Requested consecutive decoder layers per `layered`/`joint` group; `joint` reduces it when the MoE cache cannot retain the group plus one expert layer for decode |
+| `--prefill-layer-group-size` | 2 | Requested consecutive decoder layers per `layered`/`joint` group; `joint` caps it at the remaining model layers and `floor(shared cache slots / experts per layer)` |
 | `--prefill-wave-max-chunks` | 1 | Maximum prompt chunks retained in one `joint` group-resident wave |
 | `--prefill-execution` | serial | `layered` compute mode; `concurrent` is the explicit two-stream A/B mode |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
+
+See [Joint unified expert pool](joint-unified-expert-pool.md) for joint cache
+geometry, admission, and release semantics.
 
 ### Choosing a GPU
 
@@ -90,8 +93,8 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
-| `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
-| `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+| `--moe-prefill-hit-d2d` | off | Ordinary streaming prefill: copy cache-hit experts device-side into its buffer and stream only misses (CUDA >= 13); joint reuses canonical slots directly |
+| `--disable-moe-prefill-overlap` | overlap on | Disable prefill-copy overlap; ordinary streaming uses two buffers, while joint requires overlap and uses canonical group admission |
 
 ### API behaviour
 

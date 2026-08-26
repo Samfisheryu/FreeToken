@@ -380,12 +380,43 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill movement: stream whole layers -- double-buffered behind the
-        previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
-        ``materialize_layer``. In both, position == expert id, so the routing ids
-        pass through unmapped."""
+        """Prefill movement for the selected scheduling policy.
+
+        Joint maps raw expert ids directly into its canonical physical slots.
+        Other policies retain whole-layer streaming, where position equals the
+        logical expert id.
+        """
         cache = self.offload_cache
         assert cache is not None
+        if cache.has_resident_prefill_layer(self.layer_id):
+            cache.map_prefill_experts(self.layer_id, topk_ids)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(),
+                n=cache.decode_cache_size,
+                alphas=cache.alphas_for_resident_layer_slots(self.layer_id),
+                is_prefill=True,
+            )
+        if cache.prefill_group_size:
+            # Startup warmup and other direct prefill forwards do not have a
+            # scheduler-owned resident group.  Joint still uses the canonical
+            # pool: admit only the routed experts through the ordinary LRU,
+            # which rewrites logical ids to physical slots in place.
+            cache.ensure_experts(self.layer_id, topk_ids)
+            cache.copy_missing()
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(),
+                n=cache.decode_cache_size,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=True,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(

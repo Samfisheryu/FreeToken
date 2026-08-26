@@ -1244,8 +1244,7 @@ class Scheduler(SchedulerIOMixin):
                 if self.config.batching_policy == "joint":
                     parts.append(
                         f"joint group {moe.effective_prefill_group_size} layers "
-                        f"({moe.prefill_buffer_slots} prefill slots, "
-                        f"{moe.decode_cache_size} decode slots)"
+                        f"({moe.decode_cache_size} shared expert slots)"
                     )
             logger.info_rank0(f"{event}: " + ", ".join(parts))
         except Exception as e:  # noqa: BLE001
