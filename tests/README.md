@@ -3,7 +3,7 @@
 Directories mirror the `python/freetoken/` subsystem a test primarily exercises —
 put a new test next to the module it protects. There is no per-model directory:
 a model-specific test lives in the subsystem it stresses, and says which model
-in its filename (`kvcache/test_dsv4_pool.py`, `models/test_glm4_nvfp4.py`).
+in its filename (`kvcache/test_dsv4_pool.py`, `models/test_glm_dsa.py`).
 
 | directory    | subsystem under test |
 |--------------|----------------------|

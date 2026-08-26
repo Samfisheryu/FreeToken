@@ -7,6 +7,7 @@ ft <command> [args]
 | Command | Purpose |
 |---|---|
 | `ft serve` | Start the API server (OpenAI `/v1/*`, Anthropic `/v1/messages`, Responses) |
+| `ft daemon` | Keep an `ft serve` process running under a lightweight supervisor |
 | `ft shell` | Chat with a server in the terminal |
 | `ft ctl` | Query and manage a running server over HTTP |
 | `ft launch` | Configure and launch a coding agent against a server |
@@ -84,6 +85,12 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+
+## ft daemon
+
+`ft daemon` runs a persistent, torch-free supervisor for `ft serve`. See the
+[daemon guide](../python/freetoken/daemon/README.md) for its lifecycle, control
+commands and HTTP API.
 
 ## ft shell
 

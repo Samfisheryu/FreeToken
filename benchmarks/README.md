@@ -24,6 +24,8 @@ python benchmarks/bench_lab_agent_policies.py --repetitions 3 --gpu 0 \
 
 Workload contract: [`workloads/lab_agent_burst_v1.json`](workloads/lab_agent_burst_v1.json).
 Measured setup and interpretation: [`results/lab_agent_burst_20260825.md`](results/lab_agent_burst_20260825.md).
+The focused resident-group probe and raw samples are recorded in
+[`results/joint_group_wave_20260825.md`](results/joint_group_wave_20260825.md).
 
 **`bench_load_weight_generic.py`** — expert-bank load time: serial vs parallel O_DIRECT
 vs pre-repacked FTW, each mode in its own subprocess. Linux-only; stages the FTW under

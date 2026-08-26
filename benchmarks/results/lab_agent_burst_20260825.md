@@ -104,5 +104,5 @@ large throughput win or AIME representativeness from the synthetic model. The ne
 useful validation is the same trace on the real target Qwen/NoWAG checkpoint; only
 then decide whether joint wave1 deserves to become a serving default.
 
-Full per-event JSON, including the three focused output-consistency reruns, is stored
-under `/data1/lmcache_kv/experiments/freetoken_lab_agent_burst/20260825/`.
+Raw per-event JSON is not tracked in the repository. Run the command above to
+regenerate it.
