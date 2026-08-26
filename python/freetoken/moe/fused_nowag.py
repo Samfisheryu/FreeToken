@@ -13,6 +13,13 @@ from freetoken.moe.nowag import (
 )
 
 
+def _shares_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return (
+        left.untyped_storage().data_ptr()
+        == right.untyped_storage().data_ptr()
+    )
+
+
 def routed_experts_nowag(
     x: torch.Tensor,
     slots: torch.Tensor,
@@ -63,6 +70,7 @@ def routed_experts_nowag(
     from freetoken.kernel.triton.moe_align import (
         moe_align_block_size as moe_align_block_size_triton,
         moe_align_block_size_adaptive,
+        moe_align_block_size_adaptive_tail64,
         uses_large_moe_align,
     )
 
@@ -70,9 +78,12 @@ def routed_experts_nowag(
         topk_ids: torch.Tensor,
         block_size: int,
         physical_expert_rows: int,
+        *,
+        alignment_storage: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if (
-            topk_ids.numel() <= 256
+            alignment_storage is None
+            and topk_ids.numel() <= 256
             and nowag_cuda_ops.has_moe_sparse_route_align()
         ):
             return nowag_cuda_ops.moe_sparse_route_align(
@@ -84,6 +95,7 @@ def routed_experts_nowag(
             topk_ids,
             block_size,
             physical_expert_rows,
+            alignment_storage=alignment_storage,
         )
 
     gate_up_input_transform = None
@@ -96,8 +108,30 @@ def routed_experts_nowag(
             act_quant_fp8_roundtrip,
         )
 
+        gate_roundtrip_output = output
+        if gate_roundtrip_output is not None:
+            if not isinstance(gate_roundtrip_output, torch.Tensor):
+                raise ValueError("output must be a tensor")
+            for live_name, live_tensor in (
+                ("input", x),
+                ("middle_workspace", middle_workspace),
+                ("route_output_workspace", route_output_workspace),
+            ):
+                if (
+                    isinstance(live_tensor, torch.Tensor)
+                    and _shares_storage(gate_roundtrip_output, live_tensor)
+                ):
+                    raise ValueError(
+                        "output reused for Gate/Up rounding must not share "
+                        f"storage with {live_name}"
+                    )
+
         def round_gate_up_input(hidden: torch.Tensor) -> torch.Tensor:
-            return act_quant_fp8_roundtrip(hidden, 128)
+            return act_quant_fp8_roundtrip(
+                hidden,
+                128,
+                output=gate_roundtrip_output,
+            )
 
         def round_down_input(middle: torch.Tensor) -> torch.Tensor:
             return act_quant_fp8_inplace(middle, 128)
@@ -160,6 +194,12 @@ def routed_experts_nowag(
             if uses_large_moe_align(slots.numel())
             else None
         ),
+        align_routes_adaptive_tail64=(
+            moe_align_block_size_adaptive_tail64
+            if uses_large_moe_align(slots.numel())
+            else None
+        ),
+        caller_owned_alignment_storage=middle_workspace is not None,
         sum_routes=moe_sum_reduce_triton,
     )
 

@@ -250,7 +250,7 @@ def test_routed_experts_selects_adaptive_callback_only_above_1024_routes(
 
     ordinary_args = (positional[1], 16, 256)
     assert captured["align_routes"](*ordinary_args) is plain_result
-    assert plain_calls == [(ordinary_args, {})]
+    assert plain_calls == [(ordinary_args, {"alignment_storage": None})]
     if expect_adaptive:
         assert captured["builder_selection"] == "adaptive_callback"
         callback = captured["align_routes_adaptive"]

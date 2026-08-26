@@ -221,6 +221,77 @@ def _cumsum_experts_adaptive(
 
 
 @triton.jit
+def _cumsum_experts_adaptive_tail64(
+    counts_ptr,
+    cumsum_ptr,
+    num_tokens_post_pad_ptr,
+    tasks64_ptr,
+    tasks16_ptr,
+    task_counts_ptr,
+    effective_E: tl.constexpr,
+    block_size: tl.constexpr,
+    E_PADDED: tl.constexpr,
+):
+    lane = tl.arange(0, E_PADDED)
+    align_mask = lane < effective_E
+    c = tl.load(counts_ptr + lane, mask=align_mask, other=0)
+    nblk = tl.where(
+        align_mask, (c + block_size - 1) // block_size, 0
+    )
+    excl = tl.cumsum(nblk, axis=0) - nblk
+    row_start = excl * block_size
+    tl.store(cumsum_ptr + lane, row_start, mask=align_mask)
+    total_tok = tl.sum(nblk, axis=0) * block_size
+    tl.store(cumsum_ptr + effective_E, total_tok)
+    tl.store(num_tokens_post_pad_ptr, total_tok)
+
+    expert_mask = lane < effective_E - 1
+    expert_count = tl.where(expert_mask, c, 0)
+    full64 = expert_count // 64
+    remainder = expert_count - full64 * 64
+    tail64 = remainder >= 49
+    count64 = full64 + tail64.to(tl.int32)
+    count16 = tl.where(tail64, 0, (remainder + 15) // 16)
+    offset64 = tl.cumsum(count64, axis=0) - count64
+    offset16 = tl.cumsum(count16, axis=0) - count16
+    tl.store(task_counts_ptr, tl.sum(count64, axis=0))
+    tl.store(task_counts_ptr + 1, tl.sum(count16, axis=0))
+
+    for index in tl.range(0, tl.max(full64, axis=0)):
+        mask64 = expert_mask & (index < full64)
+        output64 = offset64 + index
+        tl.store(
+            tasks64_ptr + output64 * 2,
+            row_start + index * 64,
+            mask=mask64,
+        )
+        tl.store(tasks64_ptr + output64 * 2 + 1, lane, mask=mask64)
+
+    remainder_start = row_start + full64 * 64
+    tail64_output = offset64 + full64
+    tl.store(
+        tasks64_ptr + tail64_output * 2,
+        remainder_start,
+        mask=expert_mask & tail64,
+    )
+    tl.store(
+        tasks64_ptr + tail64_output * 2 + 1,
+        lane,
+        mask=expert_mask & tail64,
+    )
+
+    for index in tl.static_range(0, 3):
+        mask16 = expert_mask & (index < count16)
+        output16 = offset16 + index
+        tl.store(
+            tasks16_ptr + output16 * 2,
+            remainder_start + index * 16,
+            mask=mask16,
+        )
+        tl.store(tasks16_ptr + output16 * 2 + 1, lane, mask=mask16)
+
+
+@triton.jit
 def _fill_expert_ids(
     cumsum_ptr,
     expert_ids_ptr,
@@ -279,30 +350,157 @@ def uses_large_moe_align(num_routes: int) -> bool:
     return num_routes > _SMALL_CAP
 
 
+def _alignment_capacities(
+    num_routes: int,
+    block_size: int,
+    num_experts: int,
+) -> tuple[int, int, int]:
+    effective_E = num_experts + 1
+    if num_routes < effective_E:
+        sorted_capacity = num_routes * block_size
+    else:
+        sorted_capacity = num_routes + effective_E * (block_size - 1)
+    expert_id_capacity = _div_ceil(sorted_capacity, block_size)
+    return effective_E, sorted_capacity, expert_id_capacity
+
+
+def moe_align_workspace_int32_elements(
+    num_routes: int,
+    block_size: int,
+    num_experts: int,
+) -> int:
+    """Return the caller-owned int32 capacity for this aligner's shape path."""
+    if num_routes <= 0 or block_size <= 0 or num_experts <= 0:
+        raise ValueError("num_routes, block_size, and num_experts must be positive")
+    effective_E, sorted_capacity, expert_id_capacity = _alignment_capacities(
+        num_routes,
+        block_size,
+        num_experts,
+    )
+    elements = (
+        sorted_capacity
+        + expert_id_capacity
+        + 2 * effective_E
+        + 2
+    )
+    if uses_large_moe_align(num_routes):
+        elements += effective_E
+    return elements
+
+
+def _alignment_buffers_from_storage(
+    *,
+    alignment_storage: torch.Tensor,
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
+    num_routes = topk_ids.numel()
+    required = moe_align_workspace_int32_elements(
+        num_routes,
+        block_size,
+        num_experts,
+    )
+    if (
+        alignment_storage.dtype != torch.int32
+        or alignment_storage.device != topk_ids.device
+        or not alignment_storage.is_contiguous()
+        or alignment_storage.numel() < required
+    ):
+        raise ValueError(
+            "alignment_storage must be contiguous int32 on the route device "
+            f"with at least {required} elements"
+        )
+    if (
+        alignment_storage.untyped_storage().data_ptr()
+        == topk_ids.untyped_storage().data_ptr()
+    ):
+        raise ValueError("alignment_storage must not share storage with topk_ids")
+    effective_E, sorted_capacity, expert_id_capacity = _alignment_capacities(
+        num_routes,
+        block_size,
+        num_experts,
+    )
+    storage = alignment_storage.flatten()[:required]
+    offset = 0
+    sorted_token_ids = storage[offset : offset + sorted_capacity]
+    offset += sorted_capacity
+    expert_ids = storage[offset : offset + expert_id_capacity]
+    offset += expert_id_capacity
+    num_tokens_post_pad = storage[offset : offset + 1]
+    offset += 1
+    fill_counter = storage[offset : offset + effective_E]
+    offset += effective_E
+    cumsum = storage[offset : offset + effective_E + 1]
+    offset += effective_E + 1
+    counts = None
+    if uses_large_moe_align(num_routes):
+        counts = storage[offset : offset + effective_E]
+    return (
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        fill_counter,
+        cumsum,
+        counts,
+    )
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
+    *,
+    alignment_storage: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert topk_ids.dtype == torch.int32
     assert topk_ids.is_contiguous()
     device = topk_ids.device
     numel = topk_ids.numel()
-    effective_E = num_experts + 1  # mirrors fused.py's num_experts+1 convention
+    effective_E, max_num_tokens_padded, max_num_m_blocks = _alignment_capacities(
+        numel,
+        block_size,
+        num_experts,
+    )
 
-    # Buffer sizes mirror freetoken.moe.fused.moe_align_block_size exactly.
-    if numel < num_experts + 1:
-        max_num_tokens_padded = numel * block_size
+    counts = None
+    if alignment_storage is None:
+        sorted_token_ids = torch.empty(
+            (max_num_tokens_padded,), dtype=torch.int32, device=device
+        )
+        expert_ids = torch.empty(
+            (max_num_m_blocks,), dtype=torch.int32, device=device
+        )
+        num_tokens_post_pad = torch.empty(
+            (1,), dtype=torch.int32, device=device
+        )
+        fill_counter = torch.empty(
+            (effective_E,), dtype=torch.int32, device=device
+        )
+        cumsum = torch.empty(
+            (effective_E + 1,), dtype=torch.int32, device=device
+        )
     else:
-        max_num_tokens_padded = numel + (num_experts + 1) * (block_size - 1)
-    max_num_m_blocks = _div_ceil(max_num_tokens_padded, block_size)
-
-    sorted_token_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=device)
-    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=device)
-    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=device)
-
-    fill_counter = torch.empty((effective_E,), dtype=torch.int32, device=device)
-    cumsum = torch.empty((effective_E + 1,), dtype=torch.int32, device=device)
+        (
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            fill_counter,
+            cumsum,
+            counts,
+        ) = _alignment_buffers_from_storage(
+            alignment_storage=alignment_storage,
+            topk_ids=topk_ids,
+            block_size=block_size,
+            num_experts=num_experts,
+        )
 
     if 0 < numel <= _SMALL_CAP:
         # Fixed via H100 sweep (9-config grid; this num_warps ladder -- w2 at
@@ -329,7 +527,10 @@ def moe_align_block_size(
         )
         return sorted_token_ids, expert_ids, num_tokens_post_pad
 
-    counts = torch.zeros((effective_E,), dtype=torch.int32, device=device)
+    if counts is None:
+        counts = torch.zeros((effective_E,), dtype=torch.int32, device=device)
+    else:
+        counts.zero_()
     sorted_numel = max_num_tokens_padded
     n_big = max(sorted_numel, numel, effective_E)
     grid1 = lambda meta: (triton.cdiv(n_big, meta["BLOCK_SIZE"]),)
@@ -398,6 +599,8 @@ def moe_align_block_size_adaptive(
     tasks64: torch.Tensor,
     tasks16: torch.Tensor,
     task_counts: torch.Tensor,
+    *,
+    alignment_storage: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the four-stage large align and fill adaptive task queues in place.
 
@@ -446,23 +649,46 @@ def moe_align_block_size_adaptive(
             )
 
     device = topk_ids.device
-    effective_E = num_experts + 1
-    if numel < effective_E:
-        max_num_tokens_padded = numel * block_size
+    effective_E, max_num_tokens_padded, max_num_m_blocks = _alignment_capacities(
+        numel,
+        block_size,
+        num_experts,
+    )
+    if alignment_storage is None:
+        sorted_token_ids = torch.empty(
+            (max_num_tokens_padded,), dtype=torch.int32, device=device
+        )
+        expert_ids = torch.empty(
+            (max_num_m_blocks,), dtype=torch.int32, device=device
+        )
+        num_tokens_post_pad = torch.empty(
+            (1,), dtype=torch.int32, device=device
+        )
+        fill_counter = torch.empty(
+            (effective_E,), dtype=torch.int32, device=device
+        )
+        cumsum = torch.empty(
+            (effective_E + 1,), dtype=torch.int32, device=device
+        )
+        counts = torch.zeros(
+            (effective_E,), dtype=torch.int32, device=device
+        )
     else:
-        max_num_tokens_padded = numel + effective_E * (block_size - 1)
-    max_num_m_blocks = _div_ceil(max_num_tokens_padded, block_size)
-
-    sorted_token_ids = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=device
-    )
-    expert_ids = torch.empty(
-        (max_num_m_blocks,), dtype=torch.int32, device=device
-    )
-    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=device)
-    fill_counter = torch.empty((effective_E,), dtype=torch.int32, device=device)
-    cumsum = torch.empty((effective_E + 1,), dtype=torch.int32, device=device)
-    counts = torch.zeros((effective_E,), dtype=torch.int32, device=device)
+        (
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            fill_counter,
+            cumsum,
+            counts,
+        ) = _alignment_buffers_from_storage(
+            alignment_storage=alignment_storage,
+            topk_ids=topk_ids,
+            block_size=block_size,
+            num_experts=num_experts,
+        )
+        assert counts is not None
+        counts.zero_()
 
     sorted_numel = max_num_tokens_padded
     n_big = max(sorted_numel, numel, effective_E)
@@ -524,8 +750,155 @@ def moe_align_block_size_adaptive(
     return sorted_token_ids, expert_ids, num_tokens_post_pad
 
 
+def moe_align_block_size_adaptive_tail64(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    tasks64: torch.Tensor,
+    tasks16: torch.Tensor,
+    task_counts: torch.Tensor,
+    *,
+    alignment_storage: torch.Tensor | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run large align and fold residuals of 49..63 rows into BM64."""
+    if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+        raise ValueError("topk_ids must be contiguous int32")
+    if not topk_ids.is_cuda:
+        raise ValueError("topk_ids must be a CUDA tensor")
+    numel = topk_ids.numel()
+    if not uses_large_moe_align(numel):
+        raise ValueError("adaptive align requires the four-stage route range")
+    if block_size != 16:
+        raise ValueError("adaptive align requires block_size=16")
+    if num_experts <= 0:
+        raise ValueError("num_experts must be positive")
+
+    from nowag_vllm.cuda_ops import adaptive_tail64_task_capacities
+
+    capacity64, capacity16 = adaptive_tail64_task_capacities(
+        num_routes=numel,
+        num_experts=num_experts,
+    )
+    expected = (
+        (tasks64, (capacity64, 2), "tasks64"),
+        (tasks16, (capacity16, 2), "tasks16"),
+        (task_counts, (2,), "task_counts"),
+    )
+    for tensor, shape, name in expected:
+        if (
+            tensor.dtype != torch.int32
+            or not tensor.is_contiguous()
+            or tensor.device != topk_ids.device
+            or tuple(tensor.shape) != shape
+        ):
+            raise ValueError(
+                f"{name} must be contiguous int32{shape} on the route device"
+            )
+
+    device = topk_ids.device
+    effective_E, max_num_tokens_padded, max_num_m_blocks = (
+        _alignment_capacities(numel, block_size, num_experts)
+    )
+    if alignment_storage is None:
+        sorted_token_ids = torch.empty(
+            (max_num_tokens_padded,), dtype=torch.int32, device=device
+        )
+        expert_ids = torch.empty(
+            (max_num_m_blocks,), dtype=torch.int32, device=device
+        )
+        num_tokens_post_pad = torch.empty(
+            (1,), dtype=torch.int32, device=device
+        )
+        fill_counter = torch.empty(
+            (effective_E,), dtype=torch.int32, device=device
+        )
+        cumsum = torch.empty(
+            (effective_E + 1,), dtype=torch.int32, device=device
+        )
+        counts = torch.zeros(
+            (effective_E,), dtype=torch.int32, device=device
+        )
+    else:
+        (
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            fill_counter,
+            cumsum,
+            counts,
+        ) = _alignment_buffers_from_storage(
+            alignment_storage=alignment_storage,
+            topk_ids=topk_ids,
+            block_size=block_size,
+            num_experts=num_experts,
+        )
+        assert counts is not None
+        counts.zero_()
+
+    sorted_numel = max_num_tokens_padded
+    n_big = max(sorted_numel, numel, effective_E)
+    grid1 = lambda meta: (triton.cdiv(n_big, meta["BLOCK_SIZE"]),)
+    _fill_and_count[grid1](
+        topk_ids,
+        sorted_token_ids,
+        counts,
+        fill_counter,
+        numel,
+        sorted_numel,
+        numel,
+        effective_E,
+        triton.next_power_of_2(effective_E + 1),
+        BLOCK_SIZE=256,
+        num_warps=8,
+        num_stages=3,
+    )
+
+    _cumsum_experts_adaptive_tail64[(1,)](
+        counts,
+        cumsum,
+        num_tokens_post_pad,
+        tasks64,
+        tasks16,
+        task_counts,
+        effective_E,
+        block_size,
+        triton.next_power_of_2(effective_E),
+    )
+
+    grid_eids = lambda meta: (
+        triton.cdiv(max(max_num_m_blocks, 1), meta["BLOCK_SIZE"]),
+    )
+    _fill_expert_ids[grid_eids](
+        cumsum,
+        expert_ids,
+        num_tokens_post_pad,
+        block_size,
+        effective_E,
+        effective_E.bit_length(),
+        BLOCK_SIZE=256,
+        num_warps=4,
+        num_stages=3,
+    )
+
+    grid3 = lambda meta: (triton.cdiv(max(numel, 1), meta["BLOCK_SIZE"]),)
+    _scatter[grid3](
+        topk_ids,
+        sorted_token_ids,
+        cumsum,
+        fill_counter,
+        numel,
+        effective_E,
+        BLOCK_SIZE=256,
+        num_warps=8,
+        num_stages=3,
+    )
+    return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
 __all__ = [
     "moe_align_block_size",
     "moe_align_block_size_adaptive",
+    "moe_align_block_size_adaptive_tail64",
+    "moe_align_workspace_int32_elements",
     "uses_large_moe_align",
 ]
