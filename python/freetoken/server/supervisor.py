@@ -54,6 +54,7 @@ class BackendHandle:
     ack_queue: Any
     processes: List[Any] = field(default_factory=list)
     expected_acks: int = 0
+    ipc_resources: List[Any] = field(default_factory=list)
 
 
 class WorkerDied(Exception):

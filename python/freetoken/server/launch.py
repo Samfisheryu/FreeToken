@@ -229,6 +229,7 @@ def launch_server(
             ack_queue=ack_queue,
             processes=processes,
             expected_acks=num_tokenizers + 2,
+            ipc_resources=[gpu_queue],
         )
 
     run_api_server(server_args, start_subprocess, run_shell=run_shell)
