@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from freetoken.core import Batch
 
 from .decode import DecodeManager
+from .forward import ForwardInput
 from .prefill import PrefillManager
-
-if TYPE_CHECKING:
-    from .scheduler import ForwardInput
 
 
 @dataclass(frozen=True)

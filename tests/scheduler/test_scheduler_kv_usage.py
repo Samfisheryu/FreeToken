@@ -73,7 +73,13 @@ def test_log_cache_geometry_reports_all_pools(monkeypatch):
 
     lines: list[str] = []
     monkeypatch.setattr(sched_mod.logger, "info_rank0", lines.append)
-    Scheduler._log_cache_geometry(SimpleNamespace(engine=_fake_engine()), "Cache rebuilt")
+    Scheduler._log_cache_geometry(
+        SimpleNamespace(
+            engine=_fake_engine(),
+            config=SimpleNamespace(batching_policy="legacy"),
+        ),
+        "Cache rebuilt",
+    )
     line = lines[-1]
     assert "Cache rebuilt: KV 64 pages (1024 tokens, 1.00 GiB)" in line
     assert "swa 512 pages (512 tokens, 1.00 GiB)" in line
@@ -88,7 +94,13 @@ def test_log_cache_geometry_plain_model_kv_only(monkeypatch):
     lines: list[str] = []
     monkeypatch.setattr(sched_mod.logger, "info_rank0", lines.append)
     engine = _fake_engine(swa=False, moe=False, mamba=False)
-    Scheduler._log_cache_geometry(SimpleNamespace(engine=engine), "Cache rebuilt")
+    Scheduler._log_cache_geometry(
+        SimpleNamespace(
+            engine=engine,
+            config=SimpleNamespace(batching_policy="legacy"),
+        ),
+        "Cache rebuilt",
+    )
     line = lines[-1]
     assert "Cache rebuilt: KV 64 pages (1024 tokens, 1.00 GiB)" in line
     assert "swa" not in line and "mamba" not in line and "MoE" not in line

@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-timeout", type=float, default=300.0)
     parser.add_argument(
         "--ft-executable",
-        help="Public ft executable (default: PATH, then the local freetoken-dev environment)",
+        help="Public ft executable (default: PATH)",
     )
     return parser.parse_args()
 
@@ -137,8 +137,7 @@ def find_ft_executable(explicit: str | None) -> str:
     found = shutil.which("ft")
     if found:
         return found
-    local = Path("/home/nengneng/miniconda3/envs/freetoken-dev/bin/ft")
-    return str(local) if local.is_file() else "ft"
+    raise FileNotFoundError("ft executable not found on PATH; pass --ft-executable")
 
 
 def server_command(

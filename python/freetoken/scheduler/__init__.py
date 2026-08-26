@@ -1,6 +1,6 @@
 from .config import SchedulerConfig
+from .joint_batch import JointBatchComposer
 from .layered_batch import LayeredBatchComposer, LayeredBatchPlan, LayeredExecutionStats
-from .joint_batch import JointBatchComposer, JointExecutionStats, JointPrefillWave
 from .mixed_batch import LegacyBatchComposer, MixedBatchComposer
 from .scheduler import Scheduler
 
@@ -9,8 +9,6 @@ __all__ = [
     "LayeredBatchPlan",
     "LayeredExecutionStats",
     "JointBatchComposer",
-    "JointExecutionStats",
-    "JointPrefillWave",
     "LegacyBatchComposer",
     "MixedBatchComposer",
     "Scheduler",

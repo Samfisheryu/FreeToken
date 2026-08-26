@@ -597,6 +597,7 @@ class Engine:
                     "Joint group-resident batching: "
                     f"requested_group_size={config.prefill_layer_group_size}, "
                     f"effective_group_size={cache.effective_prefill_group_size}, "
+                    f"prefill_wave_max_chunks={config.prefill_wave_max_chunks}, "
                     f"prefill_slots={cache.prefill_buffer_slots}, "
                     f"decode_slots={cache.decode_cache_size}"
                 )

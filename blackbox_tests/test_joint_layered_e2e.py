@@ -47,7 +47,6 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_FT = Path("/home/nengneng/miniconda3/envs/freetoken-dev/bin/ft")
 RUN_E2E = os.environ.get("FT_RUN_JOINT_E2E") == "1"
 
 VOCAB_SIZE = 512
@@ -92,7 +91,7 @@ def _ft_prefix() -> list[str]:
     installed = shutil.which("ft")
     if installed:
         return [installed]
-    return [str(DEFAULT_FT)]
+    pytest.skip("ft executable not found; set FT_CLI or add ft to PATH")
 
 
 def _serve_help() -> subprocess.CompletedProcess[str]:

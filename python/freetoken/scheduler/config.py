@@ -17,7 +17,7 @@ class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
     batching_policy: Literal["legacy", "mixed", "layered", "joint"] = "legacy"
     prefill_layer_group_size: int = 2
-    prefill_wave_max_chunks: int = 4
+    prefill_wave_max_chunks: int = 1
     prefill_execution: Literal["serial", "concurrent"] = "serial"
     cache_type: str = "radix"
     offline_mode: bool = False
