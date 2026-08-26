@@ -201,10 +201,10 @@
     }
   ],
   "metrics": {
-    "timestamp_source": "time.perf_counter relative to benchmark start",
+    "timestamp_source": "Client-side time.perf_counter relative to benchmark start; submitted_at is captured immediately before constructing and sending the HTTP request.",
     "saved_stream_events": "Save the timestamp and text of every non-empty SSE choice text event, plus the total count of SSE events containing a choice.",
-    "ttft_seconds": "first non-empty SSE text-event timestamp minus request submission timestamp",
-    "tpot_seconds": "(last non-empty SSE text-event timestamp - first non-empty SSE text-event timestamp) / (usage.completion_tokens - 1)",
+    "ttft_seconds": "First non-empty SSE text-event timestamp minus the client-side request submission timestamp; this includes HTTP connection/setup time and service-side queueing before the first token.",
+    "tpot_seconds": "Client-observed (last non-empty SSE text-event timestamp - first non-empty SSE text-event timestamp) / (usage.completion_tokens - 1); by the standard TPOT definition, pre-first-token queueing is represented in TTFT rather than TPOT.",
     "sse_text_event_gap_seconds": "Adjacent non-empty SSE text-event timestamp gaps, summarized per request at P50/P95/P99/max. These are not called token gaps unless the event count equals usage.completion_tokens.",
     "stream_granularity_check": "Cross-check non-empty SSE text-event count against usage.completion_tokens; retain TPOT based on completion_tokens even when the public stream coalesces tokens.",
     "makespan_seconds": "last response completion timestamp minus benchmark start for all 20 requests",

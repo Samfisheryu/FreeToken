@@ -58,6 +58,22 @@ def parse_args() -> argparse.Namespace:
             "layeredG2 jointG2-wave1 jointG2-wave2. Use 'all' to add exploratory wave4."
         ),
     )
+    parser.add_argument(
+        "--joint-groups",
+        nargs="+",
+        help=(
+            "Joint layer-group sizes to sweep, separated by spaces or commas. "
+            "Requires --joint-waves."
+        ),
+    )
+    parser.add_argument(
+        "--joint-waves",
+        nargs="+",
+        help=(
+            "Joint prefill wave chunk counts to sweep, separated by spaces or commas. "
+            "Requires --joint-groups."
+        ),
+    )
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--gpu", default="0", help="CUDA_VISIBLE_DEVICES value for each server")
     parser.add_argument("--profile", default="main", help="Workload profile name")
@@ -75,7 +91,41 @@ def parse_args() -> argparse.Namespace:
         "--ft-executable",
         help="Public ft executable (default: PATH)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (args.joint_groups is None) != (args.joint_waves is None):
+        parser.error("--joint-groups and --joint-waves must be provided together")
+    if args.joint_groups is not None:
+        args.joint_groups = parse_positive_int_values(
+            args.joint_groups, "--joint-groups", parser
+        )
+        args.joint_waves = parse_positive_int_values(
+            args.joint_waves, "--joint-waves", parser
+        )
+    return args
+
+
+def parse_positive_int_values(
+    raw_values: Iterable[str], option: str, parser: argparse.ArgumentParser
+) -> list[int]:
+    pieces = [
+        piece.strip()
+        for raw_value in raw_values
+        for piece in raw_value.split(",")
+        if piece.strip()
+    ]
+    if not pieces:
+        parser.error(f"{option} requires at least one positive integer")
+    values: list[int] = []
+    for piece in pieces:
+        try:
+            value = int(piece)
+        except ValueError:
+            parser.error(f"{option} values must be positive integers; got {piece!r}")
+        if value <= 0:
+            parser.error(f"{option} values must be positive integers; got {piece!r}")
+        if value not in values:
+            values.append(value)
+    return values
 
 
 def load_workload() -> dict[str, Any]:
@@ -115,7 +165,12 @@ def validate_workload(workload: dict[str, Any], profile_name: str) -> dict[str, 
     return profile
 
 
-def resolve_modes(raw_modes: Iterable[str], workload: dict[str, Any]) -> list[dict[str, Any]]:
+def resolve_modes(
+    raw_modes: Iterable[str],
+    workload: dict[str, Any],
+    joint_groups: Iterable[int] | None = None,
+    joint_waves: Iterable[int] | None = None,
+) -> list[dict[str, Any]]:
     available = {mode["name"]: mode for mode in workload["comparison_modes"]}
     tokens = [piece for item in raw_modes for piece in item.split(",") if piece]
     if tokens == ["all"]:
@@ -128,7 +183,33 @@ def resolve_modes(raw_modes: Iterable[str], workload: dict[str, Any]) -> list[di
             name = MODE_ALIASES[token]
             if name not in names:
                 names.append(name)
-    return [available[name] for name in names]
+    modes = [available[name] for name in names]
+    if joint_groups is not None and joint_waves is not None:
+        modes.extend(
+            {
+                "name": f"joint_g{group_size}_wave{wave_chunks}",
+                "batching_policy": "joint",
+                "prefill_layer_group_size": group_size,
+                "prefill_wave_max_chunks": wave_chunks,
+                "primary": False,
+            }
+            for group_size in joint_groups
+            for wave_chunks in joint_waves
+        )
+
+    unique_modes: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for mode in modes:
+        identity = (
+            mode["batching_policy"],
+            mode.get("prefill_layer_group_size"),
+            mode.get("prefill_execution"),
+            mode.get("prefill_wave_max_chunks"),
+        )
+        if identity not in seen:
+            seen.add(identity)
+            unique_modes.append(mode)
+    return unique_modes
 
 
 def find_ft_executable(explicit: str | None) -> str:
@@ -641,6 +722,11 @@ def summarize_repetition(records: list[dict[str, Any]], origin: float) -> dict[s
 
 
 def summarize_mode(records: list[dict[str, Any]], repetitions: list[dict[str, Any]]) -> dict[str, Any]:
+    overall = [
+        record["ttft_seconds"]
+        for record in records
+        if record["ttft_seconds"] is not None
+    ]
     first = [record["ttft_seconds"] for record in records if record["turn_index"] == 0 and record["ttft_seconds"] is not None]
     later = [record["ttft_seconds"] for record in records if record["turn_index"] > 0 and record["ttft_seconds"] is not None]
     tpot = [record["tpot_seconds"] for record in records if record["tpot_seconds"] is not None]
@@ -654,6 +740,7 @@ def summarize_mode(records: list[dict[str, Any]], repetitions: list[dict[str, An
             true_token_gaps.extend(gaps)
     return {
         "ttft_seconds": {
+            "overall": distribution(overall, [50, 95]),
             "first_turn": distribution(first, [50, 95]),
             "later_turns": distribution(later, [50, 95]),
         },
@@ -844,7 +931,12 @@ def main() -> int:
         raise ValueError("--repetitions must be at least 1")
     workload = load_workload()
     profile = validate_workload(workload, args.profile)
-    modes = resolve_modes(args.modes, workload)
+    modes = resolve_modes(
+        args.modes,
+        workload,
+        joint_groups=args.joint_groups,
+        joint_waves=args.joint_waves,
+    )
     if args.dry_run:
         print(json.dumps(dry_run_plan(args, workload, profile, modes), indent=2))
         return 0
