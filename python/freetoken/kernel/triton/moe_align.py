@@ -160,6 +160,67 @@ def _cumsum_experts(
 
 
 @triton.jit
+def _cumsum_experts_adaptive(
+    counts_ptr,
+    cumsum_ptr,
+    num_tokens_post_pad_ptr,
+    tasks64_ptr,
+    tasks16_ptr,
+    task_counts_ptr,
+    effective_E: tl.constexpr,
+    block_size: tl.constexpr,
+    E_PADDED: tl.constexpr,
+):
+    # Preserve the ordinary BM16 align prefix exactly, then derive both task
+    # queues from the same per-expert counts.  effective_E's final lane is the
+    # align sentinel expert and intentionally contributes no compute tasks.
+    lane = tl.arange(0, E_PADDED)
+    align_mask = lane < effective_E
+    c = tl.load(counts_ptr + lane, mask=align_mask, other=0)
+    nblk = tl.where(
+        align_mask, (c + block_size - 1) // block_size, 0
+    )
+    excl = tl.cumsum(nblk, axis=0) - nblk
+    row_start = excl * block_size
+    tl.store(cumsum_ptr + lane, row_start, mask=align_mask)
+    total_tok = tl.sum(nblk, axis=0) * block_size
+    tl.store(cumsum_ptr + effective_E, total_tok)
+    tl.store(num_tokens_post_pad_ptr, total_tok)
+
+    expert_mask = lane < effective_E - 1
+    expert_count = tl.where(expert_mask, c, 0)
+    n64 = expert_count // 64
+    remainder = expert_count - n64 * 64
+    n16 = (remainder + 15) // 16
+    offset64 = tl.cumsum(n64, axis=0) - n64
+    offset16 = tl.cumsum(n16, axis=0) - n16
+    total64 = tl.sum(n64, axis=0)
+    total16 = tl.sum(n16, axis=0)
+    tl.store(task_counts_ptr, total64)
+    tl.store(task_counts_ptr + 1, total16)
+
+    for index in tl.range(0, tl.max(n64, axis=0)):
+        mask64 = expert_mask & (index < n64)
+        output64 = offset64 + index
+        tl.store(
+            tasks64_ptr + output64 * 2,
+            row_start + index * 64,
+            mask=mask64,
+        )
+        tl.store(tasks64_ptr + output64 * 2 + 1, lane, mask=mask64)
+
+    for index in tl.static_range(0, 4):
+        mask16 = expert_mask & (index < n16)
+        output16 = offset16 + index
+        tl.store(
+            tasks16_ptr + output16 * 2,
+            row_start + n64 * 64 + index * 16,
+            mask=mask16,
+        )
+        tl.store(tasks16_ptr + output16 * 2 + 1, lane, mask=mask16)
+
+
+@triton.jit
 def _fill_expert_ids(
     cumsum_ptr,
     expert_ids_ptr,
@@ -211,6 +272,11 @@ def _scatter(
 
 def _div_ceil(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def uses_large_moe_align(num_routes: int) -> bool:
+    """Return whether the in-tree aligner selects its four-stage path."""
+    return num_routes > _SMALL_CAP
 
 
 def moe_align_block_size(
@@ -325,4 +391,141 @@ def moe_align_block_size(
     return sorted_token_ids, expert_ids, num_tokens_post_pad
 
 
-__all__ = ["moe_align_block_size"]
+def moe_align_block_size_adaptive(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    tasks64: torch.Tensor,
+    tasks16: torch.Tensor,
+    task_counts: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the four-stage large align and fill adaptive task queues in place.
+
+    This callback is defined for the ordinary aligner's four-stage route range
+    and BM16 alignment.  ``num_experts`` is the physical expert-row count; the
+    align output retains its extra sentinel expert while both task queues
+    exclude it.  The three output buffers must use the fixed capacities
+    supplied by ``nowag_vllm.cuda_ops.adaptive_task_capacities``.
+    """
+    if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+        raise ValueError("topk_ids must be contiguous int32")
+    if not topk_ids.is_cuda:
+        raise ValueError("topk_ids must be a CUDA tensor")
+    numel = topk_ids.numel()
+    if not uses_large_moe_align(numel):
+        raise ValueError("adaptive align requires the four-stage route range")
+    if block_size != 16:
+        raise ValueError("adaptive align requires block_size=16")
+    if num_experts <= 0:
+        raise ValueError("num_experts must be positive")
+
+    active_experts = min(numel, num_experts)
+    capacity64 = max(1, numel // 64)
+    capacity16 = max(
+        1,
+        min(
+            numel,
+            4 * num_experts,
+            (numel + 15 * active_experts) // 16,
+        ),
+    )
+    expected = (
+        (tasks64, (capacity64, 2), "tasks64"),
+        (tasks16, (capacity16, 2), "tasks16"),
+        (task_counts, (2,), "task_counts"),
+    )
+    for tensor, shape, name in expected:
+        if (
+            tensor.dtype != torch.int32
+            or not tensor.is_contiguous()
+            or tensor.device != topk_ids.device
+            or tuple(tensor.shape) != shape
+        ):
+            raise ValueError(
+                f"{name} must be contiguous int32{shape} on the route device"
+            )
+
+    device = topk_ids.device
+    effective_E = num_experts + 1
+    if numel < effective_E:
+        max_num_tokens_padded = numel * block_size
+    else:
+        max_num_tokens_padded = numel + effective_E * (block_size - 1)
+    max_num_m_blocks = _div_ceil(max_num_tokens_padded, block_size)
+
+    sorted_token_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=device
+    )
+    expert_ids = torch.empty(
+        (max_num_m_blocks,), dtype=torch.int32, device=device
+    )
+    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=device)
+    fill_counter = torch.empty((effective_E,), dtype=torch.int32, device=device)
+    cumsum = torch.empty((effective_E + 1,), dtype=torch.int32, device=device)
+    counts = torch.zeros((effective_E,), dtype=torch.int32, device=device)
+
+    sorted_numel = max_num_tokens_padded
+    n_big = max(sorted_numel, numel, effective_E)
+    grid1 = lambda meta: (triton.cdiv(n_big, meta["BLOCK_SIZE"]),)
+    _fill_and_count[grid1](
+        topk_ids,
+        sorted_token_ids,
+        counts,
+        fill_counter,
+        numel,
+        sorted_numel,
+        numel,
+        effective_E,
+        triton.next_power_of_2(effective_E + 1),
+        BLOCK_SIZE=256,
+        num_warps=8,
+        num_stages=3,
+    )
+
+    _cumsum_experts_adaptive[(1,)](
+        counts,
+        cumsum,
+        num_tokens_post_pad,
+        tasks64,
+        tasks16,
+        task_counts,
+        effective_E,
+        block_size,
+        triton.next_power_of_2(effective_E),
+    )
+
+    grid_eids = lambda meta: (
+        triton.cdiv(max(max_num_m_blocks, 1), meta["BLOCK_SIZE"]),
+    )
+    _fill_expert_ids[grid_eids](
+        cumsum,
+        expert_ids,
+        num_tokens_post_pad,
+        block_size,
+        effective_E,
+        effective_E.bit_length(),
+        BLOCK_SIZE=256,
+        num_warps=4,
+        num_stages=3,
+    )
+
+    grid3 = lambda meta: (triton.cdiv(max(numel, 1), meta["BLOCK_SIZE"]),)
+    _scatter[grid3](
+        topk_ids,
+        sorted_token_ids,
+        cumsum,
+        fill_counter,
+        numel,
+        effective_E,
+        BLOCK_SIZE=256,
+        num_warps=8,
+        num_stages=3,
+    )
+    return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
+__all__ = [
+    "moe_align_block_size",
+    "moe_align_block_size_adaptive",
+    "uses_large_moe_align",
+]

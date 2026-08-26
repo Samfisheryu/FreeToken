@@ -62,6 +62,8 @@ def routed_experts_nowag(
     # sgl_kernel limit on the number of physical expert rows.
     from freetoken.kernel.triton.moe_align import (
         moe_align_block_size as moe_align_block_size_triton,
+        moe_align_block_size_adaptive,
+        uses_large_moe_align,
     )
 
     def align_nowag_routes(
@@ -153,6 +155,11 @@ def routed_experts_nowag(
         gate_up_input_transform=gate_up_input_transform,
         middle_transform=middle_transform,
         align_routes=align_nowag_routes,
+        align_routes_adaptive=(
+            moe_align_block_size_adaptive
+            if uses_large_moe_align(slots.numel())
+            else None
+        ),
         sum_routes=moe_sum_reduce_triton,
     )
 
