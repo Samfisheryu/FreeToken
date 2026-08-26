@@ -1,0 +1,219 @@
+{
+  "schema": "freetoken.public_workload.v1",
+  "name": "lab_agent_burst_v1",
+  "description": "Four small-lab users each run one closed-loop agent session. Starts are slightly staggered, while tool-result turns create repeatable prefill bursts during ongoing decode.",
+  "rationale": [
+    "Four independent users are enough to create overlap without turning the workload into an open-loop saturation test.",
+    "The 0/50/100/150 ms starts model users entering the service close together rather than at an artificial barrier.",
+    "Each later request waits for that user's prior request to finish and then waits a fixed user-specific think time, preserving closed-loop agent behavior.",
+    "The main profile uses 512 decode tokens because a shorter decode would overstate how often prefill arrives relative to decode in the target AIME-like agent workload.",
+    "Fixed assistant transcripts and fixed tool results, rather than each policy's actual output, make every submitted prompt token-identical across policies even when generated outputs disagree."
+  ],
+  "content_materialization": {
+    "seed": 20260825,
+    "tokenizer_requirement": "Materialize and validate every segment with the same public tokenizer used by the served model.",
+    "representation": "Text submitted to the public API, with verified token IDs used only for materialization validation.",
+    "method": "Construct deterministic tokenizer-stable project-context, assistant-transcript, and tool-result text from this seed; tokenize without added special tokens; before submitting text, require every segment and nested prompt to encode to exactly the requested valid non-special token IDs and decode back to identical text.",
+    "session_isolation": "Give each user's initial prompt a distinct first token so separate sessions cannot share a radix prefix.",
+    "fixed_input_rule": "For turn t>0, submit the prior fixed prompt text followed by the prior turn's pre-generated fixed assistant transcript text and the new pre-generated fixed tool-result text. Never append the policy's actual generated output to a later prompt.",
+    "request_seed_rule": "request_seed = 20260825 + 100 * user_index + turn_index"
+    ,
+    "repetition_seed_rule": "segment_materialization_seed = 20260825 + 10000 * repetition_index; request_seed remains fixed by user and turn so every policy receives identical seeds"
+  },
+  "sessions": [
+    {
+      "user_id": "lab_user_0",
+      "user_index": 0,
+      "start_delay_ms": 0,
+      "think_time_after_completion_ms": 50
+    },
+    {
+      "user_id": "lab_user_1",
+      "user_index": 1,
+      "start_delay_ms": 50,
+      "think_time_after_completion_ms": 100
+    },
+    {
+      "user_id": "lab_user_2",
+      "user_index": 2,
+      "start_delay_ms": 100,
+      "think_time_after_completion_ms": 150
+    },
+    {
+      "user_id": "lab_user_3",
+      "user_index": 3,
+      "start_delay_ms": 150,
+      "think_time_after_completion_ms": 200
+    }
+  ],
+  "closed_loop_submission": {
+    "turns_per_session": 5,
+    "first_turn_submit_at": "benchmark_start + start_delay_ms",
+    "later_turn_submit_at": "prior_actual_response_complete + think_time_after_completion_ms",
+    "input_dependency": "Later prompts use only pre-generated fixed transcript/tool text whose tokenization was verified; actual response completion controls timing but actual response text never controls later input.",
+    "total_requests": 20
+  },
+  "profiles": {
+    "main": {
+      "label": "lab_agent_512",
+      "primary_conclusion_eligible": true,
+      "initial_prompt_tokens": 640,
+      "requested_decode_tokens": 512,
+      "fixed_assistant_transcript_tokens": 512,
+      "fixed_tool_result_tokens": 320,
+      "incremental_prompt_tokens_after_first_turn": 832,
+      "prompt_tokens_by_turn": [
+        640,
+        1472,
+        2304,
+        3136,
+        3968
+      ],
+      "prompt_plus_requested_output_tokens_by_turn": [
+        1152,
+        1984,
+        2816,
+        3648,
+        4480
+      ],
+      "expected_cached_tokens_by_turn": [
+        0,
+        640,
+        1472,
+        2304,
+        3136
+      ],
+      "expected_actual_new_prefill_tokens_by_turn": [
+        640,
+        832,
+        832,
+        832,
+        832
+      ],
+      "new_prefill_tokens_per_session": 3968,
+      "decode_tokens_per_session": 2560,
+      "new_prefill_to_decode_ratio": 1.55,
+      "max_seq_len": 8192
+    },
+    "stress_short_turn_192": {
+      "label": "stress_short_turn_192",
+      "primary_conclusion_eligible": false,
+      "purpose": "Optional short-turn stress exploration only; it must not support the main performance conclusion because it raises prefill arrival frequency relative to decode.",
+      "initial_prompt_tokens": 640,
+      "requested_decode_tokens": 192,
+      "fixed_assistant_transcript_tokens": 192,
+      "fixed_tool_result_tokens": 320,
+      "incremental_prompt_tokens_after_first_turn": 512,
+      "prompt_tokens_by_turn": [
+        640,
+        1152,
+        1664,
+        2176,
+        2688
+      ],
+      "prompt_plus_requested_output_tokens_by_turn": [
+        832,
+        1344,
+        1856,
+        2368,
+        2880
+      ],
+      "expected_cached_tokens_by_turn": [
+        0,
+        640,
+        1152,
+        1664,
+        2176
+      ],
+      "expected_actual_new_prefill_tokens_by_turn": [
+        640,
+        512,
+        512,
+        512,
+        512
+      ],
+      "new_prefill_tokens_per_session": 2688,
+      "decode_tokens_per_session": 960,
+      "new_prefill_to_decode_ratio": 2.8,
+      "max_seq_len": 8192
+    }
+  },
+  "request_contract": {
+    "endpoint": "/v1/completions",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "temperature": 0.0,
+    "ignore_eos": true,
+    "exact_completion_length_required": true,
+    "output_mismatch_behavior": "Record exact output mismatch against the reference policy and continue all remaining requests."
+  },
+  "public_server_config": {
+    "max_running_requests": 8,
+    "max_seq_len_override": 8192,
+    "max_prefill_length": 64,
+    "dtype": "float16",
+    "attention_backend": "triton",
+    "moe_cache_size": 24,
+    "cuda_graph_max_bs": 0,
+    "cache_type": "radix",
+    "enable_cache_report": true
+  },
+  "comparison_modes": [
+    {
+      "name": "legacy",
+      "batching_policy": "legacy",
+      "primary": true
+    },
+    {
+      "name": "mixed",
+      "batching_policy": "mixed",
+      "primary": true
+    },
+    {
+      "name": "layered_g2_serial",
+      "batching_policy": "layered",
+      "prefill_layer_group_size": 2,
+      "prefill_execution": "serial",
+      "primary": true
+    },
+    {
+      "name": "joint_g2_wave1",
+      "batching_policy": "joint",
+      "prefill_layer_group_size": 2,
+      "prefill_wave_max_chunks": 1,
+      "primary": true
+    },
+    {
+      "name": "joint_g2_wave2",
+      "batching_policy": "joint",
+      "prefill_layer_group_size": 2,
+      "prefill_wave_max_chunks": 2,
+      "primary": true
+    },
+    {
+      "name": "joint_g2_wave4_exploratory",
+      "batching_policy": "joint",
+      "prefill_layer_group_size": 2,
+      "prefill_wave_max_chunks": 4,
+      "primary": false
+    }
+  ],
+  "metrics": {
+    "timestamp_source": "time.perf_counter relative to benchmark start",
+    "saved_stream_events": "Save the timestamp and text of every non-empty SSE choice text event, plus the total count of SSE events containing a choice.",
+    "ttft_seconds": "first non-empty SSE text-event timestamp minus request submission timestamp",
+    "tpot_seconds": "(last non-empty SSE text-event timestamp - first non-empty SSE text-event timestamp) / (usage.completion_tokens - 1)",
+    "sse_text_event_gap_seconds": "Adjacent non-empty SSE text-event timestamp gaps, summarized per request at P50/P95/P99/max. These are not called token gaps unless the event count equals usage.completion_tokens.",
+    "stream_granularity_check": "Cross-check non-empty SSE text-event count against usage.completion_tokens; retain TPOT based on completion_tokens even when the public stream coalesces tokens.",
+    "makespan_seconds": "last response completion timestamp minus benchmark start for all 20 requests",
+    "prompt_throughput_tokens_per_second": "sum of usage.prompt_tokens across all 20 requests divided by makespan_seconds",
+    "actual_new_prefill_throughput_tokens_per_second": "sum of (usage.prompt_tokens - cached_tokens) across all 20 requests divided by makespan_seconds; unlike prompt throughput this excludes reused prefix tokens",
+    "decode_throughput_tokens_per_second": "sum of usage.completion_tokens across all 20 requests divided by makespan_seconds",
+    "cached_tokens": "usage.prompt_tokens_details.cached_tokens for every request",
+    "actual_new_prefill_tokens": "usage.prompt_tokens - cached_tokens; compare to 640 on turn 0 and 832 on later main-profile turns",
+    "prefix_cache_validation": "For each later turn, require cached_tokens to equal the complete prior fixed prompt length; require each turn's actual_new_prefill_tokens to equal the profile expectation.",
+    "output_consistency": "Compare each actual output with the same user/turn reference output, record the first difference, and never terminate timing early solely for a mismatch."
+  }
+}
