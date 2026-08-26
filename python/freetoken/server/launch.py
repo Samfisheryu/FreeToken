@@ -55,7 +55,11 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     tokenize_worker(**kwargs)
 
 
-def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
+def _run_scheduler(
+    args: ServerArgs,
+    ack_queue: mp.Queue[str],
+    gpu_queue: mp.Queue,
+) -> None:
     if args.shell_mode:
         _detach_process_group()
 
@@ -88,7 +92,14 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             _report_startup_error(ack_queue, exc)
             raise
 
+        gpu_queue.put((args.tp_info.rank, scheduler.gpus[0]))
+
         if args.tp_info.is_primary():
+            gpus = [None] * args.tp_info.size
+            for _ in range(args.tp_info.size):
+                rank, gpu = gpu_queue.get()
+                gpus[rank] = gpu
+
             # Report the real per-unit cache VRAM costs (KV/expert/mamba), the device-wide free
             # VRAM, and the per-pool rebuild floors before the ready ack, so the supervisor has
             # them (and the desktop's slider bounds) by the time the gate flips. Optional +
@@ -99,7 +110,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
 
                 meta = compute_cache_status_meta(scheduler.engine)
                 # the parent must not touch CUDA to learn this
-                meta["gpus"] = scheduler.gpus
+                meta["gpus"] = gpus
                 ack_queue.put(("meta", meta))
             except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
                 pass
@@ -147,7 +158,7 @@ def launch_server(
             raise SystemExit(f"{prog or 'ft serve'}: error: {exc}") from exc
         logger.info(
             f"--gpu {','.join(server_args.gpu)} -> "
-            f"{', '.join(server_args.gpu_assigned) if server_args.gpu_assigned else 'resolved at CUDA init (no NVML)'}"
+            f"{', '.join(server_args.gpu_assigned) if server_args.gpu_assigned else 'resolved by each worker at CUDA init'}"
         )
 
     def start_subprocess() -> "BackendHandle":
@@ -160,13 +171,14 @@ def launch_server(
 
         world_size = server_args.tp_info.size
         ack_queue: mp.Queue = mp.Queue()
+        gpu_queue: mp.Queue = mp.Queue()
         processes: list[mp.Process] = []
 
         for i in range(world_size):
             new_args = replace(server_args, tp_info=DistributedInfo(i, world_size))
             p = mp.Process(
                 target=_run_scheduler,
-                args=(new_args, ack_queue),
+                args=(new_args, ack_queue, gpu_queue),
                 daemon=False,
                 name=f"freetoken-TP{i}-scheduler",
             )

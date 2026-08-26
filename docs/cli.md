@@ -179,7 +179,8 @@ profile that `ft serve --moe-backend auto` and `--moe-hybrid-max-fetch -1` then 
 
 - One profile per GPU, at `~/.cache/freetoken/benchbw/<gpu-uuid>.json`.
 - Keyed on expert format + GPU, so a profile from other hardware is ignored rather than
-  misapplied. An older single `benchbw.json` still counts if its GPU name matches.
+  misapplied. An older single `benchbw.json` is used only when the runtime cannot identify
+  the GPU by UUID; rerun the benchmark once per GPU after upgrading.
 - What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.

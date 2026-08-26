@@ -130,9 +130,9 @@ def _swa_page_size(config: Any) -> int:
 def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     """Full /v1/stats doc. throughput is 0 when idle; kv/mamba/swa are null
     when their total is 0 (owned-KV / non-hybrid / non-SWA). kv and swa share one shape:
-    pages + the pool's own page_size (tokens = pages x page_size). gpus: the engine's GPU as
-    [{index, name, uuid, total_bytes}] (the primary rank's; a list so TP can extend it), []
-    until the readiness meta arrives."""
+    pages + the pool's own page_size (tokens = pages x page_size). gpus: one
+    {index, name, uuid, total_bytes} entry per TP rank, or [] until the readiness
+    metadata arrives."""
     tr: StatsTracker = state.stats
     config = state.config
     ready_at = getattr(state, "ready_at", None)

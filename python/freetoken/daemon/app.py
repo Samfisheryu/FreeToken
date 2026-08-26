@@ -59,22 +59,30 @@ class BenchBody(BaseModel):
 
 
 def _bench_profile_path(gpu_uuid: str | None) -> str | None:
-    # per-GPU profiles and no torch here: the serve's own card when its --gpu names one, else the newest file
+    # Per-GPU profiles and no torch here. A requested card must never borrow another
+    # card's measurements; without a requested card, return the newest available profile.
     from freetoken.moe.bench_profile import default_profile_path, latest_profile_path  # torch-free
 
     if gpu_uuid:
         path = default_profile_path(gpu_uuid)
-        if os.path.isfile(path):
-            return path
+        return path if os.path.isfile(path) else None
     return latest_profile_path()
 
 
-def _serve_gpu_uuid(args: list[str]) -> str | None:
-    """The full UUID a serve's `--gpu` pins, or None when there is none or it cannot be resolved."""
+def _serve_gpu_spec(args: list[str]) -> str | None:
+    """The first raw selector from a serve's ``--gpu`` list."""
     for i, a in enumerate(args):
         val = a[len("--gpu="):] if a.startswith("--gpu=") else (args[i + 1] if a == "--gpu" and i + 1 < len(args) else None)
         if not val:
             continue
+        return val.split(",", 1)[0].strip() or None
+    return None
+
+
+def _serve_gpu_uuid(args: list[str]) -> str | None:
+    """The full UUID a serve's first ``--gpu`` selector pins, when resolvable without CUDA."""
+    val = _serve_gpu_spec(args)
+    if val:
         from freetoken.gpu_select import resolve_gpu_uuids
 
         try:
@@ -86,6 +94,11 @@ def _serve_gpu_uuid(args: list[str]) -> str | None:
         # no NVML: a UUID value still keys the profile file (canonical prefix), an index cannot
         return "GPU-" + val[len("GPU-"):] if val.upper().startswith("GPU-") else None
     return None
+
+
+def _serve_bench_gpu(args: list[str]) -> str | None:
+    """Best selector for benchmarking the serve's first GPU: full UUID, else its visible index."""
+    return _serve_gpu_uuid(args) or _serve_gpu_spec(args)
 
 
 def _read_bench_profile(path: str | None) -> dict | None:
@@ -343,11 +356,17 @@ def build_app(
         # per measured format, then a terminal `result` (the profile) or `error` event. `body.args`
         # is the raw arg list, so any `ft bench bw` flag (--dtype/--model/--threshold/...) passes
         # through. torch stays out of the daemon (child process), which also frees VRAM on exit.
+        bench_args = list(body.args)
+        if not any(arg == "--gpu" or arg.startswith("--gpu=") for arg in bench_args):
+            gpu = _serve_bench_gpu(manager.serve_args())
+            if gpu:
+                bench_args.extend(("--gpu", gpu))
+
         await run(lifecycle_pool, manager.stop)
 
         async def gen():
             env = {**os.environ, "FREETOKEN_BENCH_PROGRESS": "1"}
-            argv = [sys.executable, "-m", "freetoken.cli", "bench", "bw", *body.args]
+            argv = [sys.executable, "-m", "freetoken.cli", "bench", "bw", *bench_args]
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env

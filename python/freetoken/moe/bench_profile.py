@@ -83,22 +83,22 @@ def _usable_profile(
     """The cached profile, or ``None`` when there is no file / it was benched on another GPU
     (bandwidths are hardware-specific, so a mismatch is ignored rather than trusted).
 
-    Lookup: explicit ``path`` (else ``FREETOKEN_BENCHBW_PATH``) -> ``benchbw/<gpu_uuid>.json`` -> legacy ``benchbw.json``.
+    Lookup: explicit ``path`` (else ``FREETOKEN_BENCHBW_PATH``), otherwise the
+    exact ``benchbw/<gpu_uuid>.json`` when a UUID is known, otherwise the legacy
+    ``benchbw.json``.
     """
     explicit = path or os.environ.get("FREETOKEN_BENCHBW_PATH")
     if explicit:
         candidates = [explicit]
+    elif gpu_uuid:
+        candidates = [default_profile_path(gpu_uuid)]
     else:
-        candidates = [default_profile_path(gpu_uuid)] if gpu_uuid else []
-        candidates.append(default_profile_path())
+        candidates = [default_profile_path()]
     prof = None
     for src in candidates:
         prof = _load(src)
         if isinstance(prof, dict):
             break
-        if os.path.exists(src):
-            # unreadable profile for this card: stay on the safe default, do not borrow the legacy file
-            return None
     if not isinstance(prof, dict):
         return None
     prof_gpu = (prof.get("gpu") or {}).get("name")

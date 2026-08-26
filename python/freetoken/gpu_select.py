@@ -128,7 +128,9 @@ def resolve_gpu_uuids(specs: Sequence[str]) -> "tuple[str, ...] | None":
     """--gpu entries -> full GPU UUIDs, one per TP rank; raises ValueError on a bad entry.
 
     A preset CUDA_VISIBLE_DEVICES is a quota to stay inside: an index counts within that list, a UUID must name one of its entries.
-    Returns None when NVML is unavailable -- the worker then interprets the raw entries against CUDA's own enumeration (see bind_assigned_gpu).
+    Returns None when a physical UUID cannot be determined safely before CUDA
+    initialization, such as without NVML or for numeric selectors under a numeric
+    CUDA_VISIBLE_DEVICES list. The worker then uses CUDA's own visible enumeration.
     """
     specs = parse_gpu_spec(",".join(specs))
     if len({s.upper() for s in specs}) != len(specs):
@@ -138,6 +140,25 @@ def resolve_gpu_uuids(specs: Sequence[str]) -> "tuple[str, ...] | None":
         return None
     preset_raw = os.environ.get("CUDA_VISIBLE_DEVICES")
     preset = None if preset_raw is None else [e.strip() for e in preset_raw.split(",") if e.strip()]
+
+    if preset is not None and not all(is_gpu_uuid(entry) for entry in preset):
+        if all(is_gpu_index(spec) for spec in specs):
+            for spec in specs:
+                if int(spec) >= len(preset):
+                    raise ValueError(
+                        f"--gpu {spec}: only {len(preset)} GPU(s) are visible through "
+                        f"CUDA_VISIBLE_DEVICES={preset_raw!r} (indices count within that list)"
+                    )
+            # A numeric CUDA_VISIBLE_DEVICES entry is a CUDA ordinal, not an NVML
+            # index. Preserve the visible indices and let each worker bind them in
+            # CUDA's own enumeration instead of guessing a physical UUID here.
+            return None
+        # UUIDs are independent of CUDA/NVML ordering. Resolve unique prefixes now;
+        # the worker will verify that its UUID is actually visible when CUDA starts.
+        resolved = [_match_uuid(spec, uuids, "on this machine") for spec in specs]
+        if len(set(resolved)) != len(resolved):
+            raise ValueError(f"--gpu {','.join(specs)}: the same GPU appears twice")
+        return tuple(resolved)
 
     resolved: list[str] = []
     for spec in specs:
@@ -150,11 +171,8 @@ def resolve_gpu_uuids(specs: Sequence[str]) -> "tuple[str, ...] | None":
                 raise ValueError(f"--gpu {spec}: only {len(uuids)} GPU(s) on this machine; run `nvidia-smi -L` to list GPUs")
         else:
             entry = _preset_entry(spec, preset, preset_raw)
-            # an integer entry is read in physical order, as under CUDA_DEVICE_ORDER=PCI_BUS_ID; a negative or MIG-form entry cannot name a whole GPU
             if is_gpu_uuid(entry):
                 resolved.append(_match_uuid(entry, uuids, f"(from CUDA_VISIBLE_DEVICES={preset_raw!r})"))
-            elif is_gpu_index(entry) and int(entry) < len(uuids):
-                resolved.append(uuids[int(entry)])
             else:
                 raise ValueError(
                     f"--gpu {spec}: cannot resolve CUDA_VISIBLE_DEVICES entry {entry!r} "

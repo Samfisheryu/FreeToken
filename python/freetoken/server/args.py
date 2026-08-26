@@ -41,7 +41,7 @@ class ServerArgs(SchedulerConfig):
     cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
     # --gpu entries in TP-rank order, empty = not given
     gpu: tuple[str, ...] = ()
-    # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
+    # full UUIDs resolved from --gpu, entry i = TP rank i; None = resolve raw entries in each worker against CUDA's own visible enumeration
     gpu_assigned: "tuple[str, ...] | None" = None
 
     @property

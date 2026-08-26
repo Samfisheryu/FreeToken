@@ -76,10 +76,12 @@ def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
         with open(path, "w") as f:
             json.dump({"gpu": {"name": name}, "dtypes": {"bf16": verdict}}, f)
 
-    # legacy single file only: used when the name matches, ignored otherwise
+    # A UUID-specific lookup never borrows the legacy file: identical cards can
+    # sit behind different PCIe/NUMA paths and need different measurements.
     write(default_profile_path(), "FAKE GPU", "hybrid")
-    assert load_backend_recommendation("bf16", gpu_name="FAKE GPU", gpu_uuid=uuid) == "hybrid"
+    assert load_backend_recommendation("bf16", gpu_name="FAKE GPU", gpu_uuid=uuid) is None
     assert load_backend_recommendation("bf16", gpu_name="OTHER", gpu_uuid=uuid) is None
+    assert load_backend_recommendation("bf16", gpu_name="FAKE GPU") == "hybrid"
     # this card's own file wins over the legacy one
     write(default_profile_path(uuid), "FAKE GPU", "offload")
     assert load_backend_recommendation("bf16", gpu_name="FAKE GPU", gpu_uuid=uuid) == "offload"
