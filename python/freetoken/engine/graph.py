@@ -210,7 +210,7 @@ class GraphRunner:
         self,
         model: BaseLLMModel,
     ) -> None:
-        """Capture exact-size decode graphs for the pipeline's fixed layer groups.
+        """Capture exact-size decode graphs for resident prefill layer groups.
 
         Capturing one graph per group keeps startup graph work linear in model depth.
         The active resident group remains eager because its decode rows are merged with
@@ -242,7 +242,7 @@ class GraphRunner:
         self.layer_range_batch_sizes = set(batch_sizes)
         self.layer_range_group_ends = dict(groups)
         logger.info_rank0(
-            "Capturing layered-pipeline decode range graphs: "
+            "Capturing resident-prefill decode range graphs: "
             f"groups={groups}, batch_sizes={batch_sizes}"
         )
 

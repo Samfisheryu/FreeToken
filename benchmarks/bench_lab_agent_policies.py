@@ -49,6 +49,8 @@ MODE_ALIASES = {
     "layered_pipeline_g2_cpi3": "layered_pipeline_g2_cpi3",
     "layered-pipeline-cpi4": "layered_pipeline_g2_cpi4",
     "layered_pipeline_g2_cpi4": "layered_pipeline_g2_cpi4",
+    "layered-prefill": "layered_prefill_g2_wave1",
+    "layered_prefill_g2_wave1": "layered_prefill_g2_wave1",
 }
 
 LAYERED_PIPELINE_WAVE_RE = re.compile(
@@ -64,6 +66,12 @@ JOINT_WAVE_RE = re.compile(
     r"Joint wave complete: "
     r"chunks=(\d+), wave_reqs=(\d+), frontier_batches=(\d+), groups=(\d+), "
     r"effective_group_size=(\d+), prefill_layer_prepares=(\d+)"
+)
+LAYERED_PREFILL_WAVE_RE = re.compile(
+    r"Layered prefill wave complete: "
+    r"reqs=(\d+), groups=(\d+), group_forwards=(\d+), "
+    r"iterations=(\d+), decode_iterations=(\d+), "
+    r"prefill_layer_prepares=(\d+)"
 )
 MOE_CACHE_STATS_RE = re.compile(r"MoE cache stats snapshot: ([^\n]+)")
 
@@ -928,6 +936,25 @@ class PublicServer:
             for match in JOINT_WAVE_RE.finditer(text)
         ]
 
+    def layered_prefill_waves(self) -> list[dict[str, int]]:
+        if self.measurement_log_offset is None:
+            return []
+        self.log.flush()
+        self.log.seek(self.measurement_log_offset)
+        text = self.log.read().decode("utf-8", errors="replace")
+        fields = (
+            "reqs",
+            "groups",
+            "group_forwards",
+            "iterations",
+            "decode_iterations",
+            "prefill_layer_prepares",
+        )
+        return [
+            dict(zip(fields, (int(value) for value in match.groups())))
+            for match in LAYERED_PREFILL_WAVE_RE.finditer(text)
+        ]
+
     def moe_cache_stats_snapshots(self) -> list[dict[str, int]]:
         """Parse every cumulative idle snapshot, including readiness before measurement."""
         self.log.flush()
@@ -1126,6 +1153,7 @@ def main() -> int:
                 "server_log_tail": None,
                 "joint_waves": [],
                 "layered_pipeline_waves": [],
+                "layered_prefill_waves": [],
                 "error": None,
                 "readiness_prompt_token_id": readiness_prompt_token_id,
             }
@@ -1178,6 +1206,8 @@ def main() -> int:
                 server.stop()
                 if mode["batching_policy"] == "layered-pipeline":
                     mode_result["layered_pipeline_waves"] = server.layered_pipeline_waves()
+                elif mode["batching_policy"] == "layered-prefill":
+                    mode_result["layered_prefill_waves"] = server.layered_prefill_waves()
                 elif mode["batching_policy"] == "joint":
                     mode_result["joint_waves"] = server.joint_waves()
                 mode_result["server_log_tail"] = server.log_tail()

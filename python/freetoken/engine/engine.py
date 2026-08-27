@@ -324,7 +324,7 @@ class Engine:
             self.model = create_model(config.model_config)
         if (
             getattr(config, "batching_policy", "legacy")
-            in ("layered", "joint", "layered-pipeline")
+            in ("layered", "joint", "layered-pipeline", "layered-prefill")
             and not getattr(self.model, "supports_layer_group_prefill", False)
         ):
             raise ValueError(
@@ -566,14 +566,18 @@ class Engine:
                 )
             batching_policy = getattr(config, "batching_policy", "legacy")
             if (
-                batching_policy == "layered-pipeline"
+                batching_policy in ("layered-pipeline", "layered-prefill")
                 and config.moe_cache_size < 2 * config.model_config.num_experts
             ):
                 raise ValueError(
-                    "layered-pipeline requires at least two expert layers of shared cache"
+                    f"{batching_policy} requires at least two expert layers of shared cache"
                 )
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
-            if batching_policy in ("joint", "layered-pipeline") and (
+            if batching_policy in (
+                "joint",
+                "layered-pipeline",
+                "layered-prefill",
+            ) and (
                 not config.moe_prefill_overlap
                 or config.moe_cache_size < config.model_config.num_experts
             ):
@@ -596,11 +600,14 @@ class Engine:
                 ),
                 prefill_group_size=(
                     getattr(config, "prefill_layer_group_size", 1)
-                    if batching_policy in ("joint", "layered-pipeline")
+                    if batching_policy
+                    in ("joint", "layered-pipeline", "layered-prefill")
                     else 0
                 ),
                 prefill_group_decode_reserve_layers=(
-                    1 if batching_policy == "layered-pipeline" else 0
+                    1
+                    if batching_policy in ("layered-pipeline", "layered-prefill")
+                    else 0
                 ),
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 quant_format=banks.quant_format,
@@ -622,6 +629,13 @@ class Engine:
             elif getattr(config, "batching_policy", "legacy") == "layered-pipeline":
                 logger.info_rank0(
                     "Layered pipeline cache: "
+                    f"requested_group_size={config.prefill_layer_group_size}, "
+                    f"effective_group_size={cache.effective_prefill_group_size}, "
+                    f"shared_expert_slots={cache.decode_cache_size}"
+                )
+            elif getattr(config, "batching_policy", "legacy") == "layered-prefill":
+                logger.info_rank0(
+                    "Layered prefill cache: "
                     f"requested_group_size={config.prefill_layer_group_size}, "
                     f"effective_group_size={cache.effective_prefill_group_size}, "
                     f"shared_expert_slots={cache.decode_cache_size}"
@@ -1575,7 +1589,12 @@ def _adjust_config(config: EngineConfig):
         )
 
     batching_policy = getattr(config, "batching_policy", "legacy")
-    if batching_policy in ("layered", "joint", "layered-pipeline"):
+    if batching_policy in (
+        "layered",
+        "joint",
+        "layered-pipeline",
+        "layered-prefill",
+    ):
         if not is_moe or config.moe_backend not in ("offload", "hybrid"):
             raise ValueError(
                 f"{batching_policy} batching requires an offloaded MoE model "
@@ -1616,12 +1635,12 @@ def _adjust_config(config: EngineConfig):
                 f"num_experts={model_config.num_experts}"
             )
         if (
-            batching_policy == "layered-pipeline"
+            batching_policy in ("layered-pipeline", "layered-prefill")
             and not config.moe_cache_auto
             and config.moe_cache_size < 2 * model_config.num_experts
         ):
             raise ValueError(
-                "layered-pipeline requires at least two expert layers of shared cache"
+                f"{batching_policy} requires at least two expert layers of shared cache"
             )
         if (
             batching_policy == "joint"
@@ -1634,7 +1653,7 @@ def _adjust_config(config: EngineConfig):
                 f"num_experts={model_config.num_experts}"
             )
         if (
-            batching_policy in ("joint", "layered-pipeline")
+            batching_policy in ("joint", "layered-pipeline", "layered-prefill")
             and config.attention_backend.split(",")[0].strip() != "triton"
         ):
             raise ValueError(

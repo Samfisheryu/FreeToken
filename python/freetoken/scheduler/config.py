@@ -16,7 +16,12 @@ def _get_pid_suffix() -> str:
 class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
     batching_policy: Literal[
-        "legacy", "mixed", "layered", "joint", "layered-pipeline"
+        "legacy",
+        "mixed",
+        "layered",
+        "joint",
+        "layered-pipeline",
+        "layered-prefill",
     ] = "legacy"
     prefill_layer_group_size: int = 2
     prefill_wave_max_chunks: int = 1
@@ -60,6 +65,18 @@ class SchedulerConfig(EngineConfig):
 
     @property
     def max_forward_len(self) -> int:
+        if self.batching_policy == "layered-prefill":
+            # A layered-prefill wave removes physical T-sized chunk boundaries.
+            # Multi-request admission bounds total prompt rows by W*T; an oversized
+            # first request remains exclusive and is bounded by max_seq_len. Decode
+            # contributes at most one row per running request to the mixed group.
+            return (
+                max(
+                    self.max_seq_len,
+                    self.prefill_wave_max_chunks * self.max_extend_tokens,
+                )
+                + self.max_running_req
+            )
         return self.max_extend_tokens
 
     @property

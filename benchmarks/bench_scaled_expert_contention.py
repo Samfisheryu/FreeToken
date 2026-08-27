@@ -54,6 +54,9 @@ PIPELINE_MODE_RE = re.compile(
     r"layered(?:-|_)pipeline(?:-|_)g(\d+)(?:-|_)cpi(\d+)"
     r"(?:(?:-|_)wave(\d+))?"
 )
+LAYERED_PREFILL_MODE_RE = re.compile(
+    r"layered(?:-|_)prefill(?:-|_)g(\d+)(?:(?:-|_)wave(\d+))?"
+)
 JOINT_MODE_RE = re.compile(r"joint(?:-|_)g(\d+)(?:-|_)wave(\d+)")
 LAYERED_MODE_RE = re.compile(r"layered(?:-|_)g(\d+)")
 
@@ -188,7 +191,23 @@ def resolve_modes(raw_modes: Iterable[str], workload: dict[str, Any]) -> list[di
     modes: list[dict[str, Any]] = []
     tokens = [piece for item in raw_modes for piece in item.split(",") if piece]
     for token in tokens:
-        if match := PIPELINE_MODE_RE.fullmatch(token):
+        if match := LAYERED_PREFILL_MODE_RE.fullmatch(token):
+            group_size = int(match.group(1))
+            wave_chunks = int(match.group(2)) if match.group(2) is not None else 1
+            if group_size < 1 or wave_chunks < 1:
+                raise ValueError(
+                    f"layered-prefill G/wave values must be positive: {token!r}"
+                )
+            modes.append(
+                {
+                    "name": f"layered_prefill_g{group_size}_wave{wave_chunks}",
+                    "batching_policy": "layered-prefill",
+                    "prefill_layer_group_size": group_size,
+                    "prefill_wave_max_chunks": wave_chunks,
+                    "primary": False,
+                }
+            )
+        elif match := PIPELINE_MODE_RE.fullmatch(token):
             group_size = int(match.group(1))
             chunks_per_iteration = int(match.group(2))
             wave_chunks = int(match.group(3)) if match.group(3) is not None else None
@@ -565,6 +584,7 @@ def main() -> int:
                 "requests": [],
                 "joint_waves": [],
                 "layered_pipeline_waves": [],
+                "layered_prefill_waves": [],
                 "server_log_tail": None,
                 "error": None,
                 "readiness_prompt_token_id": readiness_id,
@@ -645,6 +665,22 @@ def main() -> int:
                             "prefill_layer_prepares",
                             "cross_group_prefetches",
                             "deferred_cross_group_prefetches",
+                        )
+                    }
+                elif mode["batching_policy"] == "layered-prefill":
+                    mode_result["layered_prefill_waves"] = (
+                        server.layered_prefill_waves()
+                    )
+                    waves = mode_result["layered_prefill_waves"]
+                    mode_result["layered_prefill_structure"] = {
+                        name: sum(wave[name] for wave in waves)
+                        for name in (
+                            "reqs",
+                            "groups",
+                            "group_forwards",
+                            "iterations",
+                            "decode_iterations",
+                            "prefill_layer_prepares",
                         )
                     }
                 elif mode["batching_policy"] == "joint":

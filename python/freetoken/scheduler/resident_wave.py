@@ -154,6 +154,22 @@ class ResidentWaveAdmission:
     def freeze(self) -> None:
         self.frozen = True
 
+    def retain_uids(self, uids: set[int]) -> None:
+        """Keep the FIFO prefix that was actually materialized for this wave."""
+        self.members = {
+            uid: member for uid, member in self.members.items() if uid in uids
+        }
+
+    def record_materialized_requests(self, reqs: list[Req]) -> None:
+        """Attach the one physical request segment materialized for each member."""
+        for req in reqs:
+            member = self.members.get(req.uid)
+            if member is None:
+                raise RuntimeError(f"resident wave contains unadmitted uid {req.uid}")
+            member.latest_req = req
+            member.admitted_chunks += 1
+            self.total_chunks += 1
+
 
 @dataclass
 class ResidentWaveState:
@@ -414,12 +430,18 @@ def commit_resident_chunks(wave: ResidentWaveState) -> None:
 
 
 def abort_resident_member(wave: ResidentWaveState, uid: int) -> Req | None:
-    member = wave.admission.members.get(uid)
+    return abort_resident_admission(wave.admission, uid)
+
+
+def abort_resident_admission(
+    admission: ResidentWaveAdmission, uid: int
+) -> Req | None:
+    member = admission.members.get(uid)
     if member is None:
         return None
     owner = member.latest_req
     if owner is None:
-        del wave.admission.members[uid]
+        del admission.members[uid]
         return None
     member.aborted = True
     owner.aborted = True
@@ -475,6 +497,7 @@ __all__ = [
     "ResidentWaveMember",
     "ResidentSchedule",
     "ResidentWaveState",
+    "abort_resident_admission",
     "abort_resident_member",
     "admit_resident_frontiers",
     "commit_resident_chunks",

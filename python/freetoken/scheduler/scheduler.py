@@ -40,6 +40,7 @@ from .layered_batch import (
 )
 from .joint_execution import JointWaveExecutor
 from .layered_pipeline import LayeredPipelineExecutor
+from .layered_prefill import LayeredPrefillExecutor
 from .mixed_batch import LegacyBatchComposer, MixedBatchComposer
 from .prefill import ChunkedReq, PrefillManager
 from .resident_decode import StableDecodeInput, prepare_stable_decode
@@ -137,6 +138,21 @@ class Scheduler(SchedulerIOMixin):
                 chunks_per_iteration=(
                     config.layered_pipeline_chunks_per_iteration
                 ),
+                prepare_batch=self._prepare_resident_batch,
+                prepare_mixed_batch=self._prepare_resident_mixed_batch,
+                build_execution_input=self._build_layer_group_input,
+                report_prompt_admissions=self._report_prompt_admissions,
+                restore_linear_states=self._restore_linear_states,
+                free_req_resources=self._free_req_resources,
+            )
+        elif config.batching_policy == "layered-prefill":
+            composer_cls = None
+            self.resident_executor = LayeredPrefillExecutor(
+                engine=self.engine,
+                prefill_manager=self.prefill_manager,
+                decode_manager=self.decode_manager,
+                table_manager=self.table_manager,
+                max_wave_chunks=config.prefill_wave_max_chunks,
                 prepare_batch=self._prepare_resident_batch,
                 prepare_mixed_batch=self._prepare_resident_mixed_batch,
                 build_execution_input=self._build_layer_group_input,
@@ -806,7 +822,11 @@ class Scheduler(SchedulerIOMixin):
             assert torch.cuda.current_stream() == self.stream
             while True:
                 self.layered_loop()
-        elif self.config.batching_policy in ("joint", "layered-pipeline"):
+        elif self.config.batching_policy in (
+            "joint",
+            "layered-pipeline",
+            "layered-prefill",
+        ):
             assert torch.cuda.current_stream() == self.stream
             while True:
                 self.resident_loop()
@@ -1314,6 +1334,11 @@ class Scheduler(SchedulerIOMixin):
                 elif self.config.batching_policy == "layered-pipeline":
                     parts.append(
                         f"layered pipeline group {moe.effective_prefill_group_size} layers "
+                        f"({moe.decode_cache_size} shared expert slots)"
+                    )
+                elif self.config.batching_policy == "layered-prefill":
+                    parts.append(
+                        f"layered prefill group {moe.effective_prefill_group_size} layers "
                         f"({moe.decode_cache_size} shared expert slots)"
                     )
             logger.info_rank0(f"{event}: " + ", ".join(parts))

@@ -346,6 +346,40 @@ class PrefillManager:
             )
         return candidates
 
+    def schedule_full_prefill_batch(
+        self,
+        allowed_uids: set[int],
+        *,
+        max_reqs: int | None = None,
+    ) -> Batch | None:
+        """Materialize one full uncached range per allowed FIFO request.
+
+        Layered prefill uses the configured chunk length only to size wave
+        admission.  Its physical batch keeps each request's remaining prompt as
+        one causal range.  The existing allocator may still shorten a request
+        when an SWA pool cannot hold that range; that UID's continuation remains
+        pending for a later wave instead of adding another forward boundary here.
+        """
+        token_budget = 0
+        selected = 0
+        for pending in self.pending_list:
+            if pending.uid not in allowed_uids:
+                break
+            if max_reqs is not None and selected >= max_reqs:
+                break
+            cursor = pending.layered_cached_len
+            if cursor is None and pending.chunked_req is not None:
+                cursor = pending.chunked_req.cached_len
+            token_budget += max(pending.input_len - (cursor or 0), 0)
+            selected += 1
+        if token_budget < 1:
+            return None
+        return self.schedule_next_batch(
+            token_budget,
+            allowed_uids=allowed_uids,
+            max_reqs=max_reqs,
+        )
+
     def has_pending_uid(self, uid: int) -> bool:
         return any(req.uid == uid for req in self.pending_list)
 

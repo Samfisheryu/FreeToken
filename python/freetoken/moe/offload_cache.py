@@ -597,7 +597,8 @@ class OffloadMoeCache:
             if cache_size < required_layers * self.num_experts:
                 if self.prefill_group_decode_reserve_layers:
                     raise ValueError(
-                        "layered-pipeline requires at least two expert layers of shared cache"
+                        "resident layered prefill requires at least two expert layers "
+                        "of shared cache"
                     )
                 raise ValueError(
                     "joint group batching requires at least num_experts expert slots: "
@@ -1047,7 +1048,7 @@ class OffloadMoeCache:
                     self.prefill_group_decode_reserve_layers
                     and buffer_id + 1 == group_layers
                 ):
-                    # Persistent layered-pipeline groups span scheduler iterations.
+                    # Resident layered groups may span scheduler iterations.
                     # Hard-pin their newly admitted pages before later decode
                     # prefix/suffix work can mutate the non-group LRU pages.
                     self._pin_resident_group_pages(start_layer, end_layer)

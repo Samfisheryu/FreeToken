@@ -70,8 +70,10 @@ def _setup():
         _match_stop_str=lambda _req: None,
         _pending_abort_acks=set(),
         _last_data=None,
+        _layered_pipeline_last_outputs=[],
         _abort_layered_wave=lambda uid: None,
         joint_executor=None,
+        layered_pipeline_executor=None,
     )
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
     return pool, cm, tm, dm, pm, sent, stub

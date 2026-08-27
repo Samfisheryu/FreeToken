@@ -61,6 +61,16 @@ JOINT_WAVE_PATTERN = re.compile(
     r"prefill_layer_prepares=(?P<prefill_layer_prepares>\d+)"
     r"(?:\r?\n|$)"
 )
+LAYERED_PREFILL_WAVE_PATTERN = re.compile(
+    r"Layered prefill wave complete: "
+    r"reqs=(?P<reqs>\d+), "
+    r"groups=(?P<groups>\d+), "
+    r"group_forwards=(?P<group_forwards>\d+), "
+    r"iterations=(?P<iterations>\d+), "
+    r"decode_iterations=(?P<decode_iterations>\d+), "
+    r"prefill_layer_prepares=(?P<prefill_layer_prepares>\d+)"
+    r"(?:\r?\n|$)"
+)
 CACHE_PATTERN = re.compile(
     r"Layered pipeline cache: "
     r"requested_group_size=(?P<requested_group_size>\d+), "
@@ -86,6 +96,14 @@ JOINT_WAVE_FIELDS = {
     "frontier_batches",
     "groups",
     "effective_group_size",
+    "prefill_layer_prepares",
+}
+LAYERED_PREFILL_WAVE_FIELDS = {
+    "reqs",
+    "groups",
+    "group_forwards",
+    "iterations",
+    "decode_iterations",
     "prefill_layer_prepares",
 }
 SCALED_MOE_STATS_FIELDS = {
@@ -163,9 +181,8 @@ def scaled_model(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return destination
 
 
-@pytest.fixture(scope="module")
-def tiny_prompt_materializer(
-    tiny_model: Path,
+def _public_prompt_materializer(
+    model_path: Path,
 ) -> Callable[[int, int, str, int], str]:
     from benchmarks.bench_lab_agent_policies import (
         continuation_token_pieces,
@@ -173,7 +190,7 @@ def tiny_prompt_materializer(
         materialize_segment_text,
     )
 
-    tokenizer = load_tokenizer(tiny_model)
+    tokenizer = load_tokenizer(model_path)
     pieces = continuation_token_pieces(tokenizer, required=64)
     assert len(pieces) >= 32
     assert len(set(pieces[:32])) == 32
@@ -205,6 +222,20 @@ def tiny_prompt_materializer(
         return text
 
     return materialize
+
+
+@pytest.fixture(scope="module")
+def tiny_prompt_materializer(
+    tiny_model: Path,
+) -> Callable[[int, int, str, int], str]:
+    return _public_prompt_materializer(tiny_model)
+
+
+@pytest.fixture(scope="module")
+def scaled_prompt_materializer(
+    scaled_model: Path,
+) -> Callable[[int, int, str, int], str]:
+    return _public_prompt_materializer(scaled_model)
 
 
 @pytest.fixture(scope="module")
@@ -322,6 +353,7 @@ def _service_command(
     chunks_per_iteration: int | None = None,
     pipeline_wave_max_chunks: int | None = None,
     max_prefill_length: int = 1024,
+    max_seq_len_override: int = 8192,
     cuda_graph_max_bs: int = 0,
 ) -> list[str]:
     command = [
@@ -354,7 +386,7 @@ def _service_command(
         "--max-running-requests",
         "8",
         "--max-seq-len-override",
-        "8192",
+        str(max_seq_len_override),
         "--enable-cache-report",
         "--batching-policy",
         policy,
@@ -480,6 +512,7 @@ def _running_service(
     chunks_per_iteration: int | None = None,
     pipeline_wave_max_chunks: int | None = None,
     max_prefill_length: int = 1024,
+    max_seq_len_override: int = 8192,
     cuda_graph_max_bs: int = 0,
     python_optimize: bool = False,
 ) -> Iterator[tuple[str, Path]]:
@@ -493,6 +526,7 @@ def _running_service(
         chunks_per_iteration=chunks_per_iteration,
         pipeline_wave_max_chunks=pipeline_wave_max_chunks,
         max_prefill_length=max_prefill_length,
+        max_seq_len_override=max_seq_len_override,
         cuda_graph_max_bs=cuda_graph_max_bs,
     )
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -581,6 +615,27 @@ def _wait_for_wave_accounting(
     )
 
 
+def _wait_for_layered_prefill_requests(
+    log_path: Path,
+    *,
+    offset: int,
+    expected_requests: int,
+    timeout: float = 120.0,
+) -> list[dict[str, int]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waves = _records(log_path, LAYERED_PREFILL_WAVE_PATTERN)[offset:]
+        observed_requests = sum(wave["reqs"] for wave in waves)
+        if observed_requests == expected_requests:
+            return waves
+        assert observed_requests <= expected_requests, waves
+        time.sleep(0.1)
+    raise AssertionError(
+        "layered-prefill wave membership did not close: "
+        f"requests={expected_requests}\n{_log_tail(log_path)}"
+    )
+
+
 def _assert_wave_contract(
     wave: dict[str, int],
     *,
@@ -656,6 +711,39 @@ def _assert_joint_wave_contract(
     assert wave["prefill_layer_prepares"] == num_layers
 
 
+def _assert_layered_prefill_wave_contract(
+    wave: dict[str, int],
+    *,
+    groups: int,
+    num_layers: int,
+    expected_reqs: int | None = None,
+) -> None:
+    assert set(wave) == LAYERED_PREFILL_WAVE_FIELDS
+    assert all(
+        type(wave[field]) is int and wave[field] >= 0
+        for field in LAYERED_PREFILL_WAVE_FIELDS
+    )
+    assert wave["reqs"] >= 1
+    if expected_reqs is not None:
+        assert wave["reqs"] == expected_reqs
+    assert wave["groups"] == groups
+    assert wave["group_forwards"] == groups
+    assert wave["iterations"] == groups
+    assert 0 <= wave["decode_iterations"] <= wave["iterations"]
+    assert wave["prefill_layer_prepares"] == num_layers
+
+
+def _assert_layered_prefill_structure(
+    structure: dict[str, int],
+    waves: list[dict[str, int]],
+) -> None:
+    assert set(structure) == LAYERED_PREFILL_WAVE_FIELDS
+    assert structure == {
+        field: sum(wave[field] for wave in waves)
+        for field in LAYERED_PREFILL_WAVE_FIELDS
+    }
+
+
 def _assert_dynamic_pipeline_wave_contract(
     wave: dict[str, int],
     *,
@@ -727,6 +815,10 @@ def _stream_completion(
                 if data == "[DONE]":
                     break
                 event = json.loads(data)
+                usage = event.get("usage")
+                if usage is not None:
+                    assert isinstance(usage, dict)
+                    result["usage"] = usage
                 choices = event.get("choices", [])
                 assert isinstance(choices, list)
                 if not choices:
@@ -774,6 +866,39 @@ def _run_decode_while_prefilling(
         for event in events
     ), "decode emitted no token while prefill was active"
     return stream_result, prefill_response
+
+
+def _run_decode_with_prefill_batch(
+    base_url: str,
+    *,
+    decode_payload: dict[str, Any],
+    prefill_payloads: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    first_text = threading.Event()
+    stream_result: dict[str, Any] = {}
+    decode_thread = threading.Thread(
+        target=_stream_completion,
+        args=(base_url, decode_payload, first_text, stream_result),
+        daemon=True,
+    )
+    decode_thread.start()
+    assert first_text.wait(timeout=180.0), "decode emitted no SSE text"
+    assert "error" not in stream_result, stream_result.get("error")
+
+    prefill_submitted = time.monotonic()
+    prefill_responses = _run_nonstream_batch(base_url, prefill_payloads)
+    prefill_completed = time.monotonic()
+
+    decode_thread.join(timeout=300.0)
+    assert not decode_thread.is_alive(), "streaming decode did not finish"
+    assert "error" not in stream_result, stream_result.get("error")
+    events = stream_result.get("events")
+    assert isinstance(events, list) and events
+    assert any(
+        prefill_submitted <= event["at_seconds"] <= prefill_completed
+        for event in events
+    ), "decode emitted no token while ragged prefill was active"
+    return stream_result, prefill_responses
 
 
 def _run_nonstream_batch(
@@ -1035,6 +1160,96 @@ def _exercise_graph_configuration(
     return observations
 
 
+def _exercise_layered_prefill_graph_configuration(
+    scaled_model: Path,
+    prompts: dict[str, Any],
+    log_path: Path,
+    *,
+    cuda_graph_max_bs: int,
+) -> dict[str, Any]:
+    with _running_service(
+        scaled_model,
+        log_path,
+        policy="layered-prefill",
+        cache_size=24,
+        group_size=2,
+        pipeline_wave_max_chunks=4,
+        max_prefill_length=32,
+        max_seq_len_override=4096,
+        cuda_graph_max_bs=cuda_graph_max_bs,
+        python_optimize=True,
+    ) as (base_url, service_log):
+        wave_offset = len(
+            _records(service_log, LAYERED_PREFILL_WAVE_PATTERN)
+        )
+        decode_payload = _completion_payload(
+            prompts["driver"], max_tokens=8, stream=True
+        )
+        decode_payload["stream_options"] = {"include_usage": True}
+        prefill_payloads = [
+            _completion_payload(prompt, max_tokens=1, stream=False)
+            for prompt in prompts["prefill"]
+        ]
+        decode_result, prefill_responses = (
+            _run_decode_with_prefill_batch(
+                base_url,
+                decode_payload=decode_payload,
+                prefill_payloads=prefill_payloads,
+            )
+        )
+        decode_observation = _stream_observation(decode_result)
+        decode_usage = _observable_usage(decode_result)
+        assert decode_usage == {
+            "prompt_tokens": 32,
+            "completion_tokens": 8,
+            "total_tokens": 40,
+            "cached_tokens": 0,
+        }
+        for response in prefill_responses:
+            _assert_fresh_completion_usage(
+                response,
+                prompt_tokens=56,
+                completion_tokens=1,
+            )
+
+        waves = _wait_for_layered_prefill_requests(
+            service_log,
+            offset=wave_offset,
+            expected_requests=3,
+        )
+        assert waves
+        driver_wave = waves[0]
+        _assert_layered_prefill_wave_contract(
+            driver_wave,
+            groups=4,
+            num_layers=8,
+            expected_reqs=1,
+        )
+        assert driver_wave["decode_iterations"] == 0
+        burst_waves = waves[1:]
+        assert burst_waves
+        assert sum(wave["reqs"] for wave in burst_waves) == 2
+        for wave in burst_waves:
+            assert wave["reqs"] in (1, 2)
+            _assert_layered_prefill_wave_contract(
+                wave,
+                groups=4,
+                num_layers=8,
+            )
+        assert any(wave["decode_iterations"] > 0 for wave in burst_waves)
+        return {
+            "decode": {
+                **decode_observation,
+                "usage": decode_usage,
+            },
+            "prefill": [
+                _response_observation(response)
+                for response in prefill_responses
+            ],
+            "waves": waves,
+        }
+
+
 def _run_lab_benchmark(
     tiny_model: Path,
     output_path: Path,
@@ -1089,6 +1304,7 @@ def _run_scaled_benchmark(
     max_prefill_length: int,
     repetitions: int = 1,
     prefill_stagger_ms: int = 0,
+    mode: str = "layered-pipeline-g1-cpi16-wave64",
 ) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -1098,7 +1314,7 @@ def _run_scaled_benchmark(
         "--model",
         str(scaled_model),
         "--modes",
-        "layered-pipeline-g1-cpi16-wave64",
+        mode,
         "--repetitions",
         str(repetitions),
         "--gpu",
@@ -1229,6 +1445,50 @@ def _scaled_pipeline_mode(report: dict[str, Any]) -> dict[str, Any]:
     return mode
 
 
+def _scaled_layered_prefill_mode(report: dict[str, Any]) -> dict[str, Any]:
+    required_top_level = {
+        "schema",
+        "created_at_unix_seconds",
+        "model_path",
+        "auto_generated_model",
+        "model_contract",
+        "workload_contract",
+        "reference_mode",
+        "modes",
+    }
+    optional_top_level = {"model_path_removed_after_run"}
+    assert set(report) in (
+        required_top_level,
+        required_top_level | optional_top_level,
+    )
+    assert isinstance(report["modes"], list)
+    matches = [
+        mode
+        for mode in report["modes"]
+        if str(mode.get("name", "")).replace("-", "_")
+        == "layered_prefill_g1_wave64"
+    ]
+    assert len(matches) == 1
+    mode = matches[0]
+    required_mode_fields = {
+        "name",
+        "repetitions",
+        "requests",
+        "server_log_tail",
+        "error",
+        "summary",
+        "layered_prefill_waves",
+        "layered_prefill_structure",
+    }
+    assert required_mode_fields <= set(mode)
+    assert mode["error"] in (None, "")
+    assert isinstance(mode["server_log_tail"], str)
+    assert isinstance(mode["summary"], dict)
+    assert isinstance(mode["layered_prefill_waves"], list)
+    assert isinstance(mode["layered_prefill_structure"], dict)
+    return mode
+
+
 def _assert_scaled_accounting(
     mode: dict[str, Any],
     *,
@@ -1317,7 +1577,12 @@ def test_cli_exposes_layered_pipeline_without_removing_existing_policies() -> No
     )
     assert help_result.returncode == 0, help_result.stderr
     help_text = help_result.stdout + help_result.stderr
-    for policy in ("layered-pipeline", "layered", "joint"):
+    for policy in (
+        "layered-prefill",
+        "layered-pipeline",
+        "layered",
+        "joint",
+    ):
         assert re.search(rf"(?<![\w-]){re.escape(policy)}(?![\w-])", help_text)
     assert "--layered-pipeline-chunks-per-iteration" in help_text
     assert "--prefill-wave-max-chunks" in help_text
@@ -1386,7 +1651,9 @@ def test_cli_exposes_layered_pipeline_without_removing_existing_policies() -> No
     )
 
 
-@pytest.mark.parametrize("policy", ["joint", "layered-pipeline"])
+@pytest.mark.parametrize(
+    "policy", ["joint", "layered-pipeline", "layered-prefill"]
+)
 @pytest.mark.parametrize(
     "invalid_options",
     [
@@ -1419,11 +1686,15 @@ def test_service_rejects_zero_chunk_and_group_boundaries(
     )
 
 
-def test_joint_rejects_zero_wave_capacity(tiny_model: Path) -> None:
+@pytest.mark.parametrize("policy", ["joint", "layered-prefill"])
+def test_joint_and_layered_prefill_reject_zero_wave_capacity(
+    tiny_model: Path,
+    policy: str,
+) -> None:
     completed = subprocess.run(
         _service_command(
             tiny_model,
-            policy="joint",
+            policy=policy,
             port=_free_port(),
             pipeline_wave_max_chunks=0,
         ),
@@ -1614,6 +1885,54 @@ def test_scaled_benchmark_dry_run_resolves_canonical_wave_mode() -> None:
 
 
 @pytest.mark.parametrize(
+    "requested_mode",
+    ["layered-prefill-g1-wave64", "layered_prefill_g1_wave64"],
+)
+def test_scaled_dry_run_resolves_layered_prefill_aliases(
+    requested_mode: str,
+) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "benchmarks/bench_scaled_expert_contention.py",
+            "--ft-executable",
+            str(_ft_executable()),
+            "--modes",
+            requested_mode,
+            "--dry-run",
+        ],
+        cwd=PROJECT_ROOT,
+        env=_subprocess_env(),
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout)
+    assert set(report) == {"model_contract", "workload", "commands"}
+    commands = report["commands"]
+    assert isinstance(commands, list) and len(commands) == 1
+    argv = commands[0]
+    assert isinstance(argv, list)
+    assert all(isinstance(argument, str) for argument in argv)
+    for flag, value in (
+        ("--batching-policy", "layered-prefill"),
+        ("--prefill-layer-group-size", "1"),
+        ("--prefill-wave-max-chunks", "64"),
+        ("--max-prefill-length", "128"),
+        ("--moe-cache-size", "24"),
+        ("--cuda-graph-max-bs", "8"),
+        ("--attention-backend", "triton"),
+        ("--moe-backend", "offload"),
+    ):
+        assert any(
+            argv[index : index + 2] == [flag, value]
+            for index in range(len(argv) - 1)
+        ), f"{requested_mode} omitted {flag}={value}"
+
+
+@pytest.mark.parametrize(
     "retired_mode",
     RETIRED_PIPELINE_MODES,
 )
@@ -1791,6 +2110,39 @@ def test_cpi3_group_major_wave_preserves_functional_contract(
             chunks_per_iteration=3,
             num_layers=5,
         )
+
+
+def test_scaled_layered_prefill_work_is_independent_of_wave_membership(
+    scaled_model: Path,
+    tmp_path: Path,
+) -> None:
+    report = _run_scaled_benchmark(
+        scaled_model,
+        tmp_path / "scaled-layered-prefill-g1-wave64.json",
+        prefill_requests=4,
+        prefill_tokens=2_048,
+        max_prefill_length=128,
+        mode="layered-prefill-g1-wave64",
+    )
+    mode = _scaled_layered_prefill_mode(report)
+    _assert_scaled_accounting(
+        mode,
+        request_count=5,
+        prompt_tokens=8_320,
+        completion_tokens=516,
+    )
+    waves = mode["layered_prefill_waves"]
+    assert waves
+    assert sum(wave["reqs"] for wave in waves) == 5
+    for wave in waves:
+        _assert_layered_prefill_wave_contract(
+            wave,
+            groups=8,
+            num_layers=8,
+        )
+    _assert_layered_prefill_structure(
+        mode["layered_prefill_structure"], waves
+    )
 
 
 def test_scaled_canonical_arrival_forms_driver_and_burst_waves(
@@ -2063,6 +2415,158 @@ def test_release_graph8_matches_graph0_for_public_decode_workloads(
         assert graph8["concurrent_wave"][field] == graph0[
             "concurrent_wave"
         ][field]
+
+
+def test_layered_prefill_graph0_and_graph8_preserve_public_accounting(
+    scaled_model: Path,
+    scaled_prompt_materializer: Callable[[int, int, str, int], str],
+    tmp_path: Path,
+) -> None:
+    prompts = {
+        "driver": scaled_prompt_materializer(
+            32,
+            600_000,
+            "layered-prefill-driver32",
+            0,
+        ),
+        "prefill": [
+            scaled_prompt_materializer(
+                56,
+                600_001 + request_index,
+                f"layered-prefill-burst56-request{request_index}",
+                1 + request_index,
+            )
+            for request_index in range(2)
+        ],
+    }
+    results = {
+        graph_size: _exercise_layered_prefill_graph_configuration(
+            scaled_model,
+            prompts,
+            tmp_path / f"layered-prefill-graph{graph_size}.log",
+            cuda_graph_max_bs=graph_size,
+        )
+        for graph_size in (0, 8)
+    }
+    graph0 = results[0]
+    graph8 = results[8]
+    assert graph8["decode"]["usage"] == graph0["decode"]["usage"]
+    for result in results.values():
+        decode = result["decode"]
+        assert len(decode["event_texts"]) == 8
+        assert "".join(decode["event_texts"]) == decode["output_text"]
+        assert decode["usage"] == {
+            "prompt_tokens": 32,
+            "completion_tokens": 8,
+            "total_tokens": 40,
+            "cached_tokens": 0,
+        }
+        assert len(result["prefill"]) == 2
+        for prefill in result["prefill"]:
+            assert isinstance(prefill["output_text"], str)
+            assert prefill["usage"] == {
+                "prompt_tokens": 56,
+                "completion_tokens": 1,
+                "total_tokens": 57,
+                "cached_tokens": 0,
+            }
+        assert sum(wave["reqs"] for wave in result["waves"]) == 3
+        assert all(
+            wave["groups"]
+            == wave["group_forwards"]
+            == wave["iterations"]
+            == 4
+            for wave in result["waves"]
+        )
+
+
+def test_layered_prefill_minimum_cache_and_wave_soft_cap(
+    tiny_model: Path,
+    tiny_prompt_materializer: Callable[[int, int, str, int], str],
+    tmp_path: Path,
+) -> None:
+    max_prefill_length = 32
+    with _running_service(
+        tiny_model,
+        tmp_path / "layered-prefill-minimum-cache-soft-cap.log",
+        policy="layered-prefill",
+        cache_size=16,
+        group_size=1,
+        pipeline_wave_max_chunks=3,
+        max_prefill_length=max_prefill_length,
+    ) as (base_url, service_log):
+        wave_offset = len(
+            _records(service_log, LAYERED_PREFILL_WAVE_PATTERN)
+        )
+        oversized_prompt = tiny_prompt_materializer(
+            4 * max_prefill_length,
+            610_000,
+            "layered-prefill-oversized-K4-W3",
+            0,
+        )
+        oversized_response = _post_completion(
+            base_url,
+            _completion_payload(
+                oversized_prompt, max_tokens=1, stream=False
+            ),
+        )
+        _assert_fresh_completion_usage(
+            oversized_response,
+            prompt_tokens=4 * max_prefill_length,
+            completion_tokens=1,
+        )
+        oversized_waves = _wait_for_layered_prefill_requests(
+            service_log,
+            offset=wave_offset,
+            expected_requests=1,
+        )
+        assert len(oversized_waves) == 1
+        _assert_layered_prefill_wave_contract(
+            oversized_waves[0],
+            groups=5,
+            num_layers=5,
+            expected_reqs=1,
+        )
+        wave_offset += 1
+
+        ragged_chunks = (1, 3)
+        ragged_payloads = []
+        for request_index, chunk_count in enumerate(ragged_chunks):
+            prompt_tokens = chunk_count * max_prefill_length
+            prompt = tiny_prompt_materializer(
+                prompt_tokens,
+                610_100 + request_index,
+                (
+                    f"layered-prefill-not-fit-W3-K{chunk_count}"
+                    f"-request{request_index}"
+                ),
+                1 + request_index,
+            )
+            ragged_payloads.append(
+                _completion_payload(prompt, max_tokens=1, stream=False)
+            )
+        ragged_responses = _run_nonstream_batch(base_url, ragged_payloads)
+        for response, chunk_count in zip(
+            ragged_responses, ragged_chunks, strict=True
+        ):
+            _assert_fresh_completion_usage(
+                response,
+                prompt_tokens=chunk_count * max_prefill_length,
+                completion_tokens=1,
+            )
+        ragged_waves = _wait_for_layered_prefill_requests(
+            service_log,
+            offset=wave_offset,
+            expected_requests=2,
+        )
+        assert len(ragged_waves) == 2
+        for wave in ragged_waves:
+            _assert_layered_prefill_wave_contract(
+                wave,
+                groups=5,
+                num_layers=5,
+                expected_reqs=1,
+            )
 
 
 @pytest.mark.parametrize(
@@ -2728,6 +3232,29 @@ def test_layered_pipeline_rejects_one_expert_layer_of_shared_cache(
         "layered-pipeline requires at least two expert layers of shared cache"
         in rejected.stdout + rejected.stderr
     )
+
+
+def test_layered_prefill_rejects_one_expert_layer_of_shared_cache(
+    tiny_model: Path,
+) -> None:
+    rejected = subprocess.run(
+        _service_command(
+            tiny_model,
+            policy="layered-prefill",
+            port=_free_port(),
+            cache_size=8,
+            group_size=1,
+            pipeline_wave_max_chunks=3,
+            max_prefill_length=32,
+        ),
+        cwd=PROJECT_ROOT,
+        env=_subprocess_env(),
+        capture_output=True,
+        text=True,
+        timeout=600.0,
+        check=False,
+    )
+    assert rejected.returncode != 0
 
 
 def test_layered_pipeline_runs_with_two_expert_layers_of_shared_cache(

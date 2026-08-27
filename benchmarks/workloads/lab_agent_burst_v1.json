@@ -226,6 +226,13 @@
       "prefill_layer_group_size": 2,
       "layered_pipeline_chunks_per_iteration": 4,
       "primary": false
+    },
+    {
+      "name": "layered_prefill_g2_wave1",
+      "batching_policy": "layered-prefill",
+      "prefill_layer_group_size": 2,
+      "prefill_wave_max_chunks": 1,
+      "primary": false
     }
   ],
   "metrics": {
