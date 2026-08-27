@@ -692,6 +692,7 @@ def test_triton_backend_replay_metadata_uses_capture_buffers(monkeypatch):
     class FakeKVCache:
         def __init__(self, device: torch.device):
             self.device = device
+            self.dtype = torch.float32
 
     device = torch.device("cuda")
     page_table = torch.arange(16, dtype=torch.int32, device=device).view(2, 8)
@@ -717,9 +718,10 @@ def test_triton_backend_replay_metadata_uses_capture_buffers(monkeypatch):
         padded_reqs=[
             SimpleNamespace(extend_len=1, device_len=3, cached_len=2, table_idx=0),
             SimpleNamespace(extend_len=1, device_len=5, cached_len=4, table_idx=1),
-        ],
-        positions=torch.tensor([2, 4], dtype=torch.int64, device=device),
-    )
+            ],
+            positions=torch.tensor([2, 4], dtype=torch.int64, device=device),
+            active_table_idx=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        )
     backend.prepare_metadata(runtime_batch)
     runtime_metadata = runtime_batch.attn_metadata
     assert isinstance(runtime_metadata, TritonMetadata)

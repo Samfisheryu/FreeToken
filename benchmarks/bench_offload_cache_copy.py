@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 
 from freetoken.gpu_select import assign_gpu, bind_assigned_gpu, single_gpu_arg
+from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
 from freetoken.moe.offload_cache import _BANK_SCHEMAS, OffloadMoeCache
 
 
@@ -31,9 +32,15 @@ class ModelProfile:
     quant_format: str
     hidden: int
     inter: int
+    dtype: torch.dtype = torch.bfloat16
 
 
 MODELS = {
+    # Public scaled Qwen3-MoE lab candidates. They retain the real FP16 bank layout while
+    # sweeping one expert row from 12 through 36 MiB on a 24 GiB RTX 4090.
+    "qwen3-scaled-12m": ModelProfile(8, 8, 2, "bf16", 512, 4096, torch.float16),
+    "qwen3-scaled-18m": ModelProfile(8, 8, 2, "bf16", 768, 4096, torch.float16),
+    "qwen3-scaled-36m": ModelProfile(8, 8, 2, "bf16", 1536, 4096, torch.float16),
     "qwen3.5-35B": ModelProfile(40, 256, 8, "bf16", 2048, 512),
     "qwen3-30B": ModelProfile(48, 128, 8, "bf16", 2048, 768),
     "gemma4-26B": ModelProfile(30, 128, 8, "bf16", 2816, 704),
@@ -54,8 +61,8 @@ def bank_specs(profile: ModelProfile) -> dict[str, tuple[int, torch.dtype]]:
     """Per-bank (elems_per_expert, dtype) in schema order, derived from H and I."""
     h, i = profile.hidden, profile.inter
     per_name = {
-        "gate_up": (2 * i * h, torch.bfloat16),
-        "down": (h * i, torch.bfloat16),
+        "gate_up": (2 * i * h, profile.dtype),
+        "down": (h * i, profile.dtype),
         # packed e2m1 codes (2 weights/byte) + fp8-e4m3 per-16 block scales
         "gate_up_packed": (2 * i * (h // 2), torch.uint8),
         "gate_up_scale": (2 * i * (h // 16), torch.uint8),
@@ -94,6 +101,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16, 32])
     parser.add_argument("--miss-rates", type=float, nargs="+", default=[0.0, 0.25, 0.5, 1.0])
+    parser.add_argument(
+        "--gemm-decode-batches",
+        type=int,
+        nargs="*",
+        default=[],
+        help="also time the production BF16 decode MoE kernel at these batch sizes",
+    )
+    parser.add_argument(
+        "--gemm-prefill-tokens",
+        type=int,
+        nargs="*",
+        default=[],
+        help="also time the production BF16 prefill MoE kernel at these token counts",
+    )
     return parser.parse_args()
 
 
@@ -189,6 +210,77 @@ def time_case(
     return active_unique, miss_count, statistics.median(samples)
 
 
+def time_bf16_gemm(
+    cache: OffloadMoeCache,
+    profile: ModelProfile,
+    tokens: int,
+    repeat: int,
+    *,
+    is_prefill: bool,
+) -> float:
+    gate_up, down = cache.bank_views()
+    gate_up = gate_up.view(cache.cache_size, 2 * profile.inter, profile.hidden)
+    down = down.view(cache.cache_size, profile.hidden, profile.inter)
+    hidden = torch.ones(
+        (tokens, profile.hidden), dtype=profile.dtype, device=cache.device
+    )
+    topk_ids = (
+        torch.arange(tokens * profile.topk, dtype=torch.int32, device=cache.device)
+        % profile.experts
+    ).view(tokens, profile.topk).contiguous()
+    topk_weights = torch.full(
+        topk_ids.shape,
+        1.0 / profile.topk,
+        dtype=torch.float32,
+        device=cache.device,
+    )
+    run = fused_experts_impl if is_prefill else fused_experts_decode_impl
+
+    for _ in range(2):
+        run(hidden, gate_up, down, topk_weights, topk_ids)
+    torch.cuda.synchronize(cache.device)
+
+    samples = []
+    for _ in range(repeat):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        run(hidden, gate_up, down, topk_weights, topk_ids)
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end))
+    return statistics.median(samples)
+
+
+def print_bf16_gemm_table(
+    cache: OffloadMoeCache,
+    profile: ModelProfile,
+    decode_batches: list[int],
+    prefill_tokens: list[int],
+    repeat: int,
+) -> None:
+    if not decode_batches and not prefill_tokens:
+        return
+    if profile.quant_format != "bf16":
+        print("gemm skipped: production comparison is currently BF16-only", flush=True)
+        return
+
+    print("path    tokens time_ms routed_GFLOP effective_TFLOP_s")
+    print("------- ------ ------- ------------ -----------------")
+    for is_prefill, counts in ((False, decode_batches), (True, prefill_tokens)):
+        for tokens in counts:
+            time_ms = time_bf16_gemm(
+                cache, profile, tokens, repeat, is_prefill=is_prefill
+            )
+            routed_gflop = 6 * profile.topk * profile.hidden * profile.inter * tokens / 1e9
+            effective_tflops = routed_gflop / time_ms
+            print(
+                f"{'prefill' if is_prefill else 'decode':7s} {tokens:6d} {time_ms:7.3f} "
+                f"{routed_gflop:12.3f} {effective_tflops:17.2f}",
+                flush=True,
+            )
+
+
 def print_table(
     name: str,
     profile: ModelProfile,
@@ -197,6 +289,8 @@ def print_table(
     miss_rates: list[float],
     repeat: int,
     device: torch.device,
+    gemm_decode_batches: list[int],
+    gemm_prefill_tokens: list[int],
 ) -> None:
     per_expert = expert_bytes(profile)
     cache_gib = cache_slots * per_expert / 2**30
@@ -223,6 +317,13 @@ def print_table(
                 f"{time_ms:7.3f} {copy_mib:8.1f} {bandwidth_gbps:7.1f} {tok_ms:6.2f}",
                 flush=True,
             )
+    print_bf16_gemm_table(
+        cache,
+        profile,
+        gemm_decode_batches,
+        gemm_prefill_tokens,
+        repeat,
+    )
     del cache
     torch.cuda.empty_cache()
 
@@ -245,7 +346,15 @@ def main() -> None:
         ]
         for cache_slots in slot_counts:
             print_table(
-                name, profile, cache_slots, args.batch_sizes, args.miss_rates, args.repeat, device
+                name,
+                profile,
+                cache_slots,
+                args.batch_sizes,
+                args.miss_rates,
+                args.repeat,
+                device,
+                args.gemm_decode_batches,
+                args.gemm_prefill_tokens,
             )
 
 

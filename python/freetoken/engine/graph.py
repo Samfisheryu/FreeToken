@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
+from freetoken.models.blocks import LayerGroupState
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -17,6 +18,12 @@ if TYPE_CHECKING:
     from freetoken.moe.offload_cache import OffloadMoeCache
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _LayerRangeCapture:
+    graph: torch.cuda.CUDAGraph
+    output: LayerGroupState
 
 
 @dataclass
@@ -121,6 +128,14 @@ class GraphRunner:
         self.moe_offload_cache = moe_offload_cache
         self.stream = stream
         self.device = device
+        self.layer_range_graph_map: Dict[
+            tuple[int, int, int], _LayerRangeCapture
+        ] = {}
+        self.layer_range_group_ends: dict[int, int] = {}
+        self.layer_range_batch_sizes: set[int] = set()
+        self._layer_range_hidden_input: torch.Tensor | None = None
+        self._layer_range_residual_input: torch.Tensor | None = None
+        self._prepared_layer_range_batch: Batch | None = None
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -185,9 +200,130 @@ class GraphRunner:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
 
+        assert pool is not None
+        self._capture_layer_range_graphs(model)
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+
+    def _capture_layer_range_graphs(
+        self,
+        model: BaseLLMModel,
+    ) -> None:
+        """Capture exact-size decode graphs for the pipeline's fixed layer groups.
+
+        Capturing one graph per group keeps startup graph work linear in model depth.
+        The active resident group remains eager because its decode rows are merged with
+        prefill rows; these graphs cover only the decode-only groups before and after it.
+        """
+        from freetoken.attention.triton import TritonAttentionBackend
+
+        cache = self.moe_offload_cache
+        if (
+            cache is None
+            or getattr(cache, "prefill_group_decode_reserve_layers", 0) == 0
+            or not getattr(model, "supports_layer_group_prefill", False)
+            or not isinstance(self.attn_backend, TritonAttentionBackend)
+        ):
+            return
+
+        num_layers = model.layer_group_num_layers
+        group_size = cache.effective_prefill_group_size
+        if group_size < 1:
+            return
+        groups = [
+            (start, min(start + group_size, num_layers))
+            for start in range(0, num_layers, group_size)
+        ]
+        batch_sizes = self.graph_bs_list
+        if not batch_sizes:
+            return
+
+        self.layer_range_batch_sizes = set(batch_sizes)
+        self.layer_range_group_ends = dict(groups)
+        logger.info_rank0(
+            "Capturing layered-pipeline decode range graphs: "
+            f"groups={groups}, batch_sizes={batch_sizes}"
+        )
+
+        # A shared, graph-external input state lets every group graph accept the
+        # preceding group's dynamic output without capturing any Python state joins.
+        seed_bs = max(batch_sizes)
+        seed_batch = Batch(reqs=[self.dummy_req] * seed_bs, decode_size=seed_bs)
+        seed_batch.padded_reqs = seed_batch.reqs
+        self.attn_backend.prepare_for_layer_range_capture(seed_batch)
+        self.buffer.set_batch(seed_batch)
+        self._set_dummy_linear_slots(seed_bs)
+        with get_global_ctx().forward_batch(seed_batch):
+            seed = model.begin_layer_group_prefill(seed_batch.input_ids)
+            seed = model.advance_layer_group_prefill(seed, groups[0][1])
+        if seed.residual is None:
+            raise RuntimeError(
+                "layer-range graphs require residual state after the first decoder group"
+            )
+        self._layer_range_hidden_input = torch.empty_like(seed.hidden)
+        self._layer_range_residual_input = torch.empty_like(seed.residual)
+        self._layer_range_hidden_input.zero_()
+        self._layer_range_residual_input.zero_()
+        self._reset_moe_offload_cache()
+
+        for bs in reversed(batch_sizes):
+            # Whole-decode graphs can interleave arbitrarily with range replay,
+            # and exact batch sizes can alternate between scheduler iterations.
+            # Keep each size's monotonic group sequence in its own graph pool.
+            range_pool: tuple[int, int] | None = None
+            batch = Batch(reqs=[self.dummy_req] * bs, decode_size=bs)
+            batch.padded_reqs = batch.reqs
+            self.attn_backend.prepare_for_layer_range_capture(batch)
+            self.buffer.set_batch(batch)
+            self._set_dummy_linear_slots(bs)
+            for start_layer, end_layer in groups:
+                graph = torch.cuda.CUDAGraph()
+                with get_global_ctx().forward_batch(batch):
+                    if start_layer == 0:
+                        warm = model.begin_layer_group_prefill(batch.input_ids)
+                        model.advance_layer_group_prefill(warm, end_layer)
+                        with torch.cuda.graph(
+                            graph, pool=range_pool, stream=self.stream
+                        ):
+                            captured = model.begin_layer_group_prefill(batch.input_ids)
+                            captured = model.advance_layer_group_prefill(
+                                captured, end_layer
+                            )
+                    else:
+                        assert self._layer_range_hidden_input is not None
+                        assert self._layer_range_residual_input is not None
+                        warm = LayerGroupState(
+                            self._layer_range_hidden_input[:bs],
+                            self._layer_range_residual_input[:bs],
+                            start_layer,
+                        )
+                        model.advance_layer_group_prefill(warm, end_layer)
+                        with torch.cuda.graph(
+                            graph, pool=range_pool, stream=self.stream
+                        ):
+                            captured = LayerGroupState(
+                                self._layer_range_hidden_input[:bs],
+                                self._layer_range_residual_input[:bs],
+                                start_layer,
+                            )
+                            captured = model.advance_layer_group_prefill(
+                                captured, end_layer
+                            )
+                    self._reset_moe_offload_cache()
+                if range_pool is None:
+                    range_pool = graph.pool()
+                self.layer_range_graph_map[(start_layer, end_layer, bs)] = (
+                    _LayerRangeCapture(graph=graph, output=captured)
+                )
+
+    def _set_dummy_linear_slots(self, bs: int) -> None:
+        dummy_slot = (
+            self.dummy_req.linear_slot_idx
+            if self.dummy_req.linear_slot_idx is not None
+            else self.dummy_req.table_idx
+        )
+        self.buffer.table_idx[:bs].fill_(dummy_slot)
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode_only and batch.size <= self.max_graph_bs
@@ -199,6 +335,62 @@ class GraphRunner:
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
         return self.buffer.logits[: batch.size]
+
+    def has_layer_range_graphs_for(self, batch: Batch) -> bool:
+        return (
+            batch.is_decode_only
+            and batch.size == batch.padded_size
+            and batch.size in self.layer_range_batch_sizes
+        )
+
+    def layer_range_end(self, start_layer: int) -> int | None:
+        return self.layer_range_group_ends.get(start_layer)
+
+    def prepare_layer_range_replay(self, batch: Batch) -> None:
+        if not self.has_layer_range_graphs_for(batch):
+            raise ValueError("batch is not eligible for a layer-range graph")
+        if batch is self._prepared_layer_range_batch:
+            return
+        self.buffer.copy_from(batch)
+        from freetoken.attention.triton import TritonAttentionBackend
+
+        assert isinstance(self.attn_backend, TritonAttentionBackend)
+        self.attn_backend.prepare_for_layer_range_replay(batch)
+        self._prepared_layer_range_batch = batch
+
+    def replay_layer_range(
+        self,
+        batch: Batch,
+        state: LayerGroupState | None,
+        start_layer: int,
+        end_layer: int,
+    ) -> LayerGroupState:
+        capture = self.layer_range_graph_map[(start_layer, end_layer, batch.size)]
+        if start_layer == 0:
+            if state is not None:
+                raise ValueError("layer-zero range replay cannot accept decoder state")
+        else:
+            if state is None or state.next_layer != start_layer:
+                raise ValueError(
+                    f"layer-range replay expected state at layer {start_layer}"
+                )
+            if state.residual is None:
+                raise ValueError("layer-range replay requires decoder residual state")
+            assert self._layer_range_hidden_input is not None
+            assert self._layer_range_residual_input is not None
+            self._layer_range_hidden_input[: batch.size].copy_(state.hidden)
+            self._layer_range_residual_input[: batch.size].copy_(state.residual)
+        capture.graph.replay()
+        output = capture.output
+        return LayerGroupState(
+            output.hidden[: batch.size],
+            (
+                output.residual[: batch.size]
+                if output.residual is not None
+                else None
+            ),
+            end_layer,
+        )
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size
@@ -216,5 +408,11 @@ class GraphRunner:
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
+        self.layer_range_graph_map = {}
+        self.layer_range_group_ends = {}
+        self.layer_range_batch_sizes = set()
+        self._layer_range_hidden_input = None
+        self._layer_range_residual_input = None
+        self._prepared_layer_range_batch = None
         self.buffer = None
         gc.collect()

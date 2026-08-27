@@ -152,6 +152,8 @@ def _decode_grouped_stage1_kernel(
     sm_scale,
     indptr_ptr,
     indices_ptr,
+    page_table_ptr,
+    table_idx_ptr,
     q_pos_ptr,
     mid_o_ptr,
     mid_lse_ptr,
@@ -162,6 +164,7 @@ def _decode_grouped_stage1_kernel(
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_pt,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -179,6 +182,7 @@ def _decode_grouped_stage1_kernel(
     D: tl.constexpr,
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    USE_PAGE_TABLE: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -198,9 +202,14 @@ def _decode_grouped_stage1_kernel(
     mask_d = offs_d < D
     mask_dv = offs_dv < DV
 
-    kv_start = tl.load(indptr_ptr + batch_id)
-    kv_len = tl.load(indptr_ptr + batch_id + 1) - kv_start
     q_pos = tl.load(q_pos_ptr + batch_id)
+    if USE_PAGE_TABLE:
+        kv_start = 0
+        kv_len = q_pos + 1
+        table_row = tl.load(table_idx_ptr + batch_id)
+    else:
+        kv_start = tl.load(indptr_ptr + batch_id)
+        kv_len = tl.load(indptr_ptr + batch_id + 1) - kv_start
     effective_end = tl.minimum(kv_len, q_pos + 1)
     effective_start = 0
     if SLIDING_WINDOW > 0:
@@ -230,7 +239,18 @@ def _decode_grouped_stage1_kernel(
             rel_offs = rel_start + tl.arange(0, BLOCK_N)
             mask_n = rel_offs < split_end
             logical_offs = effective_start + rel_offs
-            slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0)
+            if USE_PAGE_TABLE:
+                slots = tl.load(
+                    page_table_ptr + table_row * stride_pt + logical_offs,
+                    mask=mask_n,
+                    other=0,
+                )
+            else:
+                slots = tl.load(
+                    indices_ptr + kv_start + logical_offs,
+                    mask=mask_n,
+                    other=0,
+                )
 
             k = tl.load(
                 k_ptr + slots[None, :] * stride_ks + k_base_offsets,
@@ -293,12 +313,16 @@ def _decode_stage2_kernel(
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    USE_PAGE_TABLE: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     q_head = tl.program_id(1)
 
-    kv_len = tl.load(indptr_ptr + batch_id + 1) - tl.load(indptr_ptr + batch_id)
     q_pos = tl.load(q_pos_ptr + batch_id)
+    if USE_PAGE_TABLE:
+        kv_len = q_pos + 1
+    else:
+        kv_len = tl.load(indptr_ptr + batch_id + 1) - tl.load(indptr_ptr + batch_id)
     effective_end = tl.minimum(kv_len, q_pos + 1)
     effective_start = 0
     if SLIDING_WINDOW > 0:
@@ -364,6 +388,8 @@ def decode_paged_attention(
     sliding_window: int | None = None,
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
+    table_idx: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """SGLang-style split-k grouped decode attention for one query per request."""
 
@@ -387,9 +413,18 @@ def decode_paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+    use_page_table = page_table is not None
+    assert use_page_table == (table_idx is not None)
+    if use_page_table:
+        assert page_table is not None and table_idx is not None
+        assert page_table.is_cuda and page_table.dim() == 2
+        assert table_idx.is_cuda and table_idx.numel() >= batch
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
+    page_table_arg = page_table if page_table is not None else indices
+    table_idx_arg = table_idx if table_idx is not None else q_positions
+    page_table_stride = page_table.stride(0) if page_table is not None else 0
     group = num_q_heads // num_kv_heads
     # valid_block_h = heads computed per program (drives the grid + head indexing); block_h =
     # power-of-two tile size for tl.arange. They differ only for non-power-of-two GQA groups
@@ -408,6 +443,8 @@ def decode_paged_attention(
         sm_scale,
         indptr,
         indices,
+        page_table_arg,
+        table_idx_arg,
         q_positions,
         attn_logits,
         attn_lse,
@@ -418,6 +455,7 @@ def decode_paged_attention(
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        page_table_stride,
         attn_logits.stride(0),
         attn_logits.stride(1),
         attn_logits.stride(2),
@@ -435,6 +473,7 @@ def decode_paged_attention(
         D=head_dim,
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
+        USE_PAGE_TABLE=use_page_table,
         num_warps=4,
         num_stages=2,
     )
@@ -460,6 +499,7 @@ def decode_paged_attention(
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        USE_PAGE_TABLE=use_page_table,
         num_warps=4,
         num_stages=2,
     )

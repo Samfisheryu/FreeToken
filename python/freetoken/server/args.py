@@ -113,6 +113,19 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _layered_pipeline_chunks_per_iteration(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "--layered-pipeline-chunks-per-iteration must be at least 1"
+            ) from exc
+        if n < 1:
+            raise argparse.ArgumentTypeError(
+                "--layered-pipeline-chunks-per-iteration must be at least 1"
+            )
+        return n
+
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
 
@@ -332,14 +345,16 @@ def parse_args(
     parser.add_argument(
         "--batching-policy",
         type=str,
-        choices=["legacy", "mixed", "layered", "joint"],
+        choices=["legacy", "mixed", "layered", "joint", "layered-pipeline"],
         default=ServerArgs.batching_policy,
         help=(
             "Batch scheduling policy: legacy runs prefill before decode; mixed combines "
             "decode with chunked prefill in one forward; layered jointly schedules two "
             "independent forwards and advances prefill by layer group; joint keeps a "
             "whole layer group resident while one mixed decode/prefill state and its "
-            "remaining prefill chunks traverse it."
+            "remaining prefill chunks traverse it; layered-pipeline runs one complete "
+            "decode token per iteration while every prompt chunk traverses the current "
+            "resident group before the scheduler advances to the next group."
         ),
     )
 
@@ -348,8 +363,10 @@ def parse_args(
         type=_positive_int,
         default=ServerArgs.prefill_layer_group_size,
         help=(
-            "Requested decoder layers per layered/joint group step. Joint caps "
-            "the value at floor(shared expert-cache slots / experts per layer)."
+            "Requested decoder layers per layered/joint/layered-pipeline group step. "
+            "Joint caps the value at floor(shared slots / experts per layer); "
+            "layered-pipeline reserves one full expert layer for decode and caps it "
+            "one layer lower."
         ),
     )
 
@@ -357,7 +374,21 @@ def parse_args(
         "--prefill-wave-max-chunks",
         type=_positive_int,
         default=ServerArgs.prefill_wave_max_chunks,
-        help="Maximum prompt chunks admitted into one joint group-resident wave.",
+        help=(
+            "Soft cap on complete prompt chunks admitted into one joint or "
+            "layered-pipeline resident wave. A first request larger than the cap "
+            "remains intact and runs alone."
+        ),
+    )
+
+    parser.add_argument(
+        "--layered-pipeline-chunks-per-iteration",
+        type=_layered_pipeline_chunks_per_iteration,
+        default=ServerArgs.layered_pipeline_chunks_per_iteration,
+        help=(
+            "Maximum consecutive prompt chunks advanced inside the active resident "
+            "group per layered-pipeline scheduler iteration."
+        ),
     )
 
     parser.add_argument(
@@ -581,6 +612,16 @@ def parse_args(
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
         help="The unified MoE cache eviction policy.",
+    )
+
+    parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Collect exact MoE cache miss counters and print one cumulative snapshot "
+            "whenever the scheduler reaches an idle boundary."
+        ),
     )
 
     parser.add_argument(

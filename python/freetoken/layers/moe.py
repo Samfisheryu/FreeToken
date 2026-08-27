@@ -306,6 +306,18 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.has_resident_prefill_layer(self.layer_id):
+            cache.map_prefill_experts(self.layer_id, topk_ids)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(),
+                n=cache.decode_cache_size,
+                alphas=cache.alphas_for_resident_layer_slots(self.layer_id),
+                is_prefill=False,
+            )
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"

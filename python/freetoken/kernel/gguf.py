@@ -26,15 +26,21 @@ def _host_compiler() -> str | None:
     """A host compiler nvcc + libtorch headers accept.
 
     The system default gcc can be too new for the torch headers (gcc 16 hard-errors),
-    and on this toolchain even nvcc+gcc-13 trips a non-conformant ``typename
-    decltype`` in ``List_inl.h`` once ``torch::Tensor`` is instantiated -- but nvcc
-    with ``clang++`` as host compiles it cleanly. So prefer clang++, then fall back
-    to an older gcc. Override with ``FREETOKEN_GGUF_HOST_CXX``.
+    while CUDA 13 rejects the installed clang 22 host compiler. Prefer the verified
+    distro g++-11, then fall back to the other available host compilers. Override
+    with ``FREETOKEN_GGUF_HOST_CXX``.
     """
     override = os.environ.get("FREETOKEN_GGUF_HOST_CXX")
     if override:
         return override
-    for cxx in ("clang++", "g++-13", "g++-14", "g++-15"):
+    for cxx in (
+        "/usr/bin/g++-11",
+        "g++-11",
+        "clang++",
+        "g++-13",
+        "g++-14",
+        "g++-15",
+    ):
         if shutil.which(cxx):
             return cxx
     return None
@@ -53,6 +59,7 @@ def _module():
 
     extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
     host_cxx = _host_compiler()
+    previous_compilers = {name: os.environ.get(name) for name in ("CC", "CXX")}
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
         # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
@@ -64,13 +71,20 @@ def _module():
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
-    return load(
-        name="freetoken_gguf_kernels",
-        sources=[str(_CSRC / "gguf_kernel.cu")],
-        extra_include_paths=[str(_CSRC)],
-        extra_cuda_cflags=extra_cuda_cflags,
-        verbose=True,
-    )
+    try:
+        return load(
+            name="freetoken_gguf_kernels",
+            sources=[str(_CSRC / "gguf_kernel.cu")],
+            extra_include_paths=[str(_CSRC)],
+            extra_cuda_cflags=extra_cuda_cflags,
+            verbose=True,
+        )
+    finally:
+        for name, value in previous_compilers.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 # ---- thin typed wrappers (signatures mirror sgl_kernel.quantization.gguf) ----

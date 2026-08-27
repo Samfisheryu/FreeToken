@@ -45,12 +45,13 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
-| `--max-prefill-length` | 8192 | Per-forward query-token budget; `mixed` spends it on decode rows first and gives the remainder to chunked prefill |
-| `--batching-policy` | legacy | `legacy` prioritizes prefill; `mixed` combines decode with one prefill chunk; `layered` runs separate decode and layer-group prefill forwards; `joint` carries decode with a bounded set of prefill chunks through resident layer groups |
-| `--prefill-layer-group-size` | 2 | Requested consecutive decoder layers per `layered`/`joint` group; `joint` caps it at the remaining model layers and `floor(shared cache slots / experts per layer)` |
-| `--prefill-wave-max-chunks` | 1 | Maximum prompt chunks retained in one `joint` group-resident wave |
+| `--max-prefill-length` | 8192 | Per-request prefill chunk-token limit. Legacy/mixed also use it as their aggregate prefill budget; resident multi-request frontiers may combine several such chunks, bounded by their wave/iteration limits |
+| `--batching-policy` | legacy | `legacy` prioritizes prefill; `mixed` combines decode with one prefill chunk; `layered` runs separate forwards; `joint` carries one mixed wave through resident groups; `layered-pipeline` keeps one expert group resident while all chunks traverse it, completing at most one decode token per scheduler iteration |
+| `--prefill-layer-group-size` | 2 | Requested consecutive decoder layers per `layered`/`joint`/`layered-pipeline` group. `joint` caps it at `floor(shared slots / experts per layer)`; `layered-pipeline` reserves one full expert layer for decode, requires at least two layers of shared-cache capacity, and caps the group at `floor(shared slots / experts per layer) - 1` |
+| `--prefill-wave-max-chunks` | 1 | Soft cap on complete request chunks retained in one `joint` or `layered-pipeline` resident wave. Multiple requests may share a wave when their full chunk counts fit; a first request larger than the cap remains intact and runs alone |
+| `--layered-pipeline-chunks-per-iteration` | 1 | Maximum request chunks advanced inside the current `layered-pipeline` resident group per scheduler iteration, and the maximum requests represented by one frontier batch. Each request still contributes at most one next chunk to a frontier, and this does not change the per-request chunk-token limit |
 | `--prefill-execution` | serial | `layered` compute mode; `concurrent` is the explicit two-stream A/B mode |
-| `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
+| `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs. Layered-pipeline decode ranges reuse the same batch-size ladder and run eager when an exact active-wave batch size is not on that ladder |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
 See [Joint unified expert pool](joint-unified-expert-pool.md) for joint cache
@@ -79,7 +80,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
-| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU. `joint` currently requires Triton for prefill |
+| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU. `joint` and `layered-pipeline` currently require Triton for prefill |
 
 ### MoE offload
 
@@ -93,8 +94,8 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
-| `--moe-prefill-hit-d2d` | off | Ordinary streaming prefill: copy cache-hit experts device-side into its buffer and stream only misses (CUDA >= 13); joint reuses canonical slots directly |
-| `--disable-moe-prefill-overlap` | overlap on | Disable prefill-copy overlap; ordinary streaming uses two buffers, while joint requires overlap and uses canonical group admission |
+| `--moe-prefill-hit-d2d` | off | Ordinary streaming prefill: copy cache-hit experts device-side into its buffer and stream only misses (CUDA >= 13); shared-pool policies reuse canonical slots directly |
+| `--disable-moe-prefill-overlap` | overlap on | Disable prefill-copy overlap; ordinary streaming uses two buffers, while `joint` and `layered-pipeline` require overlap and canonical group admission |
 
 ### API behaviour
 

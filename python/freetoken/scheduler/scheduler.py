@@ -39,8 +39,11 @@ from .layered_batch import (
     LayeredPrefillWave,
 )
 from .joint_execution import JointWaveExecutor
+from .layered_pipeline import LayeredPipelineExecutor
 from .mixed_batch import LegacyBatchComposer, MixedBatchComposer
 from .prefill import ChunkedReq, PrefillManager
+from .resident_decode import StableDecodeInput, prepare_stable_decode
+from .resident_wave import ResidentExecutor
 from .status import SchedulerStatusReporter
 from .table import TableManager
 
@@ -49,6 +52,7 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
 
 def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
@@ -96,7 +100,8 @@ class Scheduler(SchedulerIOMixin):
         self.layered_composer: LayeredBatchComposer | None = None
         self.layered_wave: LayeredPrefillWave | None = None
         self.layered_stats = LayeredExecutionStats()
-        self.joint_executor: JointWaveExecutor | None = None
+        self.resident_executor: ResidentExecutor | None = None
+        self._resident_decode_input: StableDecodeInput | None = None
         if config.batching_policy == "legacy":
             composer_cls = LegacyBatchComposer
         elif config.batching_policy == "mixed":
@@ -110,13 +115,31 @@ class Scheduler(SchedulerIOMixin):
             )
         elif config.batching_policy == "joint":
             composer_cls = None
-            self.joint_executor = JointWaveExecutor(
+            self.resident_executor = JointWaveExecutor(
                 engine=self.engine,
                 prefill_manager=self.prefill_manager,
                 decode_manager=self.decode_manager,
                 table_manager=self.table_manager,
                 max_chunks=config.prefill_wave_max_chunks,
                 prepare_batch=self._prepare_batch,
+                report_prompt_admissions=self._report_prompt_admissions,
+                restore_linear_states=self._restore_linear_states,
+                free_req_resources=self._free_req_resources,
+            )
+        elif config.batching_policy == "layered-pipeline":
+            composer_cls = None
+            self.resident_executor = LayeredPipelineExecutor(
+                engine=self.engine,
+                prefill_manager=self.prefill_manager,
+                decode_manager=self.decode_manager,
+                table_manager=self.table_manager,
+                max_wave_chunks=config.prefill_wave_max_chunks,
+                chunks_per_iteration=(
+                    config.layered_pipeline_chunks_per_iteration
+                ),
+                prepare_batch=self._prepare_resident_batch,
+                prepare_mixed_batch=self._prepare_resident_mixed_batch,
+                build_execution_input=self._build_layer_group_input,
                 report_prompt_admissions=self._report_prompt_admissions,
                 restore_linear_states=self._restore_linear_states,
                 free_req_resources=self._free_req_resources,
@@ -149,6 +172,9 @@ class Scheduler(SchedulerIOMixin):
         # (mark it, defer the free to _process_last_data) or not (free immediately). Stays None
         # in normal_loop, where a batch launches and drains within one iteration.
         self._last_data: ForwardData | None = None
+        # Resident policies keep decode-only output one stage behind the next graph launch.
+        # Prefill output is drained immediately for client-visible TTFT.
+        self._resident_last_outputs: list[ForwardData] = []
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
@@ -185,6 +211,13 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        moe_cache = self.engine.moe_offload_cache
+        if moe_cache is not None and moe_cache.collect_stats:
+            stats = moe_cache.cumulative_stats_snapshot()
+            logger.info_rank0(
+                "MoE cache stats snapshot: "
+                + ", ".join(f"{name}={value}" for name, value in stats.items())
+            )
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -202,14 +235,18 @@ class Scheduler(SchedulerIOMixin):
         finished requests. All TP ranks must call this with identical arguments.
         """
         assert self.layered_wave is None, "rebuild requires no active layered prefill"
+        resident_executor = getattr(self, "resident_executor", None)
         assert not (
-            self.joint_executor is not None and self.joint_executor.active
-        ), "rebuild requires no active joint prefill"
+            resident_executor is not None and resident_executor.active
+        ), "rebuild requires no active resident prefill"
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
         torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
+        # The cached decode metadata can retain graph-capture tensor views. Drop it before
+        # the idle rebuild destroys and recreates those buffers.
+        self._resident_decode_input = None
         self.engine.rebuild_runtime_cache(
             moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
             num_swa_pages=num_swa_pages,
@@ -690,11 +727,14 @@ class Scheduler(SchedulerIOMixin):
         self._finish_layered_wave()
         return owner
 
-    def joint_loop(self) -> None:
-        """Execute one resident layer group of a true mixed multi-chunk wave."""
-        executor = self.joint_executor
+    def resident_loop(self) -> None:
+        """Advance either resident-wave policy and drain outputs one stage later."""
+        executor = self.resident_executor
         assert executor is not None
+        last_outputs = self._resident_last_outputs
         blocking = not (
+            last_outputs
+            or
             executor.active
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
@@ -703,7 +743,7 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
-        if self._pending_rebuild is not None and not (
+        if self._pending_rebuild is not None and not last_outputs and not (
             executor.active
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
@@ -711,28 +751,49 @@ class Scheduler(SchedulerIOMixin):
             self._execute_pending_rebuild()
 
         self.stream.wait_stream(self.engine.stream)
+        outputs: list[ForwardData] = []
         if not executor.active:
             batch = executor.schedule_first_batch(self.prefill_budget)
-            if batch is None:
-                self._flush_abort_acks()
-                return
-            if not batch.has_prefill:
-                forward_input = self._prepare_batch(batch)
+            if batch is not None and not batch.has_prefill:
+                forward_input = self._prepare_resident_decode_batch(batch)
                 self._report_prompt_admissions(batch)
                 with self.engine_stream_ctx:
                     self.engine.stream.wait_stream(self.stream)
                     self._restore_linear_states(batch)
                     data = (forward_input, self._forward(forward_input))
-                self._process_last_data(data)
-                self._flush_abort_acks()
-                return
-            executor.begin_wave(batch, self.prefill_budget)
+                if self._resident_decode_input is not None:
+                    # The engine has enqueued this graph and advanced request lengths. Reserve
+                    # the next query pages now, before the scheduler stream is made to wait for
+                    # the graph below, so disjoint future page-table writes overlap its compute.
+                    self.cache_manager.reserve_next_decode(batch.reqs)
+                outputs = [data]
+            elif batch is not None:
+                self._resident_decode_input = None
+                executor.begin_wave(batch, self.prefill_budget)
+        elif executor.active:
+            executor.prepare_step(self.prefill_budget)
 
-        self.engine.stream.wait_stream(self.stream)
-        with self.engine_stream_ctx:
-            outputs = executor.advance_group()
-        for data in outputs:
+        if executor.active:
+            self.engine.stream.wait_stream(self.stream)
+            with self.engine_stream_ctx:
+                outputs = executor.advance_step()
+
+        # Any page-table/cache writes performed while draining the prior iteration must follow
+        # the just-enqueued forward, which can still read those entries. This is the same
+        # stream-ordering barrier used by overlap_loop; copy_done then normally completes while
+        # the scheduler prepares and enqueues the next iteration instead of stalling the host.
+        self.stream.wait_stream(self.engine.stream)
+        for data in last_outputs:
             self._process_last_data(data)
+        deferred_outputs: list[ForwardData] = []
+        for data in outputs:
+            if data[0].batch.has_prefill:
+                # The prefill result is this request's first user-visible token. Publishing it
+                # now preserves TTFT; only steady-state decode benefits from a one-stage drain.
+                self._process_last_data(data)
+            else:
+                deferred_outputs.append(data)
+        self._resident_last_outputs = deferred_outputs
         self._flush_abort_acks()
 
     @torch.inference_mode()
@@ -745,10 +806,10 @@ class Scheduler(SchedulerIOMixin):
             assert torch.cuda.current_stream() == self.stream
             while True:
                 self.layered_loop()
-        elif self.config.batching_policy == "joint":
+        elif self.config.batching_policy in ("joint", "layered-pipeline"):
             assert torch.cuda.current_stream() == self.stream
             while True:
-                self.joint_loop()
+                self.resident_loop()
         elif ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -1001,15 +1062,16 @@ class Scheduler(SchedulerIOMixin):
                 tombstones.pop(next(iter(tombstones)))
             pending_req = self.prefill_manager.abort_req(msg.uid)
             layered_req = self._abort_layered_wave(msg.uid)
-            joint_req = (
-                self.joint_executor.abort(msg.uid)
-                if self.joint_executor is not None
+            resident_executor = getattr(self, "resident_executor", None)
+            resident_req = (
+                resident_executor.abort(msg.uid)
+                if resident_executor is not None
                 else None
             )
             decode_req = self.decode_manager.abort_req(msg.uid)
             req_to_free = (
                 None
-                if joint_req is not None
+                if resident_req is not None
                 else layered_req or pending_req or decode_req
             )
             if req_to_free is not None:
@@ -1024,6 +1086,9 @@ class Scheduler(SchedulerIOMixin):
                 inflight = (
                     self._last_data is not None
                     and req_to_free in self._last_data[0].batch.reqs
+                ) or any(
+                    req_to_free in data[0].batch.reqs
+                    for data in getattr(self, "_resident_last_outputs", ())
                 )
                 if inflight:
                     req_to_free.aborted = True
@@ -1053,8 +1118,8 @@ class Scheduler(SchedulerIOMixin):
             elif (
                 self.layered_wave is not None
                 or (
-                    self.joint_executor is not None
-                    and self.joint_executor.active
+                    self.resident_executor is not None
+                    and self.resident_executor.active
                 )
                 or self.prefill_manager.runnable
                 or self.decode_manager.runnable
@@ -1246,12 +1311,34 @@ class Scheduler(SchedulerIOMixin):
                         f"joint group {moe.effective_prefill_group_size} layers "
                         f"({moe.decode_cache_size} shared expert slots)"
                     )
+                elif self.config.batching_policy == "layered-pipeline":
+                    parts.append(
+                        f"layered pipeline group {moe.effective_prefill_group_size} layers "
+                        f"({moe.decode_cache_size} shared expert slots)"
+                    )
             logger.info_rank0(f"{event}: " + ", ".join(parts))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"could not log cache geometry: {e!r}")
 
-    def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        self.engine.graph_runner.pad_batch(batch)
+    def _prepare_batch(
+        self, batch: Batch, *, graph_pad: bool = True
+    ) -> ForwardInput:
+        self._prepare_batch_resources(batch, graph_pad=graph_pad)
+        if batch.has_prefill:
+            self._gather_multimodal(batch)
+        return self._build_forward_input(batch)
+
+    def _prepare_batch_resources(
+        self,
+        batch: Batch,
+        *,
+        graph_pad: bool,
+    ) -> None:
+        """Apply per-iteration request accounting and allocate its cache rows once."""
+        if graph_pad:
+            self.engine.graph_runner.pad_batch(batch)
+        else:
+            batch.padded_reqs = list(batch.reqs)
         self._forward_iter += 1
         if batch.has_decode:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
@@ -1269,8 +1356,45 @@ class Scheduler(SchedulerIOMixin):
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
+
+    def _prepare_resident_mixed_batch(
+        self, allocation_batch: Batch, mixed_batch: Batch
+    ) -> ForwardInput:
+        """Allocate decode once, then build only the group-local mixed metadata."""
+        self._resident_decode_input = None
+        self._prepare_batch_resources(allocation_batch, graph_pad=False)
+        return self._build_layer_group_input(mixed_batch)
+
+    def _prepare_resident_batch(self, batch: Batch) -> ForwardInput:
+        """Prepare one resident-wave request batch without graph padding."""
+        self._resident_decode_input = None
+        return self._prepare_batch(batch, graph_pad=False)
+
+    def _prepare_resident_decode_batch(self, batch: Batch) -> ForwardInput:
+        """Prepare pure decode once and reuse stable resident-policy metadata."""
+        forward_input, self._resident_decode_input = prepare_stable_decode(
+            batch,
+            self._resident_decode_input,
+            engine=self.engine,
+            token_pool=self.token_pool,
+            prepare_resources=lambda current: self._prepare_batch_resources(
+                current,
+                graph_pad=True,
+            ),
+            build_forward_input=self._build_forward_input,
+        )
+        return forward_input
+
+    def _build_layer_group_input(self, batch: Batch) -> ForwardInput:
+        """Build an eager execution view after its requests were allocated once."""
+        batch.padded_reqs = list(batch.reqs)
         if batch.has_prefill:
             self._gather_multimodal(batch)
+        forward_input = self._build_forward_input(batch)
+        batch.input_ids = self.token_pool[forward_input.input_tuple]
+        return forward_input
+
+    def _build_forward_input(self, batch: Batch) -> ForwardInput:
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)

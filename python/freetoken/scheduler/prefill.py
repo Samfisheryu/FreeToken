@@ -44,6 +44,7 @@ class ChunkedReq(Req):
 @dataclass
 class PrefillAdder:
     token_budget: int
+    chunk_token_limit: int | None
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
@@ -128,6 +129,8 @@ class PrefillAdder:
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        if self.chunk_token_limit is not None:
+            chunk_size = min(chunk_size, self.chunk_token_limit)
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
@@ -253,6 +256,7 @@ class PrefillManager:
         self,
         prefill_budget: int,
         *,
+        chunk_token_limit: int | None = None,
         allowed_uids: set[int] | None = None,
         max_reqs: int | None = None,
     ) -> Batch | None:
@@ -262,7 +266,14 @@ class PrefillManager:
         # estimated offset due to in-flight decode
         adder = PrefillAdder(
             token_budget=prefill_budget,
-            reserved_size=self.decode_manager.inflight_tokens,
+            chunk_token_limit=chunk_token_limit,
+            reserved_size=max(
+                self.decode_manager.inflight_tokens
+                - self.cache_manager.decode_reserved_tokens_for(
+                    self.decode_manager.running_reqs
+                ),
+                0,
+            ),
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
             reserved_swa=self.cache_manager.decode_swa_reservation(
@@ -310,6 +321,30 @@ class PrefillManager:
         batch.log_cached_tokens = log_cached_tokens
         batch.prompt_admissions = prompt_admissions
         return batch
+
+    def pending_wave_candidates(
+        self, chunk_token_limit: int
+    ) -> list[tuple[int, int, bool]]:
+        """Return FIFO resident-wave candidates and conservative remaining chunks.
+
+        A fresh request's prefix-cache hit is not known until admission, so its
+        raw prompt length is the safe upper bound.  Once a continuation exists,
+        the layered admission cursor makes the count exact.
+        """
+        candidates: list[tuple[int, int, bool]] = []
+        for pending in self.pending_list:
+            cursor = pending.layered_cached_len
+            if cursor is None and pending.chunked_req is not None:
+                cursor = pending.chunked_req.cached_len
+            remaining = max(pending.input_len - (cursor or 0), 0)
+            candidates.append(
+                (
+                    pending.uid,
+                    div_ceil(remaining, chunk_token_limit),
+                    pending.mm_embeds is not None,
+                )
+            )
+        return candidates
 
     def has_pending_uid(self, uid: int) -> bool:
         return any(req.uid == uid for req in self.pending_list)

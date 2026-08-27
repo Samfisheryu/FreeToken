@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 @dataclass
 class TritonCaptureData(BaseCaptureData):
     q_to_req: torch.Tensor
+    table_idx: torch.Tensor
     attn_logits: torch.Tensor
     attn_lse: torch.Tensor
     num_kv_splits: torch.Tensor
@@ -40,6 +41,7 @@ class TritonCaptureData(BaseCaptureData):
             cu_seqlens_q=torch.arange(0, max_bs + 1, dtype=torch.int32, device=device),
             page_table=torch.zeros((max_bs, max_seq_len), dtype=torch.int32, device=device),
             q_to_req=torch.arange(max_bs, dtype=torch.int32, device=device),
+            table_idx=torch.zeros(max_bs, dtype=torch.int32, device=device),
             attn_logits=torch.empty(
                 (max_bs, num_q_heads, max_kv_splits, max_head_dim),
                 dtype=torch.float32,
@@ -59,7 +61,6 @@ class TritonCaptureData(BaseCaptureData):
             **kwargs,
         )
 
-
 @dataclass
 class TritonMetadata(BaseAttnMetadata):
     cu_seqlens_q_gpu: torch.Tensor
@@ -74,6 +75,9 @@ class TritonMetadata(BaseAttnMetadata):
     attn_lse: torch.Tensor | None = None
     num_kv_splits: torch.Tensor | None = None
     swa_indices: torch.Tensor | None = None
+    decode_page_table: torch.Tensor | None = None
+    decode_table_idx: torch.Tensor | None = None
+    capture_staged: bool = False
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
@@ -181,6 +185,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                page_table=metadata.decode_page_table,
+                table_idx=metadata.decode_table_idx,
             )
         if (
             (not metadata.is_decode)
@@ -221,6 +227,41 @@ class TritonAttentionBackend(BaseAttnBackend):
         ctx = get_global_ctx()
         page_table = ctx.page_table
         padded_size = len(reqs)
+        if (
+            batch.is_decode_only
+            and self.capture is not None
+            and padded_size in self.capture_bs
+            and self._direct_decode_page_table_enabled()
+        ):
+            capture = self.capture
+            table_idx = batch.active_table_idx
+            if table_idx is None:
+                raise RuntimeError("decode batch is missing its page-table rows")
+            capture.table_idx[:padded_size].copy_(table_idx)
+            q_positions = getattr(batch, "positions", None)
+            if q_positions is None:
+                capture.positions[:padded_size].zero_()
+            else:
+                capture.positions[:padded_size].copy_(q_positions)
+
+            batch.attn_metadata = TritonMetadata(
+                cu_seqlens_q_gpu=capture.cu_seqlens_q[: padded_size + 1],
+                indptr=capture.cu_seqlens_k[: padded_size + 1],
+                indices=capture.page_table.view(-1),
+                q_to_req=capture.q_to_req[:padded_size],
+                q_positions=capture.positions[:padded_size],
+                is_decode=True,
+                prefix_lens=capture.positions[:padded_size],
+                max_q_len=1,
+                attn_logits=capture.attn_logits[:padded_size],
+                attn_lse=capture.attn_lse[:padded_size],
+                num_kv_splits=capture.num_kv_splits[:padded_size],
+                decode_page_table=page_table,
+                decode_table_idx=capture.table_idx[:padded_size],
+                capture_staged=True,
+            )
+            return
+
         seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
@@ -293,6 +334,12 @@ class TritonAttentionBackend(BaseAttnBackend):
         # (full->swa mapping translate, recomputed each replay).
         return getattr(self.kvcache, "swa_paged", False)
 
+    def _direct_decode_page_table_enabled(self) -> bool:
+        return (
+            not self._swa_capture_enabled()
+            and self.kvcache.dtype in (torch.float16, torch.bfloat16)
+        )
+
     def _capture_swa_indices(self) -> torch.Tensor | None:
         assert self.capture is not None
         if not self._swa_capture_enabled():
@@ -300,8 +347,21 @@ class TritonAttentionBackend(BaseAttnBackend):
         assert self.capture.swa_page_table is not None
         return self.capture.swa_page_table.view(-1)
 
-    def _point_to_capture(self, metadata: TritonMetadata, bs: int) -> None:
+    def _point_to_capture(
+        self,
+        metadata: TritonMetadata,
+        bs: int,
+        table_idx: torch.Tensor | None,
+    ) -> None:
         assert self.capture is not None
+        if metadata.capture_staged:
+            return
+        if self._direct_decode_page_table_enabled():
+            if table_idx is None:
+                raise RuntimeError("decode batch is missing its page-table rows")
+            self.capture.table_idx[:bs].copy_(table_idx)
+            self.capture.positions[:bs].copy_(metadata.q_positions)
+            return
         indices = self.capture.page_table.view(-1)
         self.capture.cu_seqlens_q[: bs + 1].copy_(metadata.cu_seqlens_q_gpu)
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.indptr)
@@ -325,10 +385,12 @@ class TritonAttentionBackend(BaseAttnBackend):
         metadata.attn_lse = self.capture.attn_lse[:bs]
         metadata.num_kv_splits = self.capture.num_kv_splits[:bs]
 
-    def prepare_for_capture(self, batch: Batch) -> None:
-        bs = batch.size
-        assert bs in self.capture_bs and self.capture is not None
+    def _set_capture_metadata(self, batch: Batch, bs: int) -> None:
+        assert self.capture is not None
         capture = self.capture
+        direct_page_table = self._direct_decode_page_table_enabled()
+        if direct_page_table:
+            capture.table_idx[:bs].fill_(batch.padded_reqs[0].table_idx)
         batch.attn_metadata = TritonMetadata(
             cu_seqlens_q_gpu=capture.cu_seqlens_q[: bs + 1],
             indptr=capture.cu_seqlens_k[: bs + 1],
@@ -342,10 +404,30 @@ class TritonAttentionBackend(BaseAttnBackend):
             attn_lse=capture.attn_lse[:bs],
             num_kv_splits=capture.num_kv_splits[:bs],
             swa_indices=self._capture_swa_indices(),
+            decode_page_table=(get_global_ctx().page_table if direct_page_table else None),
+            decode_table_idx=(capture.table_idx[:bs] if direct_page_table else None),
         )
+
+    def prepare_for_capture(self, batch: Batch) -> None:
+        bs = batch.size
+        assert bs in self.capture_bs
+        self._set_capture_metadata(batch, bs)
+
+    def prepare_for_layer_range_capture(self, batch: Batch) -> None:
+        """Point an exact-size decode batch at the existing graph storage."""
+        bs = batch.size
+        assert self.capture is not None and 0 < bs <= self.max_graph_bs
+        self._set_capture_metadata(batch, bs)
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, TritonMetadata)
         assert self.capture is not None and bs in self.capture_bs
-        self._point_to_capture(metadata, bs)
+        self._point_to_capture(metadata, bs, batch.active_table_idx)
+
+    def prepare_for_layer_range_replay(self, batch: Batch) -> None:
+        """Stage exact-size decode metadata for a layer-range graph replay."""
+        metadata, bs = batch.attn_metadata, batch.padded_size
+        assert isinstance(metadata, TritonMetadata)
+        assert self.capture is not None and 0 < bs <= self.max_graph_bs
+        self._point_to_capture(metadata, bs, batch.active_table_idx)

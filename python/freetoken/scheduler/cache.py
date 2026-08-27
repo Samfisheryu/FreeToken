@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, List, Tuple
 
 import torch
@@ -27,6 +28,20 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 # prompt end. The gap covers templates whose generation prompt injects tokens that vanish when
 # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
 _SWA_RETAIN_GAP = 16
+
+# A few contiguous row writes are cheaper than allocating and uploading two index
+# vectors. Above this point, one batched advanced-index write avoids excessive launches.
+_MAX_DIRECT_PAGE_TABLE_COPY_SEGMENTS = 8
+
+
+@dataclass
+class _DecodePageReservation:
+    table_idx: int
+    cached_len: int
+    device_len: int
+    first_page: int
+    last_page: int
+    allocated: torch.Tensor
 
 
 class CacheManager:
@@ -61,6 +76,7 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
+        self._decode_page_reservations: dict[Req, _DecodePageReservation] = {}
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -124,9 +140,25 @@ class CacheManager:
         if not self.swa_paged:
             return 0
         ps = self.page_size
+        total = 0
+        reservations = getattr(self, "_decode_page_reservations", {})
+        for req in reqs:
+            first_page = div_ceil(req.cached_len, ps)
+            last_page = div_ceil(req.device_len, ps)
+            reservation = reservations.get(req) if reservations else None
+            if self._reservation_matches(
+                req, reservation, first_page=first_page, last_page=last_page
+            ):
+                continue
+            total += (last_page - first_page) * ps
+        return total
+
+    def decode_reserved_tokens_for(self, reqs: Iterable[Req]) -> int:
+        """Full-token capacity already held for these runnable decode requests."""
         return sum(
-            (div_ceil(req.device_len, ps) - div_ceil(req.cached_len, ps)) * ps
+            reservation.allocated.numel()
             for req in reqs
+            if (reservation := self._decode_page_reservations.get(req)) is not None
         )
 
     def ensure_swa_slots(self, n: int) -> None:
@@ -269,22 +301,111 @@ class CacheManager:
         for req in reqs:
             first_page = div_ceil(req.cached_len, self.page_size)
             last_page = div_ceil(req.device_len, self.page_size)
+            reservation = self._decode_page_reservations.pop(req, None)
+            if self._reservation_matches(
+                req, reservation, first_page=first_page, last_page=last_page
+            ):
+                continue
+            if reservation is not None:
+                self._free_decode_reservation(reservation)
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
         if needed_pages > 0:
-            allocated = self._page_to_token(self._allocate(needed_pages))
-            if self.swa_paged:
-                # Each newly-allocated full token needs a swa-pool slot (where its SWA-layer KV is
-                # written; read back via the full->swa mapping). radix reuses the existing prefix's
-                # (live, mapped) swa slots and evicts tree swa if the pool is short; naive has no
-                # tree (the pool is sized concurrency x window so it always fits).
-                if self.is_swa:
-                    self.ensure_swa_slots(len(allocated))
-                self.swa_pool.alloc_swa(allocated)
-            _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+            self._allocate_paged_rows(needed_pages, allocation_info)
+
+    def reserve_next_decode(self, reqs: List[Req]) -> None:
+        """Reserve the next query pages while the current decode graph is running.
+
+        The current graph reads only through ``cached_len``. The rows reserved here start at
+        that exclusive boundary, so their page-table writes can run on the scheduler stream
+        while the graph consumes the earlier row prefix on the engine stream.
+        """
+        if self.device.type != "cuda":
+            return
+
+        reservation_info: List[Tuple[Req, int, int]] = []
+        needed_pages = 0
+        for req in reqs:
+            previous = self._decode_page_reservations.pop(req, None)
+            if previous is not None:
+                self._free_decode_reservation(previous)
+            if not req.can_decode:
+                continue
+            first_page = div_ceil(req.cached_len, self.page_size)
+            last_page = div_ceil(req.device_len, self.page_size)
+            if last_page > first_page:
+                needed_pages += last_page - first_page
+                reservation_info.append((req, first_page, last_page))
+        if needed_pages == 0:
+            return
+
+        allocation_info = [
+            (req.table_idx, first_page, last_page)
+            for req, first_page, last_page in reservation_info
+        ]
+        allocated = self._allocate_paged_rows(needed_pages, allocation_info)
+        offset = 0
+        for req, first_page, last_page in reservation_info:
+            length = (last_page - first_page) * self.page_size
+            self._decode_page_reservations[req] = _DecodePageReservation(
+                table_idx=req.table_idx,
+                cached_len=req.cached_len,
+                device_len=req.device_len,
+                first_page=first_page,
+                last_page=last_page,
+                allocated=allocated[offset : offset + length],
+            )
+            offset += length
+
+    def _allocate_paged_rows(
+        self,
+        needed_pages: int,
+        allocation_info: List[Tuple[int, int, int]],
+    ) -> torch.Tensor:
+        allocated = self._page_to_token(self._allocate(needed_pages))
+        if self.swa_paged:
+            # Each newly-allocated full token needs a swa-pool slot (where its SWA-layer KV is
+            # written; read back via the full->swa mapping). radix reuses the existing prefix's
+            # (live, mapped) swa slots and evicts tree swa if the pool is short; naive has no
+            # tree (the pool is sized concurrency x window so it always fits).
+            if self.is_swa:
+                self.ensure_swa_slots(len(allocated))
+            self.swa_pool.alloc_swa(allocated)
+        _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+        return allocated
+
+    @staticmethod
+    def _reservation_matches(
+        req: Req,
+        reservation: _DecodePageReservation | None,
+        *,
+        first_page: int,
+        last_page: int,
+    ) -> bool:
+        return (
+            reservation is not None
+            and reservation.table_idx == req.table_idx
+            and reservation.cached_len == req.cached_len
+            and reservation.device_len == req.device_len
+            and reservation.first_page == first_page
+            and reservation.last_page == last_page
+        )
+
+    def _free_decode_reservation(
+        self, reservation: _DecodePageReservation
+    ) -> None:
+        if self.swa_paged:
+            self._free_swa(reservation.allocated)
+        self._free(reservation.allocated)
+
+    def _cancel_decode_reservation(self, req: Req) -> None:
+        reservation = self._decode_page_reservations.pop(req, None)
+        if reservation is not None:
+            self._free_decode_reservation(reservation)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        self._cancel_decode_reservation(req)
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
         if self.is_hybrid:
@@ -614,6 +735,7 @@ class CacheManager:
         self.num_pages = num_pages
         self.page_table = page_table
         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
+        self._decode_page_reservations.clear()
         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
@@ -627,7 +749,8 @@ class CacheManager:
             # when the region exits. A commit that re-points the row in between (the dedup
             # re-point, the SWA one) would otherwise rewrite the pending free list underneath us
             # and return the tree's canonical pages instead of the request's duplicates.
-            lazy_free_list.append(indices[:: self.page_size].clone())
+            if len(indices) > 0:
+                lazy_free_list.append(indices[:: self.page_size].clone())
 
         lazy_free_list: List[torch.Tensor] = []
         try:
@@ -635,7 +758,8 @@ class CacheManager:
             yield
         finally:
             del self._free
-            self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+            if lazy_free_list:
+                self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
@@ -678,6 +802,18 @@ def _write_page_table(
     page_size: int,
 ) -> None:
     needed_tokens = len(allocated)
+    if len(allocation_info) <= _MAX_DIRECT_PAGE_TABLE_COPY_SEGMENTS:
+        offset = 0
+        for table_idx, first_page, last_page in allocation_info:
+            first_pos, last_pos = first_page * page_size, last_page * page_size
+            length = last_pos - first_pos
+            page_table[table_idx, first_pos:last_pos].copy_(
+                allocated[offset : offset + length]
+            )
+            offset += length
+        assert offset == needed_tokens, "Mismatch in allocated tokens and copied tokens."
+        return
+
     # Pinned only when there is a device to copy to asynchronously; CPU-only runs (unit tests,
     # a CPU CI runner) would otherwise raise instead of just doing a plain host allocation.
     pin = torch.cuda.is_available()

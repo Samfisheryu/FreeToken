@@ -198,6 +198,34 @@
       "prefill_layer_group_size": 2,
       "prefill_wave_max_chunks": 4,
       "primary": false
+    },
+    {
+      "name": "layered_pipeline_g2_cpi1",
+      "batching_policy": "layered-pipeline",
+      "prefill_layer_group_size": 2,
+      "layered_pipeline_chunks_per_iteration": 1,
+      "primary": true
+    },
+    {
+      "name": "layered_pipeline_g2_cpi2",
+      "batching_policy": "layered-pipeline",
+      "prefill_layer_group_size": 2,
+      "layered_pipeline_chunks_per_iteration": 2,
+      "primary": false
+    },
+    {
+      "name": "layered_pipeline_g2_cpi3",
+      "batching_policy": "layered-pipeline",
+      "prefill_layer_group_size": 2,
+      "layered_pipeline_chunks_per_iteration": 3,
+      "primary": false
+    },
+    {
+      "name": "layered_pipeline_g2_cpi4",
+      "batching_policy": "layered-pipeline",
+      "prefill_layer_group_size": 2,
+      "layered_pipeline_chunks_per_iteration": 4,
+      "primary": false
     }
   ],
   "metrics": {

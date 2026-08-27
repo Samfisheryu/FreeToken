@@ -4,7 +4,7 @@ import gc
 import math
 import os
 from datetime import timedelta
-from typing import Any, Dict, Iterable, NamedTuple, Tuple
+from typing import Any, Dict, Iterable, NamedTuple, Sequence, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
@@ -323,7 +323,8 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         if (
-            getattr(config, "batching_policy", "legacy") in ("layered", "joint")
+            getattr(config, "batching_policy", "legacy")
+            in ("layered", "joint", "layered-pipeline")
             and not getattr(self.model, "supports_layer_group_prefill", False)
         ):
             raise ValueError(
@@ -563,13 +564,22 @@ class Engine:
                     f"--moe-cache-auto resolved moe_cache_size={size} "
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
+            batching_policy = getattr(config, "batching_policy", "legacy")
+            if (
+                batching_policy == "layered-pipeline"
+                and config.moe_cache_size < 2 * config.model_config.num_experts
+            ):
+                raise ValueError(
+                    "layered-pipeline requires at least two expert layers of shared cache"
+                )
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
-            if getattr(config, "batching_policy", "legacy") == "joint" and (
+            if batching_policy in ("joint", "layered-pipeline") and (
                 not config.moe_prefill_overlap
                 or config.moe_cache_size < config.model_config.num_experts
             ):
                 raise ValueError(
-                    "joint batching needs room for one complete resident expert layer "
+                    f"{config.batching_policy} batching needs room for one complete "
+                    "resident expert layer "
                     "after --moe-cache-auto is resolved"
                 )
             cache = OffloadMoeCache(
@@ -586,8 +596,11 @@ class Engine:
                 ),
                 prefill_group_size=(
                     getattr(config, "prefill_layer_group_size", 1)
-                    if getattr(config, "batching_policy", "legacy") == "joint"
+                    if batching_policy in ("joint", "layered-pipeline")
                     else 0
+                ),
+                prefill_group_decode_reserve_layers=(
+                    1 if batching_policy == "layered-pipeline" else 0
                 ),
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 quant_format=banks.quant_format,
@@ -605,6 +618,13 @@ class Engine:
                     f"prefill_wave_max_chunks={config.prefill_wave_max_chunks}, "
                     f"pool_slots={cache.decode_cache_size}, "
                     "mapping=logical-expert-to-physical-slot"
+                )
+            elif getattr(config, "batching_policy", "legacy") == "layered-pipeline":
+                logger.info_rank0(
+                    "Layered pipeline cache: "
+                    f"requested_group_size={config.prefill_layer_group_size}, "
+                    f"effective_group_size={cache.effective_prefill_group_size}, "
+                    f"shared_expert_slots={cache.decode_cache_size}"
                 )
         else:
             cache = cache_factory(config, self.device)
@@ -931,9 +951,7 @@ class Engine:
         return self.model.layer_group_num_layers
 
     def begin_layer_group_prefill(self, batch: Batch):
-        """Embed one prefill or mixed state without entering decoder layers."""
-        if not batch.has_prefill:
-            raise ValueError("layer-group execution requires at least one prefill request")
+        """Embed one eager decode, prefill, or mixed layer-group state."""
         with self.ctx.forward_batch(batch):
             return self.model.begin_layer_group_prefill(batch.input_ids)
 
@@ -942,19 +960,103 @@ class Engine:
         with self.ctx.forward_batch(batch):
             return self.model.advance_layer_group_prefill(state, end_layer)
 
+    def begin_layer_group_decode(self, batch: Batch, end_layer: int):
+        """Embed and advance decode rows, replaying fixed non-resident groups."""
+        return self._advance_layer_group_decode(batch, None, end_layer)
+
+    def advance_layer_group_decode(self, batch: Batch, state, end_layer: int):
+        """Advance decode rows through fixed non-resident layer-group graphs."""
+        return self._advance_layer_group_decode(batch, state, end_layer)
+
+    def _advance_layer_group_decode(self, batch: Batch, state, end_layer: int):
+        if not batch.is_decode_only:
+            raise ValueError("layer-group decode execution requires a decode-only batch")
+        start_layer = 0 if state is None else state.next_layer
+        if not start_layer < end_layer <= self.layer_group_num_layers:
+            raise ValueError(
+                f"invalid decode layer range [{start_layer}, {end_layer})"
+            )
+        graph_runner = self.graph_runner
+        if not graph_runner.has_layer_range_graphs_for(batch):
+            with self.ctx.forward_batch(batch):
+                if state is None:
+                    state = self.model.begin_layer_group_prefill(batch.input_ids)
+                return self.model.advance_layer_group_prefill(state, end_layer)
+
+        graph_runner.prepare_layer_range_replay(batch)
+        current_layer = start_layer
+        while current_layer < end_layer:
+            group_end = graph_runner.layer_range_end(current_layer)
+            if group_end is None or group_end > end_layer:
+                group_end = end_layer
+            cache = self.moe_offload_cache
+            resident = (
+                cache is not None
+                and cache.has_resident_prefill_layer(current_layer)
+            )
+            if (
+                not resident
+                and graph_runner.layer_range_end(current_layer) == group_end
+            ):
+                state = graph_runner.replay_layer_range(
+                    batch,
+                    state,
+                    current_layer,
+                    group_end,
+                )
+            else:
+                with self.ctx.forward_batch(batch):
+                    if state is None:
+                        state = self.model.begin_layer_group_prefill(batch.input_ids)
+                    state = self.model.advance_layer_group_prefill(state, group_end)
+            current_layer = group_end
+        return state
+
     def finish_layer_group_prefill(
         self,
         batch: Batch,
         state,
         args: BatchSamplingArgs,
         request_slice: slice | None = None,
+        output_indices: torch.Tensor | None = None,
+        request_indices: Sequence[int] | None = None,
     ) -> ForwardOutput:
-        """Finalize all requests, or only a contiguous request subset."""
+        """Finalize all requests, a request subset, or explicit state rows."""
+        if request_slice is not None and (
+            output_indices is not None or request_indices is not None
+        ):
+            raise ValueError(
+                "request_slice is mutually exclusive with output_indices/request_indices"
+            )
+        if request_indices is not None and output_indices is None:
+            raise ValueError("request_indices requires matching output_indices")
         with self.ctx.forward_batch(batch):
-            if request_slice is None:
+            if request_indices is not None:
+                if len(request_indices) != int(output_indices.numel()):
+                    raise ValueError(
+                        "request_indices and output_indices must select the same number of rows"
+                    )
+                selected_reqs = [batch.reqs[index] for index in request_indices]
+                selected_args = BatchSamplingArgs(
+                    temperatures=(
+                        args.temperatures[list(request_indices)]
+                        if args.temperatures is not None
+                        else None
+                    ),
+                    top_k=(
+                        args.top_k[list(request_indices)]
+                        if args.top_k is not None
+                        else None
+                    ),
+                    top_p=(
+                        args.top_p[list(request_indices)]
+                        if args.top_p is not None
+                        else None
+                    ),
+                )
+            elif request_slice is None:
                 selected_reqs = batch.reqs
                 selected_args = args
-                output_indices = None
             else:
                 selected_reqs = batch.reqs[request_slice]
                 last_indices = batch.attn_metadata.get_last_indices(batch.size)
@@ -1473,7 +1575,7 @@ def _adjust_config(config: EngineConfig):
         )
 
     batching_policy = getattr(config, "batching_policy", "legacy")
-    if batching_policy in ("layered", "joint"):
+    if batching_policy in ("layered", "joint", "layered-pipeline"):
         if not is_moe or config.moe_backend not in ("offload", "hybrid"):
             raise ValueError(
                 f"{batching_policy} batching requires an offloaded MoE model "
@@ -1514,21 +1616,29 @@ def _adjust_config(config: EngineConfig):
                 f"num_experts={model_config.num_experts}"
             )
         if (
+            batching_policy == "layered-pipeline"
+            and not config.moe_cache_auto
+            and config.moe_cache_size < 2 * model_config.num_experts
+        ):
+            raise ValueError(
+                "layered-pipeline requires at least two expert layers of shared cache"
+            )
+        if (
             batching_policy == "joint"
             and not config.moe_cache_auto
             and config.moe_cache_size < model_config.num_experts
         ):
             raise ValueError(
-                "joint batching requires at least num_experts expert slots: "
+                f"{batching_policy} batching requires at least num_experts expert slots: "
                 f"got moe_cache_size={config.moe_cache_size}, "
                 f"num_experts={model_config.num_experts}"
             )
         if (
-            batching_policy == "joint"
+            batching_policy in ("joint", "layered-pipeline")
             and config.attention_backend.split(",")[0].strip() != "triton"
         ):
             raise ValueError(
-                "joint batching prepares several prefill batches before execution, "
+                f"{batching_policy} batching prepares several prefill batches before execution, "
                 "which requires independent Triton prefill metadata; use "
                 "--attention-backend triton (or a hybrid string whose prefill "
                 f"backend is triton), got {config.attention_backend!r}"

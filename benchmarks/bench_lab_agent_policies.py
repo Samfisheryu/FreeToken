@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import signal
 import shutil
 import subprocess
@@ -39,7 +40,32 @@ MODE_ALIASES = {
     "jointG2-wave4": "joint_g2_wave4_exploratory",
     "wave4": "joint_g2_wave4_exploratory",
     "joint_g2_wave4_exploratory": "joint_g2_wave4_exploratory",
+    "layered-pipeline": "layered_pipeline_g2_cpi1",
+    "layered-pipeline-cpi1": "layered_pipeline_g2_cpi1",
+    "layered_pipeline_g2_cpi1": "layered_pipeline_g2_cpi1",
+    "layered-pipeline-cpi2": "layered_pipeline_g2_cpi2",
+    "layered_pipeline_g2_cpi2": "layered_pipeline_g2_cpi2",
+    "layered-pipeline-cpi3": "layered_pipeline_g2_cpi3",
+    "layered_pipeline_g2_cpi3": "layered_pipeline_g2_cpi3",
+    "layered-pipeline-cpi4": "layered_pipeline_g2_cpi4",
+    "layered_pipeline_g2_cpi4": "layered_pipeline_g2_cpi4",
 }
+
+LAYERED_PIPELINE_WAVE_RE = re.compile(
+    r"Layered pipeline wave complete: "
+    r"chunks=(\d+), wave_reqs=(\d+), frontier_batches=(\d+), "
+    r"resident_groups=(\d+), chunk_group_steps=(\d+), "
+    r"frontier_group_forwards=(\d+), "
+    r"iterations=(\d+), decode_iterations=(\d+), "
+    r"prefill_layer_prepares=(\d+), cross_group_prefetches=(\d+), "
+    r"deferred_cross_group_prefetches=(\d+)"
+)
+JOINT_WAVE_RE = re.compile(
+    r"Joint wave complete: "
+    r"chunks=(\d+), wave_reqs=(\d+), frontier_batches=(\d+), groups=(\d+), "
+    r"effective_group_size=(\d+), prefill_layer_prepares=(\d+)"
+)
+MOE_CACHE_STATS_RE = re.compile(r"MoE cache stats snapshot: ([^\n]+)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,10 +78,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["legacy", "mixed", "layeredG2", "jointG2-wave1", "jointG2-wave2"],
+        default=[
+            "legacy",
+            "mixed",
+            "layeredG2",
+            "jointG2-wave1",
+            "jointG2-wave2",
+            "layered-pipeline",
+        ],
         help=(
             "Modes, separated by spaces or commas. Primary defaults: legacy mixed "
-            "layeredG2 jointG2-wave1 jointG2-wave2. Use 'all' to add exploratory wave4."
+            "layeredG2 jointG2-wave1 jointG2-wave2 layered-pipeline (G2/CPI1). "
+            "Use layered-pipeline-cpi2/cpi3/cpi4 or 'all' for CPI experiments."
         ),
     )
     parser.add_argument(
@@ -75,6 +109,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument(
+        "--max-prefill-length",
+        type=int,
+        help="Override the workload's server-side prefill chunk length.",
+    )
     parser.add_argument("--gpu", default="0", help="CUDA_VISIBLE_DEVICES value for each server")
     parser.add_argument("--profile", default="main", help="Workload profile name")
     parser.add_argument(
@@ -92,6 +131,8 @@ def parse_args() -> argparse.Namespace:
         help="Public ft executable (default: PATH)",
     )
     args = parser.parse_args()
+    if args.max_prefill_length is not None and args.max_prefill_length < 1:
+        parser.error("--max-prefill-length must be at least 1")
     if (args.joint_groups is None) != (args.joint_waves is None):
         parser.error("--joint-groups and --joint-waves must be provided together")
     if args.joint_groups is not None:
@@ -205,6 +246,7 @@ def resolve_modes(
             mode.get("prefill_layer_group_size"),
             mode.get("prefill_execution"),
             mode.get("prefill_wave_max_chunks"),
+            mode.get("layered_pipeline_chunks_per_iteration"),
         )
         if identity not in seen:
             seen.add(identity)
@@ -269,6 +311,11 @@ def server_command(
         command += ["--prefill-execution", mode["prefill_execution"]]
     if "prefill_wave_max_chunks" in mode:
         command += ["--prefill-wave-max-chunks", str(mode["prefill_wave_max_chunks"])]
+    if "layered_pipeline_chunks_per_iteration" in mode:
+        command += [
+            "--layered-pipeline-chunks-per-iteration",
+            str(mode["layered_pipeline_chunks_per_iteration"]),
+        ]
     return command
 
 
@@ -481,6 +528,7 @@ def request_completion(
     decode_tokens: int,
     request_seed: int,
     origin: float,
+    first_text_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     payload = {
         "model": SERVED_MODEL,
@@ -532,6 +580,8 @@ def request_completion(
                             {"at_seconds": timestamp, "text": text}
                         )
                         result["output_text"] += text
+                        if first_text_event is not None:
+                            first_text_event.set()
     except Exception as exc:  # The raw result must retain observable HTTP/stream failures.
         result["error"] = f"{type(exc).__name__}: {exc}"
     result["response_complete_at_seconds"] = relative_now(origin)
@@ -789,6 +839,7 @@ class PublicServer:
         self.readiness_prompt_text = readiness_prompt_text
         self.process: subprocess.Popen[bytes] | None = None
         self.log = tempfile.TemporaryFile(mode="w+b")
+        self.measurement_log_offset: int | None = None
 
     def start(self) -> None:
         environment = os.environ.copy()
@@ -802,6 +853,12 @@ class PublicServer:
             cwd=REPO,
             start_new_session=True,
         )
+        self.wait_until_ready()
+
+    def wait_until_ready(self) -> None:
+        """Wait for a process already assigned to this server and warm its public API."""
+        if self.process is None:
+            raise RuntimeError("server process has not been launched")
         deadline = time.monotonic() + self.timeout
         url = self.base_url + "/v1/models"
         while time.monotonic() < deadline:
@@ -822,6 +879,68 @@ class PublicServer:
 
         self._wait_for_completion_ready(deadline)
         self._minimal_completion(retry_still_loading=True, deadline=deadline)
+
+    def mark_measurement_start(self) -> None:
+        self.log.flush()
+        self.log.seek(0, os.SEEK_END)
+        self.measurement_log_offset = self.log.tell()
+
+    def layered_pipeline_waves(self) -> list[dict[str, int]]:
+        if self.measurement_log_offset is None:
+            return []
+        self.log.flush()
+        self.log.seek(self.measurement_log_offset)
+        text = self.log.read().decode("utf-8", errors="replace")
+        fields = (
+            "chunks",
+            "wave_reqs",
+            "frontier_batches",
+            "resident_groups",
+            "chunk_group_steps",
+            "frontier_group_forwards",
+            "iterations",
+            "decode_iterations",
+            "prefill_layer_prepares",
+            "cross_group_prefetches",
+            "deferred_cross_group_prefetches",
+        )
+        return [
+            dict(zip(fields, (int(value) for value in match.groups())))
+            for match in LAYERED_PIPELINE_WAVE_RE.finditer(text)
+        ]
+
+    def joint_waves(self) -> list[dict[str, int]]:
+        if self.measurement_log_offset is None:
+            return []
+        self.log.flush()
+        self.log.seek(self.measurement_log_offset)
+        text = self.log.read().decode("utf-8", errors="replace")
+        fields = (
+            "chunks",
+            "wave_reqs",
+            "frontier_batches",
+            "groups",
+            "effective_group_size",
+            "prefill_layer_prepares",
+        )
+        return [
+            dict(zip(fields, (int(value) for value in match.groups())))
+            for match in JOINT_WAVE_RE.finditer(text)
+        ]
+
+    def moe_cache_stats_snapshots(self) -> list[dict[str, int]]:
+        """Parse every cumulative idle snapshot, including readiness before measurement."""
+        self.log.flush()
+        self.log.seek(0)
+        text = self.log.read().decode("utf-8", errors="replace")
+        snapshots: list[dict[str, int]] = []
+        for match in MOE_CACHE_STATS_RE.finditer(text):
+            fields: dict[str, int] = {}
+            for item in match.group(1).split(", "):
+                name, value = item.split("=", 1)
+                fields[name] = int(value)
+            snapshots.append(fields)
+        return snapshots
 
     def _completion_request(self) -> urllib.request.Request:
         payload = {
@@ -930,6 +1049,8 @@ def main() -> int:
     if args.repetitions < 1:
         raise ValueError("--repetitions must be at least 1")
     workload = load_workload()
+    if args.max_prefill_length is not None:
+        workload["public_server_config"]["max_prefill_length"] = args.max_prefill_length
     profile = validate_workload(workload, args.profile)
     modes = resolve_modes(
         args.modes,
@@ -1003,6 +1124,8 @@ def main() -> int:
                 "repetitions": [],
                 "requests": [],
                 "server_log_tail": None,
+                "joint_waves": [],
+                "layered_pipeline_waves": [],
                 "error": None,
                 "readiness_prompt_token_id": readiness_prompt_token_id,
             }
@@ -1016,6 +1139,7 @@ def main() -> int:
             )
             try:
                 server.start()
+                server.mark_measurement_start()
                 for repetition in range(args.repetitions):
                     origin = time.perf_counter()
                     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
@@ -1052,6 +1176,10 @@ def main() -> int:
                 raise
             finally:
                 server.stop()
+                if mode["batching_policy"] == "layered-pipeline":
+                    mode_result["layered_pipeline_waves"] = server.layered_pipeline_waves()
+                elif mode["batching_policy"] == "joint":
+                    mode_result["joint_waves"] = server.joint_waves()
                 mode_result["server_log_tail"] = server.log_tail()
                 server.close()
                 write_json(output, result)
