@@ -51,11 +51,7 @@ COUNTER_FIELDS = (
     "prefill_h2d_bytes_total",
 )
 PIPELINE_MODE_RE = re.compile(
-    r"layered(?:-|_)pipeline(?:-|_)g(\d+)(?:-|_)cpi(\d+)"
-    r"(?:(?:-|_)wave(\d+))?"
-)
-LAYERED_PREFILL_MODE_RE = re.compile(
-    r"layered(?:-|_)prefill(?:-|_)g(\d+)(?:(?:-|_)wave(\d+))?"
+    r"layered(?:-|_)pipeline(?:-|_)g(\d+)(?:-|_)wave(\d+)"
 )
 JOINT_MODE_RE = re.compile(r"joint(?:-|_)g(\d+)(?:-|_)wave(\d+)")
 LAYERED_MODE_RE = re.compile(r"layered(?:-|_)g(\d+)")
@@ -71,7 +67,7 @@ def parse_args() -> argparse.Namespace:
             "mixed",
             "layeredG2",
             "jointG2-wave2",
-            "layered-pipeline-cpi3",
+            "layered-pipeline-g1-wave64",
         ],
     )
     parser.add_argument("--repetitions", type=int, default=1)
@@ -191,41 +187,19 @@ def resolve_modes(raw_modes: Iterable[str], workload: dict[str, Any]) -> list[di
     modes: list[dict[str, Any]] = []
     tokens = [piece for item in raw_modes for piece in item.split(",") if piece]
     for token in tokens:
-        if match := LAYERED_PREFILL_MODE_RE.fullmatch(token):
-            group_size = int(match.group(1))
-            wave_chunks = int(match.group(2)) if match.group(2) is not None else 1
+        if match := PIPELINE_MODE_RE.fullmatch(token):
+            group_size, wave_chunks = (int(value) for value in match.groups())
             if group_size < 1 or wave_chunks < 1:
-                raise ValueError(
-                    f"layered-prefill G/wave values must be positive: {token!r}"
-                )
+                raise ValueError(f"pipeline G/wave values must be positive: {token!r}")
             modes.append(
                 {
-                    "name": f"layered_prefill_g{group_size}_wave{wave_chunks}",
-                    "batching_policy": "layered-prefill",
+                    "name": f"layered_pipeline_g{group_size}_wave{wave_chunks}",
+                    "batching_policy": "layered-pipeline",
                     "prefill_layer_group_size": group_size,
                     "prefill_wave_max_chunks": wave_chunks,
                     "primary": False,
                 }
             )
-        elif match := PIPELINE_MODE_RE.fullmatch(token):
-            group_size = int(match.group(1))
-            chunks_per_iteration = int(match.group(2))
-            wave_chunks = int(match.group(3)) if match.group(3) is not None else None
-            if group_size < 1 or chunks_per_iteration < 1:
-                raise ValueError(f"pipeline G/CPI values must be positive: {token!r}")
-            mode = {
-                "name": f"layered_pipeline_g{group_size}_cpi{chunks_per_iteration}",
-                "batching_policy": "layered-pipeline",
-                "prefill_layer_group_size": group_size,
-                "layered_pipeline_chunks_per_iteration": chunks_per_iteration,
-                "primary": False,
-            }
-            if wave_chunks is not None:
-                if wave_chunks < 1:
-                    raise ValueError(f"pipeline wave value must be positive: {token!r}")
-                mode["name"] += f"_wave{wave_chunks}"
-                mode["prefill_wave_max_chunks"] = wave_chunks
-            modes.append(mode)
         elif match := JOINT_MODE_RE.fullmatch(token):
             group_size, wave_chunks = (int(value) for value in match.groups())
             if group_size < 1 or wave_chunks < 1:
@@ -261,7 +235,6 @@ def resolve_modes(raw_modes: Iterable[str], workload: dict[str, Any]) -> list[di
             mode["batching_policy"],
             mode.get("prefill_layer_group_size"),
             mode.get("prefill_wave_max_chunks"),
-            mode.get("layered_pipeline_chunks_per_iteration"),
         )
         if identity not in seen:
             seen.add(identity)
@@ -584,7 +557,6 @@ def main() -> int:
                 "requests": [],
                 "joint_waves": [],
                 "layered_pipeline_waves": [],
-                "layered_prefill_waves": [],
                 "server_log_tail": None,
                 "error": None,
                 "readiness_prompt_token_id": readiness_id,
@@ -652,27 +624,6 @@ def main() -> int:
                     )
                     waves = mode_result["layered_pipeline_waves"]
                     mode_result["layered_pipeline_structure"] = {
-                        name: sum(wave[name] for wave in waves)
-                        for name in (
-                            "chunks",
-                            "wave_reqs",
-                            "frontier_batches",
-                            "resident_groups",
-                            "chunk_group_steps",
-                            "frontier_group_forwards",
-                            "iterations",
-                            "decode_iterations",
-                            "prefill_layer_prepares",
-                            "cross_group_prefetches",
-                            "deferred_cross_group_prefetches",
-                        )
-                    }
-                elif mode["batching_policy"] == "layered-prefill":
-                    mode_result["layered_prefill_waves"] = (
-                        server.layered_prefill_waves()
-                    )
-                    waves = mode_result["layered_prefill_waves"]
-                    mode_result["layered_prefill_structure"] = {
                         name: sum(wave[name] for wave in waves)
                         for name in (
                             "reqs",

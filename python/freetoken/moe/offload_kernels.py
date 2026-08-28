@@ -40,6 +40,33 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     )
 
 
+def ensure_decode_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """Admit an over-capacity CUDA decode query with layer-distance eviction."""
+
+    block_e = triton.next_power_of_2(cache.num_experts)
+    block_c = triton.next_power_of_2(cache.decode_cache_size)
+    _ensure_decode_experts_layer_distance_kernel[(1,)](
+        expert_ids,
+        cache.slot_for_id,
+        cache.id_of_slot,
+        cache.usage,
+        cache.step,
+        cache.evict_slots,
+        cache.src_indices,
+        cache.num_indices,
+        cache.lru_stats[layer_id],
+        layer_id,
+        expert_ids.numel(),
+        num_layers=cache.num_layers,
+        num_experts=cache.num_experts,
+        cache_size=cache.decode_cache_size,
+        BLOCK_E=block_e,
+        BLOCK_C=block_c,
+        COLLECT_STATS=cache.collect_stats,
+        num_warps=8 if block_c >= 2048 else 4,
+    )
+
+
 def ensure_experts_hybrid(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
 ) -> None:
@@ -245,6 +272,135 @@ def _reset_cache_kernel(
     if tl.program_id(0) == 0:
         tl.store(step_ptr, 0)
         tl.store(num_indices_ptr, 0)
+
+
+@triton.jit(do_not_specialize=["layer_id", "num_active"])
+def _ensure_decode_experts_layer_distance_kernel(
+    expert_ids_ptr,
+    slot_for_id_ptr,
+    id_of_slot_ptr,
+    usage_ptr,
+    step_ptr,
+    evict_slots_ptr,
+    src_indices_ptr,
+    num_indices_ptr,
+    stats_ptr,
+    layer_id,
+    num_active,
+    num_layers: tl.constexpr,
+    num_experts: tl.constexpr,
+    cache_size: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    COLLECT_STATS: tl.constexpr,
+):
+    """One-launch decode admission with causal layer-distance replacement.
+
+    The current layer's next reuse is a full layer cycle away.  For an owner layer
+    ``x``, distance is therefore ``(x - layer_id) mod num_layers`` with zero mapped
+    to ``num_layers``.  Empty slots win first; filled victims order by distance
+    descending, then usage and physical slot ascending.
+    """
+    usage_max: tl.constexpr = 9223372036854775807
+    base = layer_id * num_experts
+    step = tl.load(step_ptr) + 1
+    tl.store(step_ptr, step)
+
+    # Build a distinct active set in the fixed expert domain.  This avoids a KxK
+    # dedup matrix while accepting arbitrary routed-query length K.
+    off_e = tl.arange(0, BLOCK_E)
+    expert_lane = off_e < num_experts
+    active = tl.zeros((BLOCK_E,), dtype=tl.int1)
+    for i in tl.range(num_active):
+        expert = tl.load(expert_ids_ptr + i)
+        active = active | (off_e == expert)
+    active = active & expert_lane
+
+    slot = tl.load(
+        slot_for_id_ptr + base + off_e, mask=expert_lane, other=-1
+    )
+    hit = active & (slot >= 0)
+    missing = active & (slot < 0)
+    missing_rank = tl.cumsum(missing.to(tl.int32)) - 1
+    num_missing = tl.sum(missing.to(tl.int32))
+    tl.store(num_indices_ptr, num_missing.to(tl.int64))
+
+    # A hard-pinned hit remains pinned.  Ordinary hits receive this call's epoch.
+    hit_usage = tl.load(usage_ptr + slot, mask=hit, other=usage_max)
+    tl.store(usage_ptr + slot, step, mask=hit & (hit_usage != usage_max))
+
+    if num_missing > 0:
+        off_c = tl.arange(0, BLOCK_C)
+        cache_lane = off_c < cache_size
+        owner = tl.load(id_of_slot_ptr + off_c, mask=cache_lane, other=-1)
+        usage = tl.load(
+            usage_ptr + off_c, mask=cache_lane, other=usage_max
+        ).to(tl.int64)
+
+        # Hits from this query cannot be evicted even if their usage store has not
+        # become visible to the vector reload yet.
+        owner_active = tl.zeros((BLOCK_C,), dtype=tl.int1)
+        for i in tl.range(num_active):
+            expert = tl.load(expert_ids_ptr + i)
+            owner_active = owner_active | (owner == base + expert)
+        eligible = cache_lane & (~owner_active) & (usage != usage_max)
+
+        for rank in tl.range(num_missing):
+            empty = eligible & (owner < 0)
+            has_empty = tl.sum(empty.to(tl.int32)) > 0
+
+            owner_layer = owner // num_experts
+            distance = owner_layer - layer_id
+            distance = tl.where(distance <= 0, distance + num_layers, distance)
+            filled_distance = tl.where(
+                eligible & (owner >= 0), distance, -1
+            )
+            farthest = tl.max(filled_distance, axis=0)
+            farthest_filled = eligible & (owner >= 0) & (distance == farthest)
+            primary = tl.where(has_empty, empty, farthest_filled)
+
+            # Empty slots tie only by physical slot. Filled pages tie by oldest
+            # usage and then physical slot.
+            candidate_usage = tl.where(
+                primary, tl.where(has_empty, 0, usage), usage_max
+            )
+            oldest = tl.min(candidate_usage, axis=0)
+            slot_key = tl.where(
+                primary & (candidate_usage == oldest), off_c, BLOCK_C
+            )
+            victim = tl.argmin(slot_key, axis=0).to(tl.int32)
+            old_id = tl.sum(tl.where(off_c == victim, owner, 0))
+            if old_id >= 0:
+                tl.store(slot_for_id_ptr + old_id, -1)
+
+            expert = tl.sum(
+                tl.where((missing_rank == rank) & missing, off_e, 0)
+            ).to(tl.int32)
+            tl.store(id_of_slot_ptr + victim, base + expert)
+            tl.store(slot_for_id_ptr + base + expert, victim)
+            tl.store(usage_ptr + victim, step)
+            tl.store(evict_slots_ptr + rank, victim)
+            tl.store(src_indices_ptr + rank, expert)
+            eligible = eligible & (off_c != victim)
+
+    # In-place rewrite is safe: every query read above precedes these stores.
+    for i in tl.range(num_active):
+        expert = tl.load(expert_ids_ptr + i)
+        resident_slot = tl.load(slot_for_id_ptr + base + expert)
+        tl.store(expert_ids_ptr + i, resident_slot)
+
+    if COLLECT_STATS:
+        stat_lane = tl.arange(0, 4)
+        stat_value = tl.where(
+            stat_lane == 0,
+            tl.sum(active.to(tl.int32)),
+            tl.where(stat_lane == 1, num_missing, 1),
+        )
+        tl.atomic_add(
+            stats_ptr + stat_lane,
+            stat_value.to(tl.int64),
+            mask=stat_lane < 3,
+        )
 
 
 @triton.jit

@@ -113,19 +113,6 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
-    def _layered_pipeline_chunks_per_iteration(value: str) -> int:
-        try:
-            n = int(value)
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError(
-                "--layered-pipeline-chunks-per-iteration must be at least 1"
-            ) from exc
-        if n < 1:
-            raise argparse.ArgumentTypeError(
-                "--layered-pipeline-chunks-per-iteration must be at least 1"
-            )
-        return n
-
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
 
@@ -351,7 +338,6 @@ def parse_args(
             "layered",
             "joint",
             "layered-pipeline",
-            "layered-prefill",
         ],
         default=ServerArgs.batching_policy,
         help=(
@@ -359,11 +345,9 @@ def parse_args(
             "decode with chunked prefill in one forward; layered jointly schedules two "
             "independent forwards and advances prefill by layer group; joint keeps a "
             "whole layer group resident while one mixed decode/prefill state and its "
-            "remaining prefill chunks traverse it; layered-pipeline runs one complete "
-            "decode token per iteration while every prompt chunk traverses the current "
-            "resident group before the scheduler advances to the next group; "
-            "layered-prefill freezes one ragged prompt wave and advances the complete "
-            "wave by exactly one resident group per scheduler iteration."
+            "remaining prefill chunks traverse it; layered-pipeline freezes one ragged "
+            "prompt wave and advances the complete wave by exactly one resident group "
+            "per scheduler iteration."
         ),
     )
 
@@ -372,11 +356,10 @@ def parse_args(
         type=_positive_int,
         default=ServerArgs.prefill_layer_group_size,
         help=(
-            "Requested decoder layers per layered/joint/layered-pipeline/layered-prefill "
-            "group step. "
+            "Requested decoder layers per layered/joint/layered-pipeline group step. "
             "Joint caps the value at floor(shared slots / experts per layer); "
-            "layered-pipeline and layered-prefill reserve one full expert layer for "
-            "decode and cap it one layer lower."
+            "layered-pipeline reserves one full expert layer for decode and caps it "
+            "one layer lower."
         ),
     )
 
@@ -385,20 +368,10 @@ def parse_args(
         type=_positive_int,
         default=ServerArgs.prefill_wave_max_chunks,
         help=(
-            "Soft cap on complete prompt chunks admitted into one joint, "
-            "layered-pipeline, or layered-prefill resident wave. Layered-prefill uses "
-            "the chunk count only for admission; each admitted request is one physical "
-            "ragged range. A first request larger than the cap remains intact and runs alone."
-        ),
-    )
-
-    parser.add_argument(
-        "--layered-pipeline-chunks-per-iteration",
-        type=_layered_pipeline_chunks_per_iteration,
-        default=ServerArgs.layered_pipeline_chunks_per_iteration,
-        help=(
-            "Maximum consecutive prompt chunks advanced inside the active resident "
-            "group per layered-pipeline scheduler iteration."
+            "Soft prompt-chunk cap for a joint wave. Layered-pipeline instead uses "
+            "planned chunks only as an aggregate complete-request admission estimate; "
+            "each admitted request is one physical ragged range, and an oversized first "
+            "request remains intact and runs alone."
         ),
     )
 
@@ -407,8 +380,9 @@ def parse_args(
         choices=["serial", "concurrent"],
         default=ServerArgs.prefill_execution,
         help=(
-            "Layered-prefill execution: serial keeps decode/prefill compute ordered while "
-            "expert copies may overlap decode; concurrent is an explicit two-stream A/B."
+            "Layered separate-forward execution: serial keeps decode/prefill compute "
+            "ordered while expert copies may overlap decode; concurrent is an explicit "
+            "two-stream A/B."
         ),
     )
 

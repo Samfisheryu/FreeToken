@@ -40,38 +40,20 @@ MODE_ALIASES = {
     "jointG2-wave4": "joint_g2_wave4_exploratory",
     "wave4": "joint_g2_wave4_exploratory",
     "joint_g2_wave4_exploratory": "joint_g2_wave4_exploratory",
-    "layered-pipeline": "layered_pipeline_g2_cpi1",
-    "layered-pipeline-cpi1": "layered_pipeline_g2_cpi1",
-    "layered_pipeline_g2_cpi1": "layered_pipeline_g2_cpi1",
-    "layered-pipeline-cpi2": "layered_pipeline_g2_cpi2",
-    "layered_pipeline_g2_cpi2": "layered_pipeline_g2_cpi2",
-    "layered-pipeline-cpi3": "layered_pipeline_g2_cpi3",
-    "layered_pipeline_g2_cpi3": "layered_pipeline_g2_cpi3",
-    "layered-pipeline-cpi4": "layered_pipeline_g2_cpi4",
-    "layered_pipeline_g2_cpi4": "layered_pipeline_g2_cpi4",
-    "layered-prefill": "layered_prefill_g2_wave1",
-    "layered_prefill_g2_wave1": "layered_prefill_g2_wave1",
+    "layered-pipeline": "layered_pipeline_g2_wave1",
+    "layered_pipeline_g2_wave1": "layered_pipeline_g2_wave1",
 }
 
 LAYERED_PIPELINE_WAVE_RE = re.compile(
     r"Layered pipeline wave complete: "
-    r"chunks=(\d+), wave_reqs=(\d+), frontier_batches=(\d+), "
-    r"resident_groups=(\d+), chunk_group_steps=(\d+), "
-    r"frontier_group_forwards=(\d+), "
+    r"reqs=(\d+), groups=(\d+), group_forwards=(\d+), "
     r"iterations=(\d+), decode_iterations=(\d+), "
-    r"prefill_layer_prepares=(\d+), cross_group_prefetches=(\d+), "
-    r"deferred_cross_group_prefetches=(\d+)"
+    r"prefill_layer_prepares=(\d+)"
 )
 JOINT_WAVE_RE = re.compile(
     r"Joint wave complete: "
     r"chunks=(\d+), wave_reqs=(\d+), frontier_batches=(\d+), groups=(\d+), "
     r"effective_group_size=(\d+), prefill_layer_prepares=(\d+)"
-)
-LAYERED_PREFILL_WAVE_RE = re.compile(
-    r"Layered prefill wave complete: "
-    r"reqs=(\d+), groups=(\d+), group_forwards=(\d+), "
-    r"iterations=(\d+), decode_iterations=(\d+), "
-    r"prefill_layer_prepares=(\d+)"
 )
 MOE_CACHE_STATS_RE = re.compile(r"MoE cache stats snapshot: ([^\n]+)")
 
@@ -96,8 +78,7 @@ def parse_args() -> argparse.Namespace:
         ],
         help=(
             "Modes, separated by spaces or commas. Primary defaults: legacy mixed "
-            "layeredG2 jointG2-wave1 jointG2-wave2 layered-pipeline (G2/CPI1). "
-            "Use layered-pipeline-cpi2/cpi3/cpi4 or 'all' for CPI experiments."
+            "layeredG2 jointG2-wave1 jointG2-wave2 layered-pipeline (G2/W1)."
         ),
     )
     parser.add_argument(
@@ -254,7 +235,6 @@ def resolve_modes(
             mode.get("prefill_layer_group_size"),
             mode.get("prefill_execution"),
             mode.get("prefill_wave_max_chunks"),
-            mode.get("layered_pipeline_chunks_per_iteration"),
         )
         if identity not in seen:
             seen.add(identity)
@@ -319,11 +299,6 @@ def server_command(
         command += ["--prefill-execution", mode["prefill_execution"]]
     if "prefill_wave_max_chunks" in mode:
         command += ["--prefill-wave-max-chunks", str(mode["prefill_wave_max_chunks"])]
-    if "layered_pipeline_chunks_per_iteration" in mode:
-        command += [
-            "--layered-pipeline-chunks-per-iteration",
-            str(mode["layered_pipeline_chunks_per_iteration"]),
-        ]
     return command
 
 
@@ -900,17 +875,12 @@ class PublicServer:
         self.log.seek(self.measurement_log_offset)
         text = self.log.read().decode("utf-8", errors="replace")
         fields = (
-            "chunks",
-            "wave_reqs",
-            "frontier_batches",
-            "resident_groups",
-            "chunk_group_steps",
-            "frontier_group_forwards",
+            "reqs",
+            "groups",
+            "group_forwards",
             "iterations",
             "decode_iterations",
             "prefill_layer_prepares",
-            "cross_group_prefetches",
-            "deferred_cross_group_prefetches",
         )
         return [
             dict(zip(fields, (int(value) for value in match.groups())))
@@ -934,25 +904,6 @@ class PublicServer:
         return [
             dict(zip(fields, (int(value) for value in match.groups())))
             for match in JOINT_WAVE_RE.finditer(text)
-        ]
-
-    def layered_prefill_waves(self) -> list[dict[str, int]]:
-        if self.measurement_log_offset is None:
-            return []
-        self.log.flush()
-        self.log.seek(self.measurement_log_offset)
-        text = self.log.read().decode("utf-8", errors="replace")
-        fields = (
-            "reqs",
-            "groups",
-            "group_forwards",
-            "iterations",
-            "decode_iterations",
-            "prefill_layer_prepares",
-        )
-        return [
-            dict(zip(fields, (int(value) for value in match.groups())))
-            for match in LAYERED_PREFILL_WAVE_RE.finditer(text)
         ]
 
     def moe_cache_stats_snapshots(self) -> list[dict[str, int]]:
@@ -1153,7 +1104,7 @@ def main() -> int:
                 "server_log_tail": None,
                 "joint_waves": [],
                 "layered_pipeline_waves": [],
-                "layered_prefill_waves": [],
+                "layered_pipeline_structure": None,
                 "error": None,
                 "readiness_prompt_token_id": readiness_prompt_token_id,
             }
@@ -1205,9 +1156,20 @@ def main() -> int:
             finally:
                 server.stop()
                 if mode["batching_policy"] == "layered-pipeline":
-                    mode_result["layered_pipeline_waves"] = server.layered_pipeline_waves()
-                elif mode["batching_policy"] == "layered-prefill":
-                    mode_result["layered_prefill_waves"] = server.layered_prefill_waves()
+                    waves = server.layered_pipeline_waves()
+                    mode_result["layered_pipeline_waves"] = waves
+                    fields = (
+                        "reqs",
+                        "groups",
+                        "group_forwards",
+                        "iterations",
+                        "decode_iterations",
+                        "prefill_layer_prepares",
+                    )
+                    mode_result["layered_pipeline_structure"] = {
+                        field: sum(wave[field] for wave in waves)
+                        for field in fields
+                    }
                 elif mode["batching_policy"] == "joint":
                     mode_result["joint_waves"] = server.joint_waves()
                 mode_result["server_log_tail"] = server.log_tail()

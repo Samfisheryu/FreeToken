@@ -21,11 +21,9 @@ class SchedulerConfig(EngineConfig):
         "layered",
         "joint",
         "layered-pipeline",
-        "layered-prefill",
     ] = "legacy"
     prefill_layer_group_size: int = 2
     prefill_wave_max_chunks: int = 1
-    layered_pipeline_chunks_per_iteration: int = 1
     prefill_execution: Literal["serial", "concurrent"] = "serial"
     cache_type: str = "radix"
     offline_mode: bool = False
@@ -42,10 +40,6 @@ class SchedulerConfig(EngineConfig):
             raise ValueError("prefill_layer_group_size must be >= 1")
         if self.prefill_wave_max_chunks < 1:
             raise ValueError("prefill_wave_max_chunks must be >= 1")
-        if self.layered_pipeline_chunks_per_iteration < 1:
-            raise ValueError(
-                "--layered-pipeline-chunks-per-iteration must be at least 1"
-            )
         if self.prefill_execution not in ("serial", "concurrent"):
             raise ValueError(
                 "prefill_execution must be either 'serial' or 'concurrent'"
@@ -65,8 +59,8 @@ class SchedulerConfig(EngineConfig):
 
     @property
     def max_forward_len(self) -> int:
-        if self.batching_policy == "layered-prefill":
-            # A layered-prefill wave removes physical T-sized chunk boundaries.
+        if self.batching_policy == "layered-pipeline":
+            # A layered-pipeline wave removes physical T-sized chunk boundaries.
             # Multi-request admission bounds total prompt rows by W*T; an oversized
             # first request remains exclusive and is bounded by max_seq_len. Decode
             # contributes at most one row per running request to the mixed group.

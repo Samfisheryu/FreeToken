@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
-import math
 from pathlib import Path
 import shutil
 import tempfile
@@ -33,8 +32,8 @@ MAX_SEQ_LEN = 16384
 DEFAULT_MODES = (
     "legacy_t8192_c24",
     "legacy_t8192_c40",
-    "layered_pipeline_g1_t512_cpi16_wave64_c24",
-    "layered_pipeline_g1_t512_cpi16_wave64_c40",
+    "layered_pipeline_g1_t512_wave64_c24",
+    "layered_pipeline_g1_t512_wave64_c40",
 )
 
 
@@ -73,7 +72,6 @@ def mode_contract(name: str) -> dict[str, Any]:
         "batching_policy": "layered-pipeline",
         "prefill_layer_group_size": 1,
         "prefill_wave_max_chunks": 64,
-        "layered_pipeline_chunks_per_iteration": 16,
         "max_prefill_length": 512,
         "moe_cache_size": cache_size,
     }
@@ -414,30 +412,28 @@ def validate_stats(delta: dict[str, int]) -> list[str]:
 def validate_pipeline_waves(
     waves: list[dict[str, int]],
     records: list[dict[str, Any]],
-    chunk_tokens: int,
 ) -> list[str]:
     failures: list[str] = []
-    expected_chunks = sum(
-        math.ceil(record["actual_new_prefill_tokens"] / chunk_tokens)
+    expected_reqs = sum(
+        1
         for record in records
         if isinstance(record.get("actual_new_prefill_tokens"), int)
         and record["actual_new_prefill_tokens"] > 0
     )
-    if sum(wave["chunks"] for wave in waves) != expected_chunks:
+    if sum(wave["reqs"] for wave in waves) != expected_reqs:
         failures.append(
-            f"pipeline chunks {sum(wave['chunks'] for wave in waves)} != "
-            f"expected {expected_chunks}"
+            f"pipeline wave reqs {sum(wave['reqs'] for wave in waves)} != "
+            f"expected {expected_reqs}"
         )
     for wave in waves:
-        if wave["resident_groups"] != scaled.MODEL_CONTRACT["layers"]:
+        if wave["groups"] != scaled.MODEL_CONTRACT["layers"]:
             failures.append("pipeline wave did not visit every resident group")
-        if wave["chunk_group_steps"] != wave["chunks"] * wave["resident_groups"]:
-            failures.append("pipeline chunk-group steps do not close")
-        if (
-            wave["frontier_group_forwards"]
-            != wave["frontier_batches"] * wave["resident_groups"]
-        ):
-            failures.append("pipeline frontier forwards do not close")
+        if wave["group_forwards"] != wave["groups"]:
+            failures.append("pipeline group forwards do not close")
+        if wave["iterations"] != wave["groups"]:
+            failures.append("pipeline iterations do not close")
+        if not 0 <= wave["decode_iterations"] <= wave["iterations"]:
+            failures.append("pipeline decode iterations are out of range")
         if wave["prefill_layer_prepares"] != scaled.MODEL_CONTRACT["layers"]:
             failures.append("pipeline layer prepares do not close")
     return failures
@@ -667,9 +663,7 @@ def validate_repetition(
         failures.append(f"{failed} requests failed public accounting")
     failures.extend(validate_stats(stats_delta))
     if mode["batching_policy"] == "layered-pipeline":
-        failures.extend(
-            validate_pipeline_waves(waves, records, mode["max_prefill_length"])
-        )
+        failures.extend(validate_pipeline_waves(waves, records))
     elif waves:
         failures.append("legacy mode unexpectedly emitted pipeline waves")
     return failures
@@ -776,6 +770,7 @@ def main() -> int:
                 "repetitions": [],
                 "requests": [],
                 "layered_pipeline_waves": [],
+                "layered_pipeline_structure": None,
                 "summary": None,
                 "server_log_tail": None,
                 "error": None,
@@ -880,6 +875,21 @@ def main() -> int:
                 mode_result["summary"] = summarize_mode(
                     mode_result["requests"], mode_result["repetitions"]
                 )
+                if mode["batching_policy"] == "layered-pipeline":
+                    mode_result["layered_pipeline_structure"] = {
+                        field: sum(
+                            wave[field]
+                            for wave in mode_result["layered_pipeline_waves"]
+                        )
+                        for field in (
+                            "reqs",
+                            "groups",
+                            "group_forwards",
+                            "iterations",
+                            "decode_iterations",
+                            "prefill_layer_prepares",
+                        )
+                    }
             except Exception as exc:
                 mode_result["error"] = f"{type(exc).__name__}: {exc}"
                 raise
