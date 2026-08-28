@@ -38,6 +38,20 @@ The paper-granularity one-group-per-iteration comparison is in
 The sustained-decode experiment with serial periodic long prefills is in
 [`results/periodic_long_prefill_lab_20260827.md`](results/periodic_long_prefill_lab_20260827.md).
 
+**`bench_real_conversation_concurrency.py`** — replays real WildChat multi-turn
+text under BurstGPT session starts and human think times. It compares identical
+fixed sessions across batching policies and records TTFT, TPOT, request latency,
+inter-token gaps, expert traffic, and peak concurrency. The Qwen3.5-MoE result
+and policy boundary are in
+[`results/real_conversation_concurrency_20260828.md`](results/real_conversation_concurrency_20260828.md).
+
+```bash
+python benchmarks/bench_real_conversation_concurrency.py \
+  --manifest /tmp/wildchat_burstgpt_qwen35.json \
+  --profiles short natural long --user-counts 5 10 20 \
+  --output /tmp/real_conversation_concurrency.json
+```
+
 **`bench_load_weight_generic.py`** — expert-bank load time: serial vs parallel O_DIRECT
 vs pre-repacked FTW, each mode in its own subprocess. Linux-only; stages the FTW under
 `/var/tmp` (`--ftw-dir` overrides; roughly checkpoint-sized).

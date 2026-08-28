@@ -512,6 +512,7 @@ def request_completion(
     request_seed: int,
     origin: float,
     first_text_event: threading.Event | None = None,
+    request_timeout: float = 3600.0,
 ) -> dict[str, Any]:
     payload = {
         "model": SERVED_MODEL,
@@ -540,7 +541,7 @@ def request_completion(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=3600) as response:
+        with urllib.request.urlopen(request, timeout=request_timeout) as response:
             for raw_line in response:
                 line = raw_line.decode("utf-8").strip()
                 if not line.startswith("data:"):
