@@ -177,14 +177,39 @@ def act_quant_fp8_inplace(x: torch.Tensor, block: int = 64) -> torch.Tensor:
     return x
 
 
-def act_quant_fp8_roundtrip(x: torch.Tensor, block: int = 128) -> torch.Tensor:
-    """FP8 quant+dequant round-trip into a fresh contiguous BF16 tensor (fuses the copy --
-    for callers that must keep ``x`` intact, e.g. the MoE expert input shared with the
-    gate / shared expert). Numerically identical to ``act_quant_fp8_inplace(x.clone())``."""
+def act_quant_fp8_roundtrip(
+    x: torch.Tensor,
+    block: int = 128,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """FP8 quant+dequant round-trip without modifying ``x``.
+
+    By default the result uses a fresh contiguous tensor. ``output`` lets graph-captured
+    callers supply their stable workspace; it must match ``x`` in shape, dtype and device,
+    is written directly by the fused kernel, and is returned unchanged.
+    """
     *lead, N = x.shape
     assert N % block == 0, (N, block)
     x2d = x.reshape(-1, N)
-    out = torch.empty_like(x2d)
+    if output is None:
+        out = torch.empty_like(x2d)
+        result = out.reshape(x.shape)
+    else:
+        if output.shape != x.shape:
+            raise ValueError(
+                f"output shape must match input shape {tuple(x.shape)}, "
+                f"got {tuple(output.shape)}"
+            )
+        if output.dtype != x.dtype:
+            raise ValueError(
+                f"output dtype must match input dtype {x.dtype}, got {output.dtype}"
+            )
+        if output.device != x.device:
+            raise ValueError(
+                f"output device must match input device {x.device}, got {output.device}"
+            )
+        out = output.reshape(-1, N)
+        result = output
     M = x2d.shape[0]
     BLOCK_M = 32
     grid = (triton.cdiv(M, BLOCK_M), N // block)
@@ -192,7 +217,7 @@ def act_quant_fp8_roundtrip(x: torch.Tensor, block: int = 128) -> torch.Tensor:
         x2d, out, M, N, x2d.stride(0), x2d.stride(1), out.stride(0), out.stride(1),
         -448.0, 448.0, 1.0 / 448.0, False, BLOCK_M=BLOCK_M, BLOCK=block,
     )
-    return out.reshape(x.shape)
+    return result
 
 
 def fp4_act_quant_inplace(x: torch.Tensor, block: int = 32) -> torch.Tensor:

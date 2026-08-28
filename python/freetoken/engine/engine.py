@@ -713,6 +713,7 @@ class Engine:
             device=self.device,
             swiglu_alpha=getattr(sample, "hidden_act_alpha", 1.702),
             swiglu_limit=getattr(sample, "swiglu_limit", None),
+            nowag_model_type=getattr(sample, "nowag_model_type", None),
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1444,6 +1445,20 @@ def _adjust_config(config: EngineConfig):
             "and let every layer decode on the GPU offload path instead."
         )
 
+    if expert_quant == "nowag" and (
+        config.moe_backend in ("cpu", "hybrid") or config.moe_cpu_layers
+    ):
+        from freetoken.moe.cpu_executor import compiled_extension_supports
+
+        if not compiled_extension_supports(
+            getattr(model_config, "hidden_act", "silu"), "nowag"
+        ):
+            raise RuntimeError(
+                "NoWAG cpu/hybrid requires a _cpu_moe extension with the NoWAG "
+                "weight format; rebuild it with `python setup.py build_ext "
+                "--inplace` (or reinstall the wheel)."
+            )
+
     if is_moe and config.moe_backend == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
         # banks into an auto-sized GPU slot cache, which is the only default that serves a model
@@ -1465,7 +1480,7 @@ def _adjust_config(config: EngineConfig):
         from freetoken.moe.bench_profile import load_backend_recommendation
 
         gpu_name, gpu_uuid = _profile_gpu()
-        if expert_quant != "nowag" and load_backend_recommendation(
+        if load_backend_recommendation(
             bench_fmt,
             gpu_name=gpu_name,
             gpu_uuid=gpu_uuid,
@@ -1479,13 +1494,16 @@ def _adjust_config(config: EngineConfig):
                     f"support this model's expert activation "
                     f"{getattr(model_config, 'hidden_act', None)!r}; staying on offload"
                 )
-            elif moe_wfmt != "mxfp4" and not compiled_extension_supports(_act):
+            elif moe_wfmt != "mxfp4" and not compiled_extension_supports(
+                _act, bench_fmt
+            ):
                 # Stale prebuilt _cpu_moe.so: an explicit cpu/hybrid pick still
                 # hard-fails in the executor, but a default must not turn into a
                 # post-load crash -- degrade to offload.
                 logger.info_rank0(
                     f"benchbw profile recommends hybrid, but the compiled _cpu_moe "
-                    f"extension predates activation {_act!r} (rebuild with "
+                    f"extension does not support activation {_act!r} with "
+                    f"{bench_fmt!r} experts (rebuild with "
                     f"`python setup.py build_ext --inplace`); staying on offload"
                 )
             else:
@@ -1514,14 +1532,6 @@ def _adjust_config(config: EngineConfig):
                 "No MoE cache sizing flag given; defaulting to --moe-cache-auto for "
                 f"auto-selected backend {config.moe_backend!r}"
             )
-
-    if expert_quant == "nowag" and (
-        config.moe_backend != "offload" or config.moe_cpu_layers
-    ):
-        raise ValueError(
-            "NoWAG currently supports only --moe-backend offload "
-            "without --moe-cpu-layers"
-        )
 
     if is_moe and config.moe_backend == "fused":
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The

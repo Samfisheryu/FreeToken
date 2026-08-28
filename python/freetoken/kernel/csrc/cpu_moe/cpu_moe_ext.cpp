@@ -1064,6 +1064,239 @@ void fp8_roundtrip_bf16(const bf16_t* src, bf16_t* dst, int K) {
   }
 }
 
+// ---------------------------------- NoWAG ----------------------------------
+// D6/B12 assignments stay in runtime [word, output] order. Eight ids span three
+// words, so AVX2 decodes eight output rows at once and gathers the shared BF16
+// codebook without materializing dense experts.
+constexpr int NOWAG_GROUP_SIZE = 6;
+constexpr int NOWAG_ASSIGNMENT_BITS = 12;
+constexpr int NOWAG_IDS_PER_BLOCK = 8;
+constexpr int NOWAG_WORDS_PER_BLOCK = 3;
+constexpr int NOWAG_CODEBOOK_PAIRS = NOWAG_GROUP_SIZE / 2;
+constexpr int NOWAG_ACCUMULATORS = 4;
+constexpr uint32_t NOWAG_ID_MASK = (1u << NOWAG_ASSIGNMENT_BITS) - 1;
+
+inline int nowag_num_groups(int K) {
+  return (K + NOWAG_GROUP_SIZE - 1) / NOWAG_GROUP_SIZE;
+}
+
+inline int nowag_assignment_words(int K) {
+  return (nowag_num_groups(K) * NOWAG_ASSIGNMENT_BITS + 31) / 32;
+}
+
+using nowag_gemv_fn = void (*)(float*, const uint32_t*, const bf16_t*,
+                               const bf16_t*, int, int, int, int, int);
+using nowag_scale_fn = void (*)(const bf16_t*, const bf16_t*, bf16_t*, int);
+
+inline uint32_t nowag_decode_id(const uint32_t* assignments, int W, int N,
+                                int group, int output) {
+  const int bit = group * NOWAG_ASSIGNMENT_BITS;
+  const int word = bit >> 5;
+  const int shift = bit & 31;
+  uint64_t packed = assignments[(size_t)word * N + output];
+  if (shift + NOWAG_ASSIGNMENT_BITS > 32 && word + 1 < W)
+    packed |= (uint64_t)assignments[(size_t)(word + 1) * N + output] << 32;
+  return static_cast<uint32_t>((packed >> shift) & NOWAG_ID_MASK);
+}
+
+void nowag_gemv_scalar(float* out, const uint32_t* assignments,
+                       const bf16_t* x, const bf16_t* codebook, int K,
+                       int N, int W, int n0, int n1) {
+  const int groups = nowag_num_groups(K);
+  for (int n = n0; n < n1; ++n) {
+    float acc[NOWAG_ACCUMULATORS] = {};
+    for (int g = 0; g < groups; ++g) {
+      const bf16_t* cb = codebook + (size_t)nowag_decode_id(
+          assignments, W, N, g, n) * NOWAG_GROUP_SIZE;
+      const int k0 = g * NOWAG_GROUP_SIZE;
+      const int lanes = std::min(NOWAG_GROUP_SIZE, K - k0);
+      for (int d = 0; d < lanes; ++d)
+        acc[(k0 + d) & (NOWAG_ACCUMULATORS - 1)] +=
+            bf16_to_f32(x[k0 + d]) * bf16_to_f32(cb[d]);
+    }
+    out[n - n0] = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+  }
+}
+
+void nowag_scale_bf16_scalar(const bf16_t* x, const bf16_t* scale,
+                             bf16_t* out, int K) {
+  for (int k = 0; k < K; ++k)
+    out[k] = f32_to_bf16(bf16_to_f32(x[k]) * bf16_to_f32(scale[k]));
+}
+
+#if CPU_MOE_X86
+struct NowagAvxAccumulators {
+  __m256 values[NOWAG_ACCUMULATORS];
+};
+
+__attribute__((target("avx2,fma")))
+static inline void nowag_accumulate_codeword(
+    NowagAvxAccumulators& acc, __m256i ids, const bf16_t* x,
+    const bf16_t* codebook, int lanes, int input_offset) {
+  const __m256i base = _mm256_mullo_epi32(
+      ids, _mm256_set1_epi32(NOWAG_CODEBOOK_PAIRS));
+  const __m256i high_mask = _mm256_set1_epi32((int)0xFFFF0000u);
+  for (int d = 0; d < lanes; d += 2) {
+    const __m256i indices = _mm256_add_epi32(
+        base, _mm256_set1_epi32(d >> 1));
+    const __m256i pair = _mm256_i32gather_epi32(
+        reinterpret_cast<const int*>(codebook), indices, 4);
+    const __m256 low = _mm256_castsi256_ps(_mm256_slli_epi32(pair, 16));
+    const int low_acc = (input_offset + d) & (NOWAG_ACCUMULATORS - 1);
+    acc.values[low_acc] = _mm256_fmadd_ps(
+        low, _mm256_set1_ps(bf16_to_f32(x[d])), acc.values[low_acc]);
+    if (d + 1 < lanes) {
+      const __m256 high = _mm256_castsi256_ps(
+          _mm256_and_si256(pair, high_mask));
+      const int high_acc = (input_offset + d + 1) & (NOWAG_ACCUMULATORS - 1);
+      acc.values[high_acc] = _mm256_fmadd_ps(
+          high, _mm256_set1_ps(bf16_to_f32(x[d + 1])), acc.values[high_acc]);
+    }
+  }
+}
+
+__attribute__((target("avx2,fma")))
+static inline __m256i nowag_decode_ids_avx2(const uint32_t* assignments,
+                                             int N, int group, int output) {
+  const int bit = group * NOWAG_ASSIGNMENT_BITS;
+  const int word = bit >> 5;
+  const int shift = bit & 31;
+  const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+      assignments + (size_t)word * N + output));
+  __m256i ids = _mm256_srlv_epi32(lo, _mm256_set1_epi32(shift));
+  if (shift + NOWAG_ASSIGNMENT_BITS > 32) {
+    const __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+        assignments + (size_t)(word + 1) * N + output));
+    ids = _mm256_or_si256(
+        ids, _mm256_sllv_epi32(hi, _mm256_set1_epi32(32 - shift)));
+  }
+  return _mm256_and_si256(ids, _mm256_set1_epi32(NOWAG_ID_MASK));
+}
+
+__attribute__((target("avx2,fma")))
+static inline void nowag_accumulate_eight_groups(
+    NowagAvxAccumulators& acc, const uint32_t* assignments, const bf16_t* x,
+    const bf16_t* codebook, int N, int group, int output) {
+  const int word = (group / NOWAG_IDS_PER_BLOCK) * NOWAG_WORDS_PER_BLOCK;
+  const __m256i w0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+      assignments + (size_t)word * N + output));
+  const __m256i w1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+      assignments + (size_t)(word + 1) * N + output));
+  const __m256i w2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+      assignments + (size_t)(word + 2) * N + output));
+  const __m256i mask = _mm256_set1_epi32(NOWAG_ID_MASK);
+  __m256i ids = _mm256_and_si256(w0, mask);
+  nowag_accumulate_codeword(
+      acc, ids, x, codebook, NOWAG_GROUP_SIZE, group * NOWAG_GROUP_SIZE);
+  ids = _mm256_and_si256(_mm256_srli_epi32(w0, 12), mask);
+  nowag_accumulate_codeword(
+      acc, ids, x + NOWAG_GROUP_SIZE, codebook, NOWAG_GROUP_SIZE,
+      (group + 1) * NOWAG_GROUP_SIZE);
+  ids = _mm256_and_si256(_mm256_or_si256(
+      _mm256_srli_epi32(w0, 24), _mm256_slli_epi32(w1, 8)), mask);
+  nowag_accumulate_codeword(
+      acc, ids, x + 2 * NOWAG_GROUP_SIZE, codebook, NOWAG_GROUP_SIZE,
+      (group + 2) * NOWAG_GROUP_SIZE);
+  ids = _mm256_and_si256(_mm256_srli_epi32(w1, 4), mask);
+  nowag_accumulate_codeword(
+      acc, ids, x + 3 * NOWAG_GROUP_SIZE, codebook, NOWAG_GROUP_SIZE,
+      (group + 3) * NOWAG_GROUP_SIZE);
+  ids = _mm256_and_si256(_mm256_srli_epi32(w1, 16), mask);
+  nowag_accumulate_codeword(
+      acc, ids, x + 4 * NOWAG_GROUP_SIZE, codebook, NOWAG_GROUP_SIZE,
+      (group + 4) * NOWAG_GROUP_SIZE);
+  ids = _mm256_and_si256(_mm256_or_si256(
+      _mm256_srli_epi32(w1, 28), _mm256_slli_epi32(w2, 4)), mask);
+  nowag_accumulate_codeword(
+      acc, ids, x + 5 * NOWAG_GROUP_SIZE, codebook, NOWAG_GROUP_SIZE,
+      (group + 5) * NOWAG_GROUP_SIZE);
+  ids = _mm256_and_si256(_mm256_srli_epi32(w2, 8), mask);
+  nowag_accumulate_codeword(
+      acc, ids, x + 6 * NOWAG_GROUP_SIZE, codebook, NOWAG_GROUP_SIZE,
+      (group + 6) * NOWAG_GROUP_SIZE);
+  ids = _mm256_and_si256(_mm256_srli_epi32(w2, 20), mask);
+  nowag_accumulate_codeword(
+      acc, ids, x + 7 * NOWAG_GROUP_SIZE, codebook, NOWAG_GROUP_SIZE,
+      (group + 7) * NOWAG_GROUP_SIZE);
+}
+
+__attribute__((target("avx2,fma")))
+void nowag_gemv_avx2(float* out, const uint32_t* assignments,
+                     const bf16_t* x, const bf16_t* codebook, int K,
+                     int N, int W, int n0, int n1) {
+  const int groups = nowag_num_groups(K);
+  int n = n0;
+  for (; n + NOWAG_IDS_PER_BLOCK <= n1; n += NOWAG_IDS_PER_BLOCK) {
+    NowagAvxAccumulators acc;
+    for (int i = 0; i < NOWAG_ACCUMULATORS; ++i)
+      acc.values[i] = _mm256_setzero_ps();
+    int g = 0;
+    for (; g + NOWAG_IDS_PER_BLOCK <= groups &&
+           (g + NOWAG_IDS_PER_BLOCK) * NOWAG_GROUP_SIZE <= K;
+         g += NOWAG_IDS_PER_BLOCK)
+      nowag_accumulate_eight_groups(
+          acc, assignments, x + (size_t)g * NOWAG_GROUP_SIZE,
+          codebook, N, g, n);
+    for (; g < groups; ++g) {
+      const __m256i ids = nowag_decode_ids_avx2(assignments, N, g, n);
+      nowag_accumulate_codeword(
+          acc, ids, x + (size_t)g * NOWAG_GROUP_SIZE, codebook,
+          std::min(NOWAG_GROUP_SIZE, K - g * NOWAG_GROUP_SIZE),
+          g * NOWAG_GROUP_SIZE);
+    }
+    const __m256 sum01 = _mm256_add_ps(acc.values[0], acc.values[1]);
+    const __m256 sum23 = _mm256_add_ps(acc.values[2], acc.values[3]);
+    _mm256_storeu_ps(out + (n - n0), _mm256_add_ps(sum01, sum23));
+  }
+  if (n < n1)
+    nowag_gemv_scalar(
+        out + (n - n0), assignments, x, codebook, K, N, W, n, n1);
+}
+
+__attribute__((target("avx2,fma")))
+void nowag_scale_bf16_avx2(const bf16_t* x, const bf16_t* scale,
+                           bf16_t* out, int K) {
+  int k = 0;
+  const __m256i bias = _mm256_set1_epi32(0x7FFF);
+  const __m256i one = _mm256_set1_epi32(1);
+  for (; k + 8 <= K; k += 8) {
+    const __m128i xi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + k));
+    const __m128i ni = _mm_loadu_si128(reinterpret_cast<const __m128i*>(scale + k));
+    const __m256 xf = _mm256_castsi256_ps(
+        _mm256_slli_epi32(_mm256_cvtepu16_epi32(xi), 16));
+    const __m256 nf = _mm256_castsi256_ps(
+        _mm256_slli_epi32(_mm256_cvtepu16_epi32(ni), 16));
+    __m256i bits = _mm256_castps_si256(_mm256_mul_ps(xf, nf));
+    bits = _mm256_add_epi32(
+        bits, _mm256_add_epi32(bias, _mm256_and_si256(
+            _mm256_srli_epi32(bits, 16), one)));
+    bits = _mm256_srli_epi32(bits, 16);
+    const __m128i packed = _mm_packus_epi32(
+        _mm256_castsi256_si128(bits), _mm256_extracti128_si256(bits, 1));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out + k), packed);
+  }
+  nowag_scale_bf16_scalar(x + k, scale + k, out + k, K - k);
+}
+#endif
+
+nowag_gemv_fn select_nowag_gemv() {
+  const IsaTier t = pick_isa();
+#if CPU_MOE_X86
+  if (t >= ISA_AVX2) return nowag_gemv_avx2;
+#endif
+  (void)t;
+  return nowag_gemv_scalar;
+}
+
+nowag_scale_fn select_nowag_scale() {
+  const IsaTier t = pick_isa();
+#if CPU_MOE_X86
+  if (t >= ISA_AVX2) return nowag_scale_bf16_avx2;
+#endif
+  (void)t;
+  return nowag_scale_bf16_scalar;
+}
+
 // --------------------------------- executor ---------------------------------
 
 struct CpuMoeExecutor;
@@ -1212,7 +1445,46 @@ q4dot_fn select_q4dot() {
   return q4_0_dot_i8_scalar;
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
+enum WFmt {
+  WF_BF16 = 0,
+  WF_NVFP4 = 1,
+  WF_MXFP4 = 2,
+  WF_DSFP4 = 3,
+  WF_Q4_0 = 4,
+  WF_NOWAG = 5,
+};
+
+enum NowagBank {
+  NW_GATE_ASSIGN = 0,
+  NW_GATE_INPUT_NORM = 1,
+  NW_GATE_OUTPUT_NORM = 2,
+  NW_UP_ASSIGN = 3,
+  NW_UP_INPUT_NORM = 4,
+  NW_UP_OUTPUT_NORM = 5,
+  NW_DOWN_ASSIGN = 6,
+  NW_DOWN_INPUT_NORM = 7,
+  NW_DOWN_OUTPUT_NORM = 8,
+  NW_NUM_BANKS = 9,
+};
+
+struct NowagMath {
+  bool round_input;
+  bool round_middle;
+  bool preapply_down_norm;
+  bool router_weight_on_input;
+};
+
+struct NowagLayerBanks {
+  const uint32_t* gate_assignments;
+  const bf16_t* gate_input_norm;
+  const bf16_t* gate_output_norm;
+  const uint32_t* up_assignments;
+  const bf16_t* up_input_norm;
+  const bf16_t* up_output_norm;
+  const uint32_t* down_assignments;
+  const bf16_t* down_input_norm;
+  const bf16_t* down_output_norm;
+};
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1242,6 +1514,13 @@ struct CpuMoeExecutor {
   const uint64_t* dn_global_tbl; // nvfp4: [E,H] fp16 row globals
   const uint64_t* gu_bias_tbl;   // mxfp4: [E,2I] bf16 biases
   const uint64_t* dn_bias_tbl;   // mxfp4: [E,H] bf16 biases
+  // [num_layers, NW_NUM_BANKS] raw pointers plus one model-wide codebook.
+  const uint64_t* nowag_bank_table;
+  const bf16_t* nowag_codebook;
+  NowagMath nowag_math;
+  int nowag_gu_words = 0, nowag_dn_words = 0;
+  nowag_gemv_fn nowag_gemv;
+  nowag_scale_fn nowag_scale;
   float swiglu_alpha;
   float swiglu_limit;          // +inf == no clamp
   dot_fn dot;
@@ -1268,6 +1547,9 @@ struct CpuMoeExecutor {
 
   std::vector<bf16_t> g_scratch;   // [max_tokens * top_k * I] intermediate
   std::vector<bf16_t> xq_scratch;  // [max_tokens * H] ds_fp4 fp8-roundtripped input
+  // NoWAG Gate and Up have distinct per-expert input normalizers. Normalize
+  // once per route, then reuse across all output tiles.
+  std::vector<bf16_t> nowag_gate_x_scratch, nowag_up_x_scratch;
   // ds_fp4 activations pre-deinterleaved to fp32 (even/odd K) for the row-major dot.
   std::vector<float> xe_scratch, xo_scratch;  // [max_tokens * H/2]   (input)
   std::vector<float> ge_scratch, go_scratch;  // [max_tokens*top_k*I/2] (intermediate)
@@ -1288,10 +1570,11 @@ struct CpuMoeExecutor {
   std::atomic<uint64_t> submitted{0};
   std::atomic<uint64_t> completed{0};
 
+  std::atomic<int64_t> input_prep_next{0};
   std::atomic<int64_t> p1_next{0};
   std::atomic<int64_t> p2_next{0};
   std::atomic<int64_t> prt_next{0};  // ds_fp4 intermediate fp8 round-trip phase
-  int64_t p1_total = 0, p2_total = 0, prt_total = 0;
+  int64_t input_prep_total = 0, p1_total = 0, p2_total = 0, prt_total = 0;
   int n_iblk = 0, n_hblk = 0;
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
@@ -1347,7 +1630,10 @@ struct CpuMoeExecutor {
                  uintptr_t gate_up_ptr, uintptr_t down_ptr, uintptr_t gate_up_scale_ptr,
                  uintptr_t gate_up_global_ptr, uintptr_t down_scale_ptr,
                  uintptr_t down_global_ptr, uintptr_t gate_up_bias_ptr,
-                 uintptr_t down_bias_ptr, double swiglu_alpha_, double swiglu_limit_,
+                 uintptr_t down_bias_ptr, uintptr_t nowag_bank_table_ptr,
+                 uintptr_t nowag_codebook_ptr, double swiglu_alpha_,
+                 double swiglu_limit_, bool nowag_round_input_,
+                 bool nowag_round_middle_, bool nowag_preapply_down_norm_,
                  std::vector<int> core_ids_)
       : num_threads(num_threads_ > 0 ? num_threads_ : 1),
         num_layers(num_layers_),
@@ -1366,6 +1652,11 @@ struct CpuMoeExecutor {
         dn_global_tbl(reinterpret_cast<const uint64_t*>(down_global_ptr)),
         gu_bias_tbl(reinterpret_cast<const uint64_t*>(gate_up_bias_ptr)),
         dn_bias_tbl(reinterpret_cast<const uint64_t*>(down_bias_ptr)),
+        nowag_bank_table(reinterpret_cast<const uint64_t*>(nowag_bank_table_ptr)),
+        nowag_codebook(reinterpret_cast<const bf16_t*>(nowag_codebook_ptr)),
+        nowag_math{nowag_round_input_, nowag_round_middle_,
+                   nowag_preapply_down_norm_,
+                   apply_router_weight_on_input != 0},
         swiglu_alpha(static_cast<float>(swiglu_alpha_)),
         swiglu_limit(static_cast<float>(swiglu_limit_)),
         core_ids(std::move(core_ids_)) {
@@ -1375,11 +1666,19 @@ struct CpuMoeExecutor {
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
+    nowag_gemv = select_nowag_gemv();
+    nowag_scale = select_nowag_scale();
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
       q4_gu_row_bytes = (H / 32) * 18;  // K = H (gate_up rows)
       q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
+    }
+    if (weight_format == WF_NOWAG) {
+      if (!nowag_bank_table || !nowag_codebook)
+        throw std::runtime_error("NoWAG CPU MoE requires bank pointers and a codebook");
+      nowag_gu_words = nowag_assignment_words(H);
+      nowag_dn_words = nowag_assignment_words(I);
     }
     isa = c.name;
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
@@ -1398,6 +1697,13 @@ struct CpuMoeExecutor {
     // e8m0 (mxfp4 block scale) = 2^(s-127); the GPU GEMV clamps s to [0,254].
     for (int i = 0; i < 256; ++i) e8m0_lut[i] = std::ldexp(1.0f, std::min(i, 254) - 127);
     g_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
+    if (fmt == WF_NOWAG) {
+      const size_t nr = static_cast<size_t>(max_tokens) * top_k * H;
+      nowag_gate_x_scratch.assign(nr, 0);
+      nowag_up_x_scratch.assign(nr, 0);
+      if (nowag_math.round_input)
+        xq_scratch.assign(static_cast<size_t>(max_tokens) * H, 0);
+    }
     // Row-major fp4 (nvfp4/ds_fp4) pre-deinterleaves activations to fp32 even/odd.
     needs_di = (fmt == WF_NVFP4 || fmt == WF_DSFP4);
     if (needs_di) {
@@ -1557,6 +1863,21 @@ struct CpuMoeExecutor {
 
   const char* isa_name() const { return isa; }
 
+  inline NowagLayerBanks nowag_layer_banks(int layer_id) const {
+    const uint64_t* row = nowag_bank_table + (size_t)layer_id * NW_NUM_BANKS;
+    return {
+        reinterpret_cast<const uint32_t*>(row[NW_GATE_ASSIGN]),
+        reinterpret_cast<const bf16_t*>(row[NW_GATE_INPUT_NORM]),
+        reinterpret_cast<const bf16_t*>(row[NW_GATE_OUTPUT_NORM]),
+        reinterpret_cast<const uint32_t*>(row[NW_UP_ASSIGN]),
+        reinterpret_cast<const bf16_t*>(row[NW_UP_INPUT_NORM]),
+        reinterpret_cast<const bf16_t*>(row[NW_UP_OUTPUT_NORM]),
+        reinterpret_cast<const uint32_t*>(row[NW_DOWN_ASSIGN]),
+        reinterpret_cast<const bf16_t*>(row[NW_DOWN_INPUT_NORM]),
+        reinterpret_cast<const bf16_t*>(row[NW_DOWN_OUTPUT_NORM]),
+    };
+  }
+
   void barrier(int& local_sense) {
     local_sense ^= 1;
     if (bar_count.fetch_add(1) + 1 == num_threads) {
@@ -1572,6 +1893,10 @@ struct CpuMoeExecutor {
   }
 
   void do_pass1(const MoeTask* t, int64_t p) {
+    if (fmt == WF_NOWAG) {
+      do_pass1_nowag(t, p);
+      return;
+    }
     if (fmt == WF_MXFP4) {
       do_pass1_mxfp4(t, p);
       return;
@@ -1627,6 +1952,10 @@ struct CpuMoeExecutor {
   }
 
   void do_pass2(const MoeTask* t, int64_t p) {
+    if (fmt == WF_NOWAG) {
+      do_pass2_nowag(t, p);
+      return;
+    }
     if (fmt == WF_MXFP4) {
       do_pass2_mxfp4(t, p);
       return;
@@ -1665,6 +1994,115 @@ struct CpuMoeExecutor {
       }
       y_row[h] = f32_to_bf16(acc);
     }
+  }
+
+  // ------------------------------- NoWAG -----------------------------------
+  // The caller resolves model rules into this compact math strategy. The hot
+  // path depends only on tensor shapes, D6/B12 data, and those strategy fields.
+
+  void prep_nowag_input(const MoeTask* t, int64_t r) {
+    const int k = static_cast<int>(r % top_k);
+    const int tok = static_cast<int>(r / top_k);
+    const int e = t->ids[(size_t)tok * top_k + k];
+    if (e < 0 || e >= num_experts) return;
+    const NowagLayerBanks banks = nowag_layer_banks(t->layer_id);
+    const bf16_t* x = t->x + (size_t)tok * H;
+    if (nowag_math.round_input && !input_prequant)
+      x = xq_scratch.data() + (size_t)tok * H;
+    nowag_scale(
+        x, banks.gate_input_norm + (size_t)e * H,
+        nowag_gate_x_scratch.data() + (size_t)r * H, H);
+    nowag_scale(
+        x, banks.up_input_norm + (size_t)e * H,
+        nowag_up_x_scratch.data() + (size_t)r * H, H);
+  }
+
+  void do_pass1_nowag(const MoeTask* t, int64_t p) {
+    const int64_t ib = p % n_iblk;
+    const int64_t r = p / n_iblk;
+    const int k = static_cast<int>(r % top_k);
+    const int tok = static_cast<int>(r / top_k);
+    const int e = t->ids[(size_t)tok * top_k + k];
+    if (e < 0 || e >= num_experts) return;
+    const NowagLayerBanks banks = nowag_layer_banks(t->layer_id);
+    const int i0 = static_cast<int>(ib) * IBLK;
+    const int i1 = std::min(I, i0 + IBLK);
+    const uint32_t* gate_assign = banks.gate_assignments +
+        (size_t)e * nowag_gu_words * I;
+    const uint32_t* up_assign = banks.up_assignments +
+        (size_t)e * nowag_gu_words * I;
+    const bf16_t* gate_out_norm = banks.gate_output_norm + (size_t)e * I;
+    const bf16_t* up_out_norm = banks.up_output_norm + (size_t)e * I;
+    const bf16_t* down_in_norm = banks.down_input_norm + (size_t)e * I;
+    const bf16_t* gx = nowag_gate_x_scratch.data() + (size_t)r * H;
+    const bf16_t* ux = nowag_up_x_scratch.data() + (size_t)r * H;
+    float gate[IBLK], up[IBLK];
+    nowag_gemv(gate, gate_assign, gx, nowag_codebook,
+               H, I, nowag_gu_words, i0, i1);
+    nowag_gemv(up, up_assign, ux, nowag_codebook,
+               H, I, nowag_gu_words, i0, i1);
+    bf16_t* g_row = g_scratch.data() + (size_t)r * I;
+    const float lim = swiglu_limit;
+    const float route_scale = nowag_math.router_weight_on_input ? t->w[r] : 1.0f;
+    for (int i = i0; i < i1; ++i) {
+      const int j = i - i0;
+      float gv = bf16_to_f32(f32_to_bf16(
+          gate[j] * bf16_to_f32(gate_out_norm[i]) * route_scale));
+      float uv = bf16_to_f32(f32_to_bf16(
+          up[j] * bf16_to_f32(up_out_norm[i]) * route_scale));
+      if (gv > lim) gv = lim;
+      if (uv > lim) uv = lim;
+      else if (uv < -lim) uv = -lim;
+      const bf16_t middle = f32_to_bf16(
+          (gv / (1.0f + std::exp(-gv))) * uv);
+      g_row[i] = nowag_math.preapply_down_norm
+          ? f32_to_bf16(bf16_to_f32(middle) * bf16_to_f32(down_in_norm[i]))
+          : middle;
+    }
+  }
+
+  void prep_nowag_middle(const MoeTask* t, int64_t r) {
+    const int k = static_cast<int>(r % top_k);
+    const int tok = static_cast<int>(r / top_k);
+    const int e = t->ids[(size_t)tok * top_k + k];
+    if (e < 0 || e >= num_experts) return;
+    const NowagLayerBanks banks = nowag_layer_banks(t->layer_id);
+    bf16_t* g = g_scratch.data() + (size_t)r * I;
+    if (nowag_math.round_middle)
+      fp8_roundtrip_bf16(g, g, I);
+    nowag_scale(g, banks.down_input_norm + (size_t)e * I, g, I);
+  }
+
+  void do_pass2_nowag(const MoeTask* t, int64_t p) {
+    const int64_t hb = p % n_hblk;
+    const int tok = static_cast<int>(p / n_hblk);
+    const int h0 = static_cast<int>(hb) * HBLK;
+    const int h1 = std::min(H, h0 + HBLK);
+    const NowagLayerBanks banks = nowag_layer_banks(t->layer_id);
+    float sum[HBLK];
+    for (int h = h0; h < h1; ++h) sum[h - h0] = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+      const int e = t->ids[(size_t)tok * top_k + k];
+      if (e < 0 || e >= num_experts) continue;
+      const uint32_t* down_assign = banks.down_assignments +
+          (size_t)e * nowag_dn_words * H;
+      const bf16_t* down_out_norm = banks.down_output_norm + (size_t)e * H;
+      const size_t r = (size_t)tok * top_k + k;
+      const bf16_t* g = g_scratch.data() + r * I;
+      float part[HBLK];
+      nowag_gemv(part, down_assign, g, nowag_codebook,
+                 I, H, nowag_dn_words, h0, h1);
+      const float route_scale = nowag_math.router_weight_on_input ? 1.0f : t->w[r];
+      for (int h = h0; h < h1; ++h) {
+        // GPU stores each route output in BF16 before the Top-K reduction.
+        const float route = bf16_to_f32(f32_to_bf16(
+            part[h - h0] * bf16_to_f32(down_out_norm[h])));
+        sum[h - h0] += route * route_scale;
+      }
+    }
+    bf16_t* y = t->y + (size_t)tok * H;
+    for (int h = h0; h < h1; ++h)
+      y[h] = f32_to_bf16(sum[h - h0]);
   }
 
   // ----------------------------- mxfp4 (gpt-oss) -----------------------------
@@ -1786,8 +2224,12 @@ struct CpuMoeExecutor {
   // Prepare one intermediate row (token,route) for the down GEMV: ds_fp4 first FP8
   // round-trips it (DSV4 act_quant), then both formats deinterleave to fp32 even/odd
   // (reused across every down output row).
-  void prep_g_row(int64_t r) {
+  void prep_g_row(const MoeTask* t, int64_t r) {
     bf16_t* g = g_scratch.data() + (size_t)r * I;
+    if (fmt == WF_NOWAG) {
+      prep_nowag_middle(t, r);
+      return;
+    }
     if (use_q4a8) {  // q4_0 W4A8: Q8_0-quantize the intermediate row for the down GEMV.
       quant_q8_0(g, I, gi8_scratch.data() + (size_t)r * I,
                  gas_scratch.data() + (size_t)r * (I / 32));
@@ -1832,6 +2274,14 @@ struct CpuMoeExecutor {
 
   void run_task_body(const MoeTask* t) {
     int local_sense = 0;
+    if (input_prep_total) {
+      for (;;) {
+        int64_t r = input_prep_next.fetch_add(1, std::memory_order_relaxed);
+        if (r >= input_prep_total) break;
+        prep_nowag_input(t, r);
+      }
+      barrier(local_sense);
+    }
     for (;;) {
       int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p1_total) break;
@@ -1841,11 +2291,12 @@ struct CpuMoeExecutor {
     // Row-major fp4: prepare the intermediate rows (per token,route) before the down
     // GEMV -- ds_fp4 FP8 round-trips (DSV4 act_quant), both deinterleave to fp32; q4_0
     // W4A8 Q8_0-quantizes. Needs all of pass1 done (a full row spans every iblk).
-    if (needs_di || use_q4a8) {
+    if (needs_di || use_q4a8 ||
+        (fmt == WF_NOWAG && !nowag_math.preapply_down_norm)) {
       for (;;) {
         int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
         if (r >= prt_total) break;
-        prep_g_row(r);
+        prep_g_row(t, r);
       }
       barrier(local_sense);
     }
@@ -1887,9 +2338,21 @@ struct CpuMoeExecutor {
     // this happens at most once, before any capture, while the pool is idle).
     const size_t need = static_cast<size_t>(t->num_tokens) * top_k * I;
     if (need > g_scratch.size()) g_scratch.resize(need);
+    if (fmt == WF_NOWAG) {
+      const size_t nx = static_cast<size_t>(t->num_tokens) * top_k * H;
+      if (nx > nowag_gate_x_scratch.size()) {
+        nowag_gate_x_scratch.resize(nx);
+        nowag_up_x_scratch.resize(nx);
+      }
+    }
+    input_prep_total = fmt == WF_NOWAG
+        ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
     p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
-    prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
+    prt_total = (needs_di || use_q4a8 ||
+                 (fmt == WF_NOWAG && !nowag_math.preapply_down_norm))
+        ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
+    input_prep_next.store(0, std::memory_order_relaxed);
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
@@ -1941,6 +2404,15 @@ struct CpuMoeExecutor {
       for (int tok = 0; tok < t->num_tokens; ++tok)
         quant_q8_0(t->x + (size_t)tok * H, H, xi8_scratch.data() + (size_t)tok * H,
                    xas_scratch.data() + (size_t)tok * (H / 32));
+    }
+    // Apply the rule-selected input round-trip on CPU when the caller did not
+    // already perform it before D2H.
+    if (fmt == WF_NOWAG && nowag_math.round_input && !input_prequant) {
+      const size_t xn = static_cast<size_t>(t->num_tokens) * H;
+      if (xn > xq_scratch.size()) xq_scratch.resize(xn);
+      for (int tok = 0; tok < t->num_tokens; ++tok)
+        fp8_roundtrip_bf16(t->x + (size_t)tok * H,
+                           xq_scratch.data() + (size_t)tok * H, H);
     }
     {
       std::lock_guard<std::mutex> lk(task_mtx);
@@ -2106,7 +2578,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
       .def(py::init<int, int, int, int, int, int, int, int, int, int, uintptr_t, uintptr_t,
                     uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
-                    double, double, std::vector<int>>(),
+                    uintptr_t, uintptr_t, double, double, bool, bool, bool,
+                    std::vector<int>>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
@@ -2114,7 +2587,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("gate_up_ptr"), py::arg("down_ptr"), py::arg("gate_up_scale_ptr"),
            py::arg("gate_up_global_ptr"), py::arg("down_scale_ptr"),
            py::arg("down_global_ptr"), py::arg("gate_up_bias_ptr"),
-           py::arg("down_bias_ptr"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
+           py::arg("down_bias_ptr"), py::arg("nowag_bank_table_ptr"),
+           py::arg("nowag_codebook_ptr"), py::arg("swiglu_alpha"),
+           py::arg("swiglu_limit"), py::arg("nowag_round_input"),
+           py::arg("nowag_round_middle"), py::arg("nowag_preapply_down_norm"),
            py::arg("core_ids"))
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
@@ -2147,4 +2623,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLUOAI); });
+  // ABI capability marker used before model/bank load. A stale extension has no
+  // marker and Python treats it as the pre-NoWAG maximum (WF_Q4_0).
+  m.def("max_weight_format_id", []() { return static_cast<int>(WF_NOWAG); });
 }

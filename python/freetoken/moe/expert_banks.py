@@ -280,8 +280,6 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
 
 
 def _nowag_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
-    if decode_target != "gpu":
-        raise ValueError("NoWAG experts currently support only GPU offload")
     if dummy:
         raise ValueError("NoWAG experts require a completed quantization output")
     if layer_sink is not None:

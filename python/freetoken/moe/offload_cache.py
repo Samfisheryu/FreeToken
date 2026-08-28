@@ -291,8 +291,11 @@ class OffloadMoeCache:
         # stable full-slot scale view per resident group position instead.
         self._joint_gate_up_alpha_slots: torch.Tensor | None = None
         self._joint_down_alpha_slots: torch.Tensor | None = None
-        # One model-wide NoWAG codebook; it is not replicated per cache slot.
+        # One model-wide NoWAG codebook; it is not replicated per cache slot.  Keep
+        # both views alive: GPU offload reads ``codebook`` while cpu/hybrid reads the
+        # original host tensor directly from the persistent CPU worker pool.
         self.codebook: torch.Tensor | None = None
+        self.host_codebook: torch.Tensor | None = None
         # Opt-in decode miss-rate instrumentation. Accumulated on-device (no per-step host
         # sync); read via ``decode_miss_stats``. Graph-safe: the ``+=`` is captured into the
         # decode graph and re-executes with each replay's REAL routing (record_decode_stats
@@ -743,14 +746,15 @@ class OffloadMoeCache:
         )
 
     def set_codebook(self, codebook: torch.Tensor | None) -> None:
-        """Install the model-wide NoWAG codebook on the cache device."""
+        """Install the model-wide NoWAG codebook on the host and cache device."""
         if codebook is None:
             return
         if codebook.ndim != 2:
             raise ValueError(
                 f"NoWAG codebook must be [entries, group_size], got {tuple(codebook.shape)}"
             )
-        self.codebook = codebook.to(self.device).contiguous()
+        self.host_codebook = codebook.contiguous()
+        self.codebook = self.host_codebook.to(self.device).contiguous()
 
     def set_cpu_executor(self, executor) -> None:
         """Attach the CPU MoE executor (``decode_target`` in {"cpu", "hybrid"}).

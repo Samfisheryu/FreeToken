@@ -32,6 +32,7 @@ class NowagModelRule:
     gate_up_input_rounding: str
     down_input_rounding: str
     down_norm_placement: str
+    router_weight_on_input: bool
     requires_swiglu_limit: bool
 
 
@@ -41,6 +42,7 @@ _MODEL_RULES = {
         gate_up_input_rounding=DYNAMIC_E4M3_GROUP128_UE8M0,
         down_input_rounding=DYNAMIC_E4M3_GROUP128_UE8M0,
         down_norm_placement=DOWN_PROLOGUE_NORM,
+        router_weight_on_input=False,
         requires_swiglu_limit=True,
     ),
     "qwen3_5_moe": NowagModelRule(
@@ -48,6 +50,7 @@ _MODEL_RULES = {
         gate_up_input_rounding=NO_ACTIVATION_ROUNDING,
         down_input_rounding=NO_ACTIVATION_ROUNDING,
         down_norm_placement=GATE_UP_EPILOGUE_NORM,
+        router_weight_on_input=False,
         requires_swiglu_limit=False,
     ),
 }

@@ -21,6 +21,7 @@ import os
 import threading
 import time
 import weakref
+from dataclasses import dataclass
 
 import torch
 
@@ -68,23 +69,102 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {
+    "bf16": 0,
+    "nvfp4": 1,
+    "mxfp4_triton": 2,
+    "ds_fp4": 3,
+    "q4_0": 4,
+    "nowag": 5,
+}
+
+_NOWAG_BANK_NAMES = (
+    "gate_assignments",
+    "gate_input_norm",
+    "gate_output_norm",
+    "up_assignments",
+    "up_input_norm",
+    "up_output_norm",
+    "down_assignments",
+    "down_input_norm",
+    "down_output_norm",
+)
 
 
-def compiled_extension_supports(activation: str) -> bool:
-    """Whether the compiled ``_cpu_moe`` extension can serve ``activation``
-    through its generic epilogue. A stale prebuilt .so accepts newer act ids
-    while silently computing the wrong math; the executor hard-errors on that,
-    but the engine's auto offload->hybrid upgrade consults this first so a
-    default boot degrades to offload instead of crashing after weight load."""
+def _nowag_assignment_words(width: int) -> int:
+    return ((width + 5) // 6 * 12 + 31) // 32
+
+
+@dataclass(frozen=True)
+class _NowagCpuMath:
+    round_input: bool = False
+    round_middle: bool = False
+    preapply_down_norm: bool = False
+    router_weight_on_input: bool = False
+
+
+def _resolve_nowag_cpu_math(
+    fmt: str,
+    model_type: str | None,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    swiglu_limit: float | None,
+) -> _NowagCpuMath:
+    if fmt != "nowag":
+        return _NowagCpuMath()
+
+    from freetoken.moe.nowag import (
+        GATE_UP_EPILOGUE_NORM,
+        NO_ACTIVATION_ROUNDING,
+        get_nowag_model_rule,
+    )
+
+    if model_type is None:
+        raise ValueError(
+            "NoWAG CPU MoE requires nowag_model_type "
+            "('qwen3_5_moe' or 'deepseek_v4')"
+        )
+    rule = get_nowag_model_rule(model_type)
+    if activation not in ("silu", "swish"):
+        raise ValueError(
+            f"{rule.model_type} NoWAG CPU MoE requires silu, got {activation!r}"
+        )
+    if apply_router_weight_on_input != rule.router_weight_on_input:
+        placement = "Gate/Up input" if rule.router_weight_on_input else "Down output"
+        raise ValueError(f"{rule.model_type} NoWAG applies router weights at {placement}")
+    if rule.requires_swiglu_limit and swiglu_limit is None:
+        raise ValueError(f"{rule.model_type} NoWAG requires swiglu_limit")
+    return _NowagCpuMath(
+        round_input=rule.gate_up_input_rounding != NO_ACTIVATION_ROUNDING,
+        round_middle=rule.down_input_rounding != NO_ACTIVATION_ROUNDING,
+        preapply_down_norm=rule.down_norm_placement == GATE_UP_EPILOGUE_NORM,
+        router_weight_on_input=rule.router_weight_on_input,
+    )
+
+
+def compiled_extension_supports(
+    activation: str,
+    quant_format: str | None = None,
+) -> bool:
+    """Whether ``_cpu_moe`` supports the requested activation and format.
+
+    The engine consults this before an automatic offload-to-hybrid upgrade so a
+    stale prebuilt extension stays on offload instead of failing after bank load.
+    """
     if activation not in _ACT_IDS:
         return False
-    if _ACT_IDS[activation] < 3:
+    if quant_format is None and _ACT_IDS[activation] < 3:
         return True
     try:
         from freetoken.kernel import _cpu_moe
     except ImportError:
         return False
+    if quant_format is not None:
+        format_id = _WFMT_IDS.get(quant_format)
+        if format_id is None:
+            return False
+        if format_id > getattr(_cpu_moe, "max_weight_format_id", lambda: 4)():
+            return False
     return _ACT_IDS[activation] <= getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
 
 
@@ -142,7 +222,8 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
-    (bf16, nvfp4, mxfp4_triton, ds_fp4 or q4_0 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
+    (bf16, nvfp4, mxfp4_triton, ds_fp4, q4_0 or NoWAG — see
+    ``_WFMT_IDS`` / ``_resolve_banks``)."""
 
     def __init__(
         self,
@@ -156,6 +237,7 @@ class CpuMoeExecutor:
         device: torch.device,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
+        nowag_model_type: str | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
 
@@ -165,6 +247,13 @@ class CpuMoeExecutor:
                 f"--moe-backend cpu/hybrid computes experts on the CPU and supports "
                 f"{sorted(_WFMT_IDS)} formats, but this checkpoint's experts are "
                 f"{fmt!r}; use --moe-backend offload (GPU-side dequant) instead."
+            )
+        max_format = getattr(_cpu_moe, "max_weight_format_id", lambda: 4)()
+        if _WFMT_IDS[fmt] > max_format:
+            raise RuntimeError(
+                f"the compiled _cpu_moe extension predates the {fmt!r} CPU weight "
+                f"format (max format id {max_format}); rebuild it with "
+                "`python setup.py build_ext --inplace` (or reinstall the wheel)."
             )
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
@@ -188,11 +277,25 @@ class CpuMoeExecutor:
         self.quant_format = fmt
         self.device = device
         self.max_tokens = int(max_tokens)
-        self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
+        nowag_math = _resolve_nowag_cpu_math(
+            fmt,
+            nowag_model_type,
+            activation,
+            apply_router_weight_on_input,
+            swiglu_limit,
+        )
+        router_weight_on_input = (
+            nowag_math.router_weight_on_input
+            if fmt == "nowag"
+            else bool(apply_router_weight_on_input)
+        )
+        self.apply_router_weight_on_input = router_weight_on_input
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
-        ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
+        ptrs, (self.H, self.I) = self._resolve_banks(cache, fmt)
+        ptrs.setdefault("nowag_bank_table_ptr", 0)
+        ptrs.setdefault("nowag_codebook_ptr", 0)
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
         # probe): its coordinator needs a core of its own, which the auto thread sizing
@@ -231,10 +334,13 @@ class CpuMoeExecutor:
             inter_size=self.I,
             max_tokens=self.max_tokens,
             activation_id=_ACT_IDS[activation],
-            apply_router_weight_on_input=1 if apply_router_weight_on_input else 0,
+            apply_router_weight_on_input=1 if router_weight_on_input else 0,
             weight_format=_WFMT_IDS[fmt],
             swiglu_alpha=float(swiglu_alpha),
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
+            nowag_round_input=nowag_math.round_input,
+            nowag_round_middle=nowag_math.round_middle,
+            nowag_preapply_down_norm=nowag_math.preapply_down_norm,
             core_ids=core_ids,
             **ptrs,
         )
@@ -295,18 +401,15 @@ class CpuMoeExecutor:
             )
             self._watchdog.start()
 
-        # ds_fp4: the reference FP8 activation round-trip is a scalar per-element chain
-        # that the C++ side runs single-threaded on the CUDA host-callback thread --
-        # straight on the decode critical path (~0.3ms/layer at H=4096, every worker and
-        # the GPU waiting on it). When a GPU is present we run the numerically identical
-        # round-trip as a captured GPU kernel BEFORE the D2H (see decode_submit) and tell
-        # the C++ side to skip its own. Measured on DeepSeek-V4-Flash bs=1 decode:
-        # 12.85 -> 15.65 tok/s, output bit-identical (tests/moe/test_dsfp4_prequant.py).
-        self._gpu_prequant = fmt == "ds_fp4" and device.type == "cuda"
+        # Move a required input FP8 round-trip to the captured GPU path before D2H;
+        # the C++ executor then skips its serial host-side equivalent.
+        self._gpu_prequant = (
+            fmt == "ds_fp4" or (fmt == "nowag" and nowag_math.round_input)
+        ) and device.type == "cuda"
         if self._gpu_prequant:
             self._ext.set_input_prequant(True)
             logger.info_rank0(
-                "ds_fp4: input FP8 round-trip moved to the GPU "
+                f"{fmt}: input FP8 round-trip moved to the GPU "
                 "(bit-identical grid; the CPU-side scalar round-trip is skipped)"
             )
 
@@ -332,7 +435,7 @@ class CpuMoeExecutor:
         self._banks.extend(layers)
         return table
 
-    def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
+    def _resolve_banks(self, cache, fmt: str) -> tuple[dict, tuple[int, int]]:
         """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.
 
         ``banks[name]`` is a list of ``num_layers`` ``[num_experts, ...]`` tensors
@@ -341,6 +444,10 @@ class CpuMoeExecutor:
         is actually a per-layer table's address (see ``_make_table``), not a single
         bank's -- the C++ ctor resolves ``tbl[layer_id]`` per task.
         """
+        banks = cache.bank_sources
+        if fmt == "nowag":
+            return self._resolve_nowag_banks(banks, cache.host_codebook)
+
         if fmt == "bf16":
             gate_up = banks["gate_up"]
             down = banks["down"]
@@ -396,6 +503,73 @@ class CpuMoeExecutor:
             down_global_ptr=self._make_table(dng).data_ptr(),
             gate_up_bias_ptr=0,
             down_bias_ptr=0,
+        )
+        return ptrs, (H, I)
+
+    def _resolve_nowag_banks(
+        self,
+        banks: dict,
+        codebook: torch.Tensor | None,
+    ) -> tuple[dict, tuple[int, int]]:
+        """Resolve the D6/B12 word-major NoWAG banks without expanding weights.
+
+        A compact ``[layer, bank]`` pointer descriptor is the only extra metadata;
+        the C++ kernel reads the nine original pinned banks and the shared BF16
+        codebook in place.
+        """
+        if codebook is None:
+            raise RuntimeError("NoWAG CPU MoE cache has no host codebook")
+        if codebook.dtype != torch.bfloat16 or tuple(codebook.shape) != (4096, 6):
+            raise ValueError(
+                "NoWAG CPU MoE requires a shared BF16 [4096, 6] D6/B12 codebook"
+            )
+        gate_in = banks["gate_input_norm"]
+        gate_out = banks["gate_output_norm"]
+        H = int(gate_in[0].shape[1])
+        I = int(gate_out[0].shape[1])
+
+        expected = {
+            "gate_assignments": (self.num_experts, _nowag_assignment_words(H), I),
+            "gate_input_norm": (self.num_experts, H),
+            "gate_output_norm": (self.num_experts, I),
+            "up_assignments": (self.num_experts, _nowag_assignment_words(H), I),
+            "up_input_norm": (self.num_experts, H),
+            "up_output_norm": (self.num_experts, I),
+            "down_assignments": (self.num_experts, _nowag_assignment_words(I), H),
+            "down_input_norm": (self.num_experts, I),
+            "down_output_norm": (self.num_experts, H),
+        }
+        for name in _NOWAG_BANK_NAMES:
+            want_dtype = torch.int32 if name.endswith("assignments") else torch.bfloat16
+            for layer_id, tensor in enumerate(banks[name]):
+                if tensor.dtype != want_dtype or tuple(tensor.shape) != expected[name]:
+                    raise ValueError(
+                        f"NoWAG bank {name!r} layer {layer_id} must be "
+                        f"{expected[name]} {want_dtype}, got {tuple(tensor.shape)} "
+                        f"{tensor.dtype}"
+                    )
+        descriptor = torch.tensor(
+            [
+                [banks[name][layer_id].data_ptr() for name in _NOWAG_BANK_NAMES]
+                for layer_id in range(self.num_layers)
+            ],
+            dtype=torch.int64,
+        )
+        self._banks.append(descriptor)
+        for name in _NOWAG_BANK_NAMES:
+            self._banks.extend(banks[name])
+        self._banks.append(codebook)
+        ptrs = dict(
+            gate_up_ptr=0,
+            down_ptr=0,
+            gate_up_scale_ptr=0,
+            gate_up_global_ptr=0,
+            down_scale_ptr=0,
+            down_global_ptr=0,
+            gate_up_bias_ptr=0,
+            down_bias_ptr=0,
+            nowag_bank_table_ptr=descriptor.data_ptr(),
+            nowag_codebook_ptr=codebook.data_ptr(),
         )
         return ptrs, (H, I)
 

@@ -63,9 +63,11 @@ logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
 # else is offload-only here. (The kernel also does q4_0, but this bench has no q4_0 banks.)
-_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4"})
+_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "nowag"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
-_BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
+_BUILDABLE_FORMATS = frozenset(
+    {"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4", "nowag"}
+)
 # Friendlier CLI/display aliases for the internal quant_format strings.
 _FORMAT_ALIASES = {"fp8": "fp8_block", "mxfp4": "mxfp4_triton"}
 _FORMAT_DISPLAY = {"fp8_block": "fp8", "mxfp4_triton": "mxfp4"}
@@ -108,19 +110,33 @@ class Workload:
     activation: str = "silu"
     swiglu_alpha: float = 1.702
     swiglu_limit: float | None = None
+    nowag_model_type: str | None = None
+
+
+@dataclass(frozen=True)
+class _CpuMoeBanks:
+    sources: dict[str, torch.Tensor]
+    codebook: torch.Tensor | None = None
 
 
 # Preset workloads. Dims from the model configs / benchmarks/bench_offload_cache_copy.py.
 # E/top_k/H/I are what drive the per-expert byte size and thus the bandwidths.
 WORKLOADS: dict[str, Workload] = {
-    "qwen3.6-moe": Workload("qwen3.6-moe", 2048, 512, 256, 8, ("bf16", "nvfp4", "fp8_block")),
+    "qwen3.6-moe": Workload(
+        "qwen3.6-moe", 2048, 512, 256, 8,
+        ("bf16", "nvfp4", "fp8_block", "nowag"),
+        nowag_model_type="qwen3_5_moe",
+    ),
     "qwen3-30b": Workload("qwen3-30b", 2048, 768, 128, 8, ("bf16",)),
     "gemma4-26b": Workload("gemma4-26b", 2816, 704, 128, 8, ("bf16",), activation="gelu_tanh"),
     "gpt-oss-120b": Workload("gpt-oss-120b", 2880, 2880, 128, 4, ("mxfp4_triton",),
                              activation="gpt_oss_swiglu", swiglu_limit=7.0),
     "gpt-oss-20b": Workload("gpt-oss-20b", 2880, 2880, 32, 4, ("mxfp4_triton",),
                             activation="gpt_oss_swiglu", swiglu_limit=7.0),
-    "dsv4": Workload("dsv4", 4096, 2048, 256, 6, ("ds_fp4",), swiglu_limit=7.0),
+    "dsv4": Workload(
+        "dsv4", 4096, 2048, 256, 6, ("ds_fp4", "nowag"),
+        swiglu_limit=7.0, nowag_model_type="deepseek_v4",
+    ),
     "glm4.7-nvfp4": Workload("glm4.7-nvfp4", 5120, 1536, 160, 8, ("nvfp4",)),
     "minimax-m2.5": Workload("minimax-m2.5", 3072, 1536, 256, 8, ("nvfp4",)),
 }
@@ -139,6 +155,10 @@ DTYPE_WORKLOADS: dict[str, Workload] = {
     "mxfp4_triton": Workload("dtype:mxfp4", 2880, 2880, 128, 4, ("mxfp4_triton",),
                              activation="gpt_oss_swiglu", swiglu_limit=7.0),
     "ds_fp4": Workload("dtype:ds_fp4", 4096, 2048, 128, 6, ("ds_fp4",), swiglu_limit=7.0),
+    "nowag": Workload(
+        "dtype:nowag", 2048, 512, 128, 8, ("nowag",),
+        nowag_model_type="qwen3_5_moe",
+    ),
 }
 
 
@@ -278,6 +298,10 @@ def measure_pcie_bw(device: torch.device, nbytes: int = 256 << 20, iters: int = 
 # ============================== bank geometry ==============================
 
 
+def _nowag_assignment_words(width: int) -> int:
+    return ((width + 5) // 6 * 12 + 31) // 32
+
+
 def _offload_bank_specs(fmt: str, H: int, I: int) -> dict[str, tuple[int, torch.dtype]]:
     """Per-bank (elems_per_expert, dtype) for the flat offload host banks (the gather)."""
     u8, bf16, f16, f8 = torch.uint8, torch.bfloat16, torch.float16, torch.float8_e4m3fn
@@ -305,6 +329,18 @@ def _offload_bank_specs(fmt: str, H: int, I: int) -> dict[str, tuple[int, torch.
             "gate_up_packed": (2 * I * (H // 2), u8), "gate_up_scale": (2 * I * (H // 32), u8),
             "down_packed": (H * (I // 2), u8), "down_scale": (H * (I // 32), u8),
         }
+    if fmt == "nowag":
+        return {
+            "gate_assignments": (_nowag_assignment_words(H) * I, torch.int32),
+            "gate_input_norm": (H, bf16),
+            "gate_output_norm": (I, bf16),
+            "up_assignments": (_nowag_assignment_words(H) * I, torch.int32),
+            "up_input_norm": (H, bf16),
+            "up_output_norm": (I, bf16),
+            "down_assignments": (_nowag_assignment_words(I) * H, torch.int32),
+            "down_input_norm": (I, bf16),
+            "down_output_norm": (H, bf16),
+        }
     raise NotImplementedError(fmt)
 
 
@@ -320,7 +356,7 @@ def _synth_experts(E: int, expert_bytes: int) -> int:
     return min(E, max(1, _SYNTH_BANK_BUDGET // max(1, expert_bytes)))
 
 
-def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
+def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> _CpuMoeBanks:
     """3D pinned banks in the exact layout ``CpuMoeExecutor`` expects for ``fmt``.
 
     Scale banks that decode through an e8m0 exponent (mxfp4/ds_fp4) are set to a unit
@@ -335,7 +371,7 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         gate_up, down = pin(E, 2 * I, H, dtype=torch.bfloat16), pin(E, H, I, dtype=torch.bfloat16)
         gate_up.fill_(0.02)  # uninitialized bf16 can be denormal -> x86 FP slowdown
         down.fill_(0.02)
-        return {"gate_up": gate_up, "down": down}
+        return _CpuMoeBanks({"gate_up": gate_up, "down": down})
     if fmt == "nvfp4":
         b = {
             "gate_up_packed": pin(E, 2 * I, H // 2, dtype=torch.uint8),
@@ -347,7 +383,7 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         }
         b["gate_up_global"].fill_(1.0)
         b["down_global"].fill_(1.0)  # e4m3 scales decode to normal float32; globals are fp16
-        return b
+        return _CpuMoeBanks(b)
     if fmt == "mxfp4_triton":  # transposed split-K layout
         b = {
             "gate_up_blocks": pin(E, H // 2, 2 * I, dtype=torch.uint8),
@@ -361,7 +397,7 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         b["down_scales"].fill_(127)
         b["gate_up_bias"].zero_()
         b["down_bias"].zero_()
-        return b
+        return _CpuMoeBanks(b)
     if fmt == "ds_fp4":
         b = {
             "gate_up_packed": pin(E, 2 * I, H // 2, dtype=torch.uint8),
@@ -371,7 +407,40 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         }
         b["gate_up_scale"].fill_(127)  # e8m0 unit exponent
         b["down_scale"].fill_(127)
-        return b
+        return _CpuMoeBanks(b)
+    if fmt == "nowag":
+        b = {
+            "gate_assignments": pin(
+                E, _nowag_assignment_words(H), I, dtype=torch.int32
+            ),
+            "gate_input_norm": pin(E, H, dtype=torch.bfloat16),
+            "gate_output_norm": pin(E, I, dtype=torch.bfloat16),
+            "up_assignments": pin(
+                E, _nowag_assignment_words(H), I, dtype=torch.int32
+            ),
+            "up_input_norm": pin(E, H, dtype=torch.bfloat16),
+            "up_output_norm": pin(E, I, dtype=torch.bfloat16),
+            "down_assignments": pin(
+                E, _nowag_assignment_words(I), H, dtype=torch.int32
+            ),
+            "down_input_norm": pin(E, I, dtype=torch.bfloat16),
+            "down_output_norm": pin(E, H, dtype=torch.bfloat16),
+        }
+        assignment_rng = torch.Generator(device="cpu")
+        assignment_rng.manual_seed(0x4E6F574147)
+        for name, tensor in b.items():
+            if name.endswith("assignments"):
+                # Deterministic full-width word bits spread decoded ids over the
+                # whole 4096-entry codebook. All-zero ids turn the benchmark into
+                # a single-cache-line lookup and materially overstate throughput.
+                tensor.random_(
+                    -(1 << 31), 1 << 31, generator=assignment_rng
+                )
+            else:
+                tensor.fill_(1.0)
+        codebook = alloc_pinned_tensor(4096, 6, dtype=torch.bfloat16)
+        codebook.fill_(0.02)
+        return _CpuMoeBanks(b, codebook)
     raise NotImplementedError(fmt)
 
 
@@ -442,21 +511,29 @@ def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: 
     }
 
 
-def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: int, E: int):
+def _build_cpu_moe_executor(
+    fmt: str,
+    wl: Workload,
+    banks: _CpuMoeBanks,
+    num_threads: int,
+    E: int,
+):
     """A production ``CpuMoeExecutor`` over synthetic banks (via a minimal cache stand-in)."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     cache = SimpleNamespace(
         quant_format=fmt,
-        bank_sources={name: [t] for name, t in banks.items()},
+        bank_sources={name: [tensor] for name, tensor in banks.sources.items()},
         num_layers=1, num_experts=E,
         decode_target="cpu", cpu_executor=None,
+        host_codebook=banks.codebook,
     )
     return CpuMoeExecutor(
         cache, top_k=wl.top_k, activation=wl.activation,
         apply_router_weight_on_input=False, num_threads=num_threads, max_tokens=1,
         device=torch.device("cuda"), swiglu_alpha=wl.swiglu_alpha,
         swiglu_limit=wl.swiglu_limit,
+        nowag_model_type=wl.nowag_model_type,
     )
 
 
