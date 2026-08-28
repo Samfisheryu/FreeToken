@@ -99,14 +99,15 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
 
 def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
     """Wait out a preceding ``_terminate_backend_workers`` and SIGKILL whatever is still
-    standing. Only the shell path needs this: it owns the process lifetime end to end (no
-    outer signal takes the process down for it), and a worker that ignored SIGTERM would keep
-    the GPU and the IPC sockets after the shell has already returned to the user's terminal."""
+    standing. The API parent owns these multiprocessing children and must reap them before it
+    returns; otherwise an external supervisor can observe the frontend exit while an orphaned
+    scheduler still owns its CUDA context."""
     for p in processes or []:
         try:
             p.join(timeout=timeout)
             if p.is_alive():
                 p.kill()
+                p.join()
         except Exception:  # noqa: BLE001 -- already-gone / unqueryable handle: nothing to do
             continue
 
@@ -1037,4 +1038,12 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    try:
+        uvicorn.run(app, host=host, port=port)
+    finally:
+        # Lifespan shutdown initiates worker termination but deliberately does not block the
+        # event loop. Reap here, after uvicorn has stopped, so the API process cannot return to
+        # its launcher while a scheduler still owns CUDA memory.
+        _SHUTTING_DOWN.set()
+        _terminate_backend_workers(_GLOBAL_STATE.backend_processes)
+        _reap_backend_workers(_GLOBAL_STATE.backend_processes)

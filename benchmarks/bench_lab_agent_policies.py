@@ -960,23 +960,89 @@ class PublicServer:
     def _wait_for_completion_ready(self, deadline: float) -> None:
         self._minimal_completion(retry_still_loading=True, deadline=deadline)
 
+    @staticmethod
+    def _live_process_group_members(process_group: int) -> list[int]:
+        """Return non-zombie Linux processes that still belong to ``process_group``."""
+        members: list[int] = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                # /proc/PID/stat starts with ``pid (comm)``; comm may contain spaces or
+                # parentheses, so split after its final ``) ``. The next fields are state,
+                # parent pid and process-group id.
+                fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
+                state = fields[0]
+                member_group = int(fields[2])
+            except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError):
+                continue
+            if member_group == process_group and state != "Z":
+                members.append(int(entry.name))
+        return members
+
+    @classmethod
+    def _wait_for_process_group_exit(
+        cls,
+        process_group: int,
+        timeout: float,
+    ) -> list[int]:
+        """Return live members left at the deadline; zombies count as drained."""
+        deadline = time.monotonic() + timeout
+        while True:
+            members = cls._live_process_group_members(process_group)
+            if not members:
+                return []
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return members
+            time.sleep(min(0.05, remaining))
+
+    @staticmethod
+    def _signal_process_group(process_group: int, sig: signal.Signals) -> None:
+        try:
+            os.killpg(process_group, sig)
+        except ProcessLookupError:
+            pass
+
     def stop(self) -> None:
         if self.process is None:
             return
+        process = self.process
+        process_group = process.pid
+
+        # Signal only the API parent first. Its uvicorn shutdown owns orderly backend
+        # termination and joins every multiprocessing child before the parent returns.
+        if process.poll() is None:
+            process.terminate()
         try:
-            os.killpg(self.process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        if self.process.poll() is not None:
-            return
-        try:
-            self.process.wait(timeout=20)
+            process.wait(timeout=30)
         except subprocess.TimeoutExpired:
+            # The parent did not complete its owned shutdown. Fall back to the exact session
+            # process group so no descendant can outlive this benchmark server.
+            self._signal_process_group(process_group, signal.SIGTERM)
             try:
-                os.killpg(self.process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            self.process.wait(timeout=10)
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._signal_process_group(process_group, signal.SIGKILL)
+                process.wait(timeout=10)
+
+        live_members = self._wait_for_process_group_exit(
+            process_group,
+            timeout=5,
+        )
+        if not live_members:
+            return
+        # A returned parent with live group members is an abnormal incomplete shutdown.
+        self._signal_process_group(process_group, signal.SIGKILL)
+        live_members = self._wait_for_process_group_exit(
+            process_group,
+            timeout=10,
+        )
+        if live_members:
+            raise RuntimeError(
+                f"server process group {process_group} still has live members after "
+                f"SIGKILL: {live_members}"
+            )
 
     def log_tail(self) -> str:
         self.log.flush()

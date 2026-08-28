@@ -84,6 +84,10 @@ class TritonMetadata(BaseAttnMetadata):
 
 
 class TritonAttentionBackend(BaseAttnBackend):
+    @property
+    def supports_layer_range_graphs(self) -> bool:
+        return True
+
     def __init__(self, config: ModelConfig):
         self.config = config
         self.kvcache = get_global_ctx().kv_cache
@@ -308,6 +312,49 @@ class TritonAttentionBackend(BaseAttnBackend):
             max_q_len=max(seqlens_q),
             swa_indices=swa_indices,
         )
+
+    def prepare_metadata_view(self, source: Batch, target: Batch) -> bool:
+        """View the decode prefix of a decode-first mixed batch without allocation."""
+        if not target.is_decode_only:
+            return False
+        metadata = source.attn_metadata
+        if not isinstance(metadata, TritonMetadata):
+            raise TypeError("layered Triton view requires Triton source metadata")
+        decode_size = target.decode_size
+        decode_rows = sum(req.extend_len for req in target.reqs)
+        if decode_rows != decode_size:
+            raise RuntimeError("layered decode requires one query row per request")
+        decode_kv_rows = sum(req.device_len for req in target.reqs)
+        target.attn_metadata = TritonMetadata(
+            cu_seqlens_q_gpu=metadata.cu_seqlens_q_gpu[: decode_size + 1],
+            indptr=metadata.indptr[: decode_size + 1],
+            indices=metadata.indices[:decode_kv_rows],
+            q_to_req=metadata.q_to_req[:decode_rows],
+            q_positions=metadata.q_positions[:decode_rows],
+            is_decode=True,
+            prefix_lens=metadata.prefix_lens[:decode_size],
+            max_q_len=1,
+            swa_indices=(
+                metadata.swa_indices[:decode_kv_rows]
+                if metadata.swa_indices is not None
+                else None
+            ),
+        )
+        return True
+
+    def capture_stable_decode_state(self, batch: Batch) -> object | None:
+        metadata = batch.attn_metadata
+        if not isinstance(metadata, TritonMetadata) or not metadata.capture_staged:
+            return None
+        batch.positions = metadata.q_positions
+        return metadata
+
+    def restore_stable_decode_state(self, batch: Batch, state: object) -> bool:
+        if not isinstance(state, TritonMetadata) or not state.capture_staged:
+            return False
+        batch.attn_metadata = state
+        batch.positions = state.q_positions
+        return True
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."

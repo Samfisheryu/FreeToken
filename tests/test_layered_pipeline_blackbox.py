@@ -24,9 +24,11 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ROOT = PROJECT_ROOT / "python"
 HOST = "127.0.0.1"
-SERVED_MODEL = "scaled-public-qwen3-moe"
+SERVED_MODEL = "lab-agent-qwen3-moe"
 NUM_LAYERS = 8
 NUM_EXPERTS = 8
+QWEN36_MODEL_PATH = Path("/data1/lmcache_kv/models/Qwen3.6-35B-A3B")
+DSV4_MODEL_PATH = Path("/data1/lmcache_kv/models/DeepSeek-V4-Flash-0731")
 
 for import_root in (str(PYTHON_ROOT), str(PROJECT_ROOT)):
     if import_root not in sys.path:
@@ -252,6 +254,56 @@ def _service_command(
     if collect_moe_stats:
         command.append("--moe-collect-stats")
     return command
+
+
+def _real_model_service_command(
+    model_path: Path,
+    *,
+    port: int,
+    attention_backend: str,
+    cuda_graph_max_bs: int,
+    num_tokens: int,
+) -> list[str]:
+    return [
+        str(_ft_executable()),
+        "serve",
+        "--model-path",
+        str(model_path),
+        "--served-model-name",
+        SERVED_MODEL,
+        "--host",
+        HOST,
+        "--port",
+        str(port),
+        "--dtype",
+        "bfloat16",
+        "--max-running-requests",
+        "8",
+        "--max-seq-len-override",
+        "4096",
+        "--num-tokens",
+        str(num_tokens),
+        "--max-prefill-length",
+        "32",
+        "--attention-backend",
+        attention_backend,
+        "--moe-backend",
+        "offload",
+        "--moe-cache-size",
+        "512",
+        "--cuda-graph-max-bs",
+        str(cuda_graph_max_bs),
+        "--cache-type",
+        "radix",
+        "--enable-cache-report",
+        "--batching-policy",
+        "layered-pipeline",
+        "--prefill-layer-group-size",
+        "1",
+        "--prefill-wave-max-chunks",
+        "8",
+        "--moe-collect-stats",
+    ]
 
 
 def _completion_payload(
@@ -566,11 +618,38 @@ def _wait_for_pipeline_requests(
     )
 
 
-def _effective_group_size(group_size: int, cache_size: int) -> int:
+def _wait_for_public_server_pipeline_requests(
+    server: Any,
+    *,
+    offset: int,
+    expected_requests: int,
+    timeout: float = 300.0,
+) -> list[dict[str, int]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waves = _records_from_text(server.log_tail())[offset:]
+        observed_requests = sum(wave["reqs"] for wave in waves)
+        if observed_requests >= expected_requests:
+            assert observed_requests == expected_requests
+            return waves
+        time.sleep(0.1)
+    raise AssertionError(
+        f"pipeline accounted for fewer than {expected_requests} requests:\n"
+        f"{server.log_tail()}"
+    )
+
+
+def _effective_group_size(
+    group_size: int,
+    cache_size: int,
+    *,
+    num_layers: int = NUM_LAYERS,
+    num_experts: int = NUM_EXPERTS,
+) -> int:
     effective = min(
         group_size,
-        NUM_LAYERS,
-        (cache_size // NUM_EXPERTS) - 1,
+        num_layers,
+        (cache_size // num_experts) - 1,
     )
     assert effective >= 1
     return effective
@@ -582,6 +661,8 @@ def _assert_pipeline_wave(
     group_size: int,
     cache_size: int,
     expected_reqs: int | None = None,
+    num_layers: int = NUM_LAYERS,
+    num_experts: int = NUM_EXPERTS,
 ) -> None:
     assert set(wave) == PIPELINE_WAVE_FIELDS
     assert all(
@@ -591,13 +672,18 @@ def _assert_pipeline_wave(
     assert wave["reqs"] >= 1
     if expected_reqs is not None:
         assert wave["reqs"] == expected_reqs
-    effective_group_size = _effective_group_size(group_size, cache_size)
-    groups = math.ceil(NUM_LAYERS / effective_group_size)
+    effective_group_size = _effective_group_size(
+        group_size,
+        cache_size,
+        num_layers=num_layers,
+        num_experts=num_experts,
+    )
+    groups = math.ceil(num_layers / effective_group_size)
     assert wave["groups"] == groups
     assert wave["group_forwards"] == groups
     assert wave["iterations"] == groups
     assert 0 <= wave["decode_iterations"] <= groups
-    assert wave["prefill_layer_prepares"] == NUM_LAYERS
+    assert wave["prefill_layer_prepares"] == num_layers
 
 
 def _assert_pipeline_structure(
@@ -745,6 +831,40 @@ def _run_decode_then_prefill_batch(
         for event in events
     ), "decode emitted no SSE text while prefill was active"
     return decode_result, prefill_responses
+
+
+def _run_decode_then_stream_prefill_batch(
+    base_url: str,
+    *,
+    decode_payload: dict[str, Any],
+    prefill_payloads: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    first_text = threading.Event()
+    decode_result: dict[str, Any] = {}
+    decode_thread = threading.Thread(
+        target=_stream_completion,
+        args=(base_url, decode_payload, first_text, decode_result),
+        daemon=True,
+    )
+    decode_thread.start()
+    assert first_text.wait(timeout=900.0), "decode emitted no nonempty SSE"
+    assert "error" not in decode_result, decode_result.get("error")
+    assert decode_thread.is_alive(), "decode ended before prefill admission"
+
+    prefill_started = time.monotonic()
+    prefill_results = _run_stream_batch(base_url, prefill_payloads)
+    prefill_completed = time.monotonic()
+
+    decode_thread.join(timeout=1_800.0)
+    assert not decode_thread.is_alive(), "decode did not finish"
+    assert "error" not in decode_result, decode_result.get("error")
+    events = decode_result.get("events")
+    assert isinstance(events, list) and events
+    assert any(
+        prefill_started <= event["at_seconds"] <= prefill_completed
+        for event in events
+    ), "decode emitted no SSE text while prefill was active"
+    return decode_result, prefill_results
 
 
 def _has_pair(argv: list[str], flag: str, value: str) -> bool:
@@ -1536,6 +1656,210 @@ def test_graph0_and_graph8_preserve_public_function_and_wave_structure(
     for graph_size in (0, 8):
         assert observations[graph_size]["structure"]["reqs"] == 13
         assert observations[graph_size]["wave_count"] >= 3
+
+
+def _exercise_real_model_backend(
+    model_path: Path,
+    prompts: dict[str, str],
+    *,
+    attention_backend: str,
+    cuda_graph_max_bs: int,
+    num_layers: int,
+    num_experts: int,
+    num_tokens: int,
+) -> dict[str, Any]:
+    from benchmarks.bench_lab_agent_policies import PublicServer
+    from benchmarks.bench_scaled_expert_contention import (
+        wait_for_snapshot_count,
+    )
+
+    port = _free_port()
+    base_url = f"http://{HOST}:{port}"
+    server = PublicServer(
+        command=_real_model_service_command(
+            model_path,
+            port=port,
+            attention_backend=attention_backend,
+            cuda_graph_max_bs=cuda_graph_max_bs,
+            num_tokens=num_tokens,
+        ),
+        gpu=str(torch.cuda.current_device()),
+        base_url=base_url,
+        timeout=3_600.0,
+        readiness_prompt_text=prompts["readiness"],
+    )
+    try:
+        server.start()
+    except Exception as exc:
+        raise AssertionError(
+            "real-model service failed during public startup: "
+            f"{type(exc).__name__}: {exc}\n{server.log_tail()}"
+        ) from exc
+    try:
+        wait_for_snapshot_count(server, minimum=1, timeout=600.0)
+        readiness_cursor = len(_records_from_text(server.log_tail()))
+        assert readiness_cursor >= 1
+        server.mark_measurement_start()
+        wave_offset = len(_records_from_text(server.log_tail()))
+        assert wave_offset >= readiness_cursor
+
+        driver_result, prefill_results = (
+            _run_decode_then_stream_prefill_batch(
+                base_url,
+                decode_payload=_completion_payload(
+                    prompts["driver"],
+                    max_tokens=16,
+                    stream=True,
+                    ignore_eos=True,
+                ),
+                prefill_payloads=[
+                    _completion_payload(
+                        prompts[f"prefill_{request_index}"],
+                        max_tokens=1,
+                        stream=True,
+                        ignore_eos=True,
+                    )
+                    for request_index in range(2)
+                ],
+            )
+        )
+        driver_output = _assert_stream_completion(
+            driver_result,
+            prompt_tokens=32,
+            completion_tokens=16,
+        )
+        prefill_outputs = [
+            _assert_stream_completion(
+                result,
+                prompt_tokens=64,
+                completion_tokens=1,
+            )
+            for result in prefill_results
+        ]
+        results = [driver_result, *prefill_results]
+        assert sum(_usage(result)["prompt_tokens"] for result in results) == 160
+        assert sum(
+            _usage(result)["completion_tokens"] for result in results
+        ) == 18
+
+        waves = _wait_for_public_server_pipeline_requests(
+            server,
+            offset=wave_offset,
+            expected_requests=3,
+            timeout=600.0,
+        )
+        assert len(waves) == 2
+        first_wave, second_wave = waves
+        _assert_pipeline_wave(
+            first_wave,
+            group_size=1,
+            cache_size=512,
+            expected_reqs=1,
+            num_layers=num_layers,
+            num_experts=num_experts,
+        )
+        assert first_wave["decode_iterations"] == 0
+        _assert_pipeline_wave(
+            second_wave,
+            group_size=1,
+            cache_size=512,
+            expected_reqs=2,
+            num_layers=num_layers,
+            num_experts=num_experts,
+        )
+        assert 0 < second_wave["decode_iterations"] <= num_layers
+        return {
+            "outputs": [driver_output, *prefill_outputs],
+            "usages": [_usage(result) for result in results],
+            "waves": waves,
+        }
+    except AssertionError as exc:
+        exc.add_note(server.log_tail())
+        raise
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize(
+    (
+        "model_path",
+        "attention_backend",
+        "num_layers",
+        "num_experts",
+        "num_tokens",
+        "requires_flashinfer",
+    ),
+    [
+        pytest.param(
+            QWEN36_MODEL_PATH,
+            "triton",
+            40,
+            256,
+            4_096,
+            False,
+            id="qwen36-triton",
+        ),
+        pytest.param(
+            QWEN36_MODEL_PATH,
+            "fi",
+            40,
+            256,
+            4_096,
+            True,
+            id="qwen36-flashinfer",
+        ),
+        pytest.param(
+            DSV4_MODEL_PATH,
+            "dsv4_sparse",
+            43,
+            256,
+            8_192,
+            False,
+            id="dsv4-sparse",
+        ),
+    ],
+)
+def test_real_moe_backends_support_layered_pipeline_graph0_and_graph8(
+    model_path: Path,
+    attention_backend: str,
+    num_layers: int,
+    num_experts: int,
+    num_tokens: int,
+    requires_flashinfer: bool,
+) -> None:
+    _require_cuda_e2e()
+    if not model_path.exists():
+        pytest.skip(f"public checkpoint is unavailable: {model_path}")
+    if requires_flashinfer and importlib.util.find_spec("flashinfer") is None:
+        pytest.skip("flashinfer is unavailable")
+
+    materialize = _public_prompt_materializer(model_path)
+    prompts = {
+        "readiness": materialize(
+            8, 500_000, "real-model-readiness", 3
+        ),
+        "driver": materialize(32, 500_001, "real-model-driver", 0),
+        "prefill_0": materialize(
+            64, 500_002, "real-model-prefill-0", 1
+        ),
+        "prefill_1": materialize(
+            64, 500_003, "real-model-prefill-1", 2
+        ),
+    }
+    observations = {
+        graph_size: _exercise_real_model_backend(
+            model_path,
+            prompts,
+            attention_backend=attention_backend,
+            cuda_graph_max_bs=graph_size,
+            num_layers=num_layers,
+            num_experts=num_experts,
+            num_tokens=num_tokens,
+        )
+        for graph_size in (0, 8)
+    }
+    assert observations[8]["usages"] == observations[0]["usages"]
+    assert observations[8]["outputs"] == observations[0]["outputs"]
 
 
 def test_layered_pipeline_shared_pool_bounds_three_driver_decode_misses(

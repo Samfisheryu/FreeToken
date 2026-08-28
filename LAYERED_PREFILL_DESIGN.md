@@ -16,14 +16,15 @@ expert offload 场景扩展。
 4. prefill wave 的中间状态停在当前 group 之后，下一次 iteration 再进入下一个
    group。
 
-因此，同一个 iteration 内，同一个 active group 必须只执行一次。active group
-收到的是一个 ragged batch：decode rows 与 wave 中所有 prefill rows 拼在一起。
-不能因为 prompt 在 bookkeeping 上被表示成多个 chunk，就对同一个 group 重复做
-多个 forward。
+因此，同一个 iteration 内，scheduler 必须只进入 active group 一次，prefill wave
+也只推进一次。能共享 state 布局的模型收到一个 ragged batch：decode rows 与 wave
+中所有 prefill rows 拼在一起。布局不同的模型由自己的 adapter 在同一个 group
+scope 内分别推进 decode 和 prefill。两种情况都不能因为 prompt 在 bookkeeping 上
+被表示成多个 chunk，就对同一个 group 重复做多个 prefill forward。
 
-这里的“一次 iteration 一个 forward”指一个完整的模型调度步：每个 group 在这一
-步里最多执行一次。实现可以保留分段的 layer-group API，但不允许同一 active group
-因为多个 frontier 被重复调用。
+这里的“一次 iteration 一个 forward”指一个完整的逻辑模型调度步：每个 group 在
+这一步里最多被 scheduler 调度一次。实现可以保留模型自己的 decode/prefill kernel
+和分段 layer-group API，但不允许同一 active group 因为多个 frontier 被重复调用。
 
 ## 论文原本的设计
 
@@ -61,9 +62,9 @@ N_groups(prompt_length) = max(1, ceil(prompt_length / 512))
 一个 wave 是一起完成 layered prefill 的一组请求。wave 保存：
 
 - 每个请求的完整 prefill token 范围；
-- ragged attention 所需的请求边界和位置；
-- 所有 prefill rows 的 hidden/residual state；
-- 当前已经通过的 layer group；
+- backend 准备的 ragged attention view；
+- model adapter 返回的不透明中间状态；
+- 当前已经通过的逻辑 execution stage；
 - 每个请求的 KV、结束位置和最终输出 row。
 
 wave 可以有多个请求，也可以只有一个长请求。它不应该由一串必须分别 forward 的
@@ -94,7 +95,7 @@ prefill wave:             enter [Gi] once, then park its state
 
 - 有 runnable decode 时，每个 iteration 产生一个 decode token；
 - 每个 group 每个 iteration 最多执行一次；
-- active group 的一次执行同时包含 decode rows 和全部 wave prefill rows；
+- active group 的一次逻辑执行覆盖 decode rows 和全部 wave prefill rows；
 - 每个 prefill token 在每一层恰好计算一次；
 - 请求之间只共享物理 batch，不共享 attention 因果边界；
 - KV allocation/accounting 对每个 prefill token只发生一次；
@@ -109,20 +110,34 @@ prefill wave:             enter [Gi] once, then park its state
 - 每个成员的当前未缓存 prefill 范围只 materialize 一次，多请求保持
   独立的 ragged attention 边界；
 - 每次 iteration 只构建一个 `decode rows + full prefill wave` mixed batch；
-- active group 只执行一次 forward，然后拆回 decode 和 prefill state；
-- resident expert group 的 pin、prefetch、release 与 decode 保留层由共享 cache
-  生命周期管理；
-- `LayerGroupState` 保存 wave 在 group 边界的 hidden/residual state；
+- scheduler 只推进 wave、请求和逻辑 stage，不读取模型 state、attention metadata
+  或 expert cache slot；
+- `LayeredExecutionAdapter` 由 engine 创建、由模型选择具体实现，负责 begin、推进、
+  拆分和 finish；scheduler 只保存它返回的不透明 state；
+- attention backend 自己创建 mixed batch 的 metadata view 和 stable-decode state；
+- expert cache 通过 `ResidentExpertSession` 完成 stage geometry、pin、admission、
+  prefetch、promote、release 和取消清理；
 - KV allocation、abort、terminal output row 和 finish 按请求独立记账。
+
+Qwen residual 模型的 adapter 可以把 decode rows 与 prefill rows 合成一个 ragged
+state，因此 active group 仍是一次 mixed model call。DSV4 的 decode state 和 ragged
+prefill state 具有不同布局和 attention 算法；它的 model-owned adapter 在同一个
+resident group iteration 内分别调用现有 `decode_step` 与 ragged prefill kernel，
+不把 decode rows 伪装成 prefill segment。两者都不向 scheduler 暴露布局。
+
+Triton decode backend 可复用通用 layer-range CUDA graph。FlashInfer 和 DSV4 的
+prefix/suffix 在不具备该能力时走 eager 路径，pure decode 仍使用各 backend 原有的
+whole-model CUDA graph。这里不 capture 特定 prompt 长度或 prefill shape。
+
+新增模型需要同时提供 model execution adapter、attention metadata view，以及由
+expert cache 注册的每个 stage working set；具备这些公开接口后才能接入，不能仅凭
+模型名称或一个独立 boolean 声明支持。
 
 `--max-prefill-length` (`T`) 只用于计算请求的 planned chunks 和 wave
 admission 容量，不会在 wave 内创建额外 forward 边界。
 `--prefill-wave-max-chunks` (`W`) 是完整请求的 aggregate soft cap：首个请求
 本身若大于 `W`，它仍保持完整并独占 wave。`--prefill-layer-group-size`
 (`G`) 控制 resident layer group 的大小，并受 shared expert cache 容量限制。
-
-这条路径复用通用 decode range graph，但不 capture 特定 prompt 长度或 prefill
-shape。
 
 ## 验收判据
 

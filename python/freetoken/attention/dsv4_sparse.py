@@ -190,6 +190,12 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
             last_indices=last, table_rows=self._table_rows(batch), window_ar=self._window_ar
         )
 
+    def prepare_metadata_view(self, source: Batch, target: Batch) -> bool:
+        """Build independent addressing for a DSV4 execution-state view."""
+        del source
+        self.prepare_metadata(target)
+        return True
+
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         self.max_graph_bs = max(bs_list)

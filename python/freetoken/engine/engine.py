@@ -322,11 +322,27 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
-        if (
-            getattr(config, "batching_policy", "legacy")
-            in ("layered", "joint", "layered-pipeline")
-            and not getattr(self.model, "supports_layer_group_prefill", False)
-        ):
+        from .layered_execution import LayeredExecutionAdapter
+
+        self._layered_execution_adapter = LayeredExecutionAdapter.create(self)
+        batching_policy = getattr(config, "batching_policy", "legacy")
+        legacy_layer_group_methods = (
+            "layer_group_num_layers",
+            "begin_layer_group_prefill",
+            "advance_layer_group_prefill",
+            "finish_layer_group_prefill",
+        )
+        unsupported_layer_groups = (
+            batching_policy == "layered-pipeline"
+            and self._layered_execution_adapter is None
+        ) or (
+            batching_policy in ("layered", "joint")
+            and not all(
+                hasattr(self.model, name)
+                for name in legacy_layer_group_methods
+            )
+        )
+        if unsupported_layer_groups:
             raise ValueError(
                 f"model {type(self.model).__name__} does not support layer-group prefill"
             )
@@ -427,6 +443,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            layered_execution_adapter=self._layered_execution_adapter,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -645,6 +662,9 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
+        cache.register_resident_working_sets(
+            [layer.num_experts for layer in layers]
+        )
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -924,6 +944,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            layered_execution_adapter=self._layered_execution_adapter,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
@@ -948,18 +969,112 @@ class Engine:
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
+    def prepare_execution_metadata(
+        self,
+        batch: Batch,
+        input_mapping,
+        *,
+        linear_cache_is_hybrid: bool,
+    ) -> None:
+        """Let execution backends own metadata after Scheduler allocates rows."""
+        if self.linear_state_pool is not None:
+            if batch.is_decode_only:
+                if linear_cache_is_hybrid:
+                    pool = self.linear_state_pool
+                    slots = [
+                        req.linear_slot_idx
+                        if req.linear_slot_idx is not None
+                        else pool.padding_slot
+                        for req in batch.padded_reqs
+                    ]
+                    batch.linear_table_idx = torch.tensor(
+                        slots,
+                        dtype=torch.int32,
+                        device="cpu",
+                        pin_memory=True,
+                    ).to(self.device, non_blocking=True)
+                else:
+                    batch.linear_table_idx = input_mapping[0].to(torch.int32)
+            if batch.fla_metadata is None:
+                from freetoken.attention.linear import build_fla_metadata
+
+                batch.fla_metadata = build_fla_metadata(batch, self.device)
+        if batch.has_decode:
+            decode_rows = (
+                len(batch.padded_reqs)
+                if batch.is_decode_only
+                else batch.decode_size
+            )
+            batch.active_table_idx = input_mapping[0][:decode_rows].view(-1)
+        self.attn_backend.prepare_metadata(batch)
+
+    def prepare_execution_metadata_view(
+        self,
+        source: Batch,
+        target: Batch,
+    ) -> bool:
+        """Build backend-owned metadata for an allocation-free execution view."""
+        if self.linear_state_pool is not None:
+            from freetoken.attention.linear import FLAMetadata
+
+            source_metadata = source.fla_metadata
+            if source_metadata is None:
+                raise RuntimeError("source batch is missing linear attention metadata")
+            if target.is_decode_only:
+                if source_metadata.decode is None:
+                    raise RuntimeError("source batch has no linear decode metadata")
+                target.linear_table_idx = source_metadata.decode.cache_indices
+                target.fla_metadata = FLAMetadata(decode=source_metadata.decode)
+            elif target.has_prefill:
+                if source_metadata.prefill is None:
+                    raise RuntimeError("source batch has no linear prefill metadata")
+                target.fla_metadata = FLAMetadata(prefill=source_metadata.prefill)
+        return self.attn_backend.prepare_metadata_view(source, target)
+
+    def capture_stable_decode_state(self, batch: Batch) -> object | None:
+        if (
+            self.linear_state_pool is not None
+            or not self.graph_runner.can_use_cuda_graph(batch)
+        ):
+            return None
+        return self.attn_backend.capture_stable_decode_state(batch)
+
+    def restore_stable_decode_state(self, batch: Batch, state: object) -> bool:
+        return self.attn_backend.restore_stable_decode_state(batch, state)
+
     @property
     def layer_group_num_layers(self) -> int:
-        if not getattr(self.model, "supports_layer_group_prefill", False):
+        if self._layered_execution_adapter is not None:
+            return self._layered_execution_adapter.num_stages
+        try:
+            return self.model.layer_group_num_layers
+        except AttributeError as exc:
             raise ValueError(
                 f"model {type(self.model).__name__} does not support layer-group prefill"
+            ) from exc
+
+    @property
+    def layered_execution_adapter(self):
+        if self._layered_execution_adapter is None:
+            raise ValueError(
+                f"model {type(self.model).__name__} does not support layered execution"
             )
-        return self.model.layer_group_num_layers
+        return self._layered_execution_adapter
 
     def begin_layer_group_prefill(self, batch: Batch):
         """Embed one eager decode, prefill, or mixed layer-group state."""
         with self.ctx.forward_batch(batch):
             return self.model.begin_layer_group_prefill(batch.input_ids)
+
+    def restore_layered_linear_states(self, batch: Batch) -> None:
+        """Restore request-owned recurrent state immediately before embedding."""
+        pool = self.linear_state_pool
+        if pool is None or not batch.has_prefill:
+            return
+        for req in batch.prefill_reqs:
+            if req.mamba_restore_src is not None:
+                pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
+                req.mamba_restore_src = None
 
     def advance_layer_group_prefill(self, batch: Batch, state, end_layer: int):
         """Advance one chunk from ``state.next_layer`` up to ``end_layer``."""
@@ -977,7 +1092,9 @@ class Engine:
     def _advance_layer_group_decode(self, batch: Batch, state, end_layer: int):
         if not batch.is_decode_only:
             raise ValueError("layer-group decode execution requires a decode-only batch")
-        start_layer = 0 if state is None else state.next_layer
+        start_layer = (
+            0 if state is None else self.model.layer_group_state_layer(state)
+        )
         if not start_layer < end_layer <= self.layer_group_num_layers:
             raise ValueError(
                 f"invalid decode layer range [{start_layer}, {end_layer})"
@@ -1653,11 +1770,11 @@ def _adjust_config(config: EngineConfig):
                 f"num_experts={model_config.num_experts}"
             )
         if (
-            batching_policy in ("joint", "layered-pipeline")
+            batching_policy == "joint"
             and config.attention_backend.split(",")[0].strip() != "triton"
         ):
             raise ValueError(
-                f"{batching_policy} batching prepares several prefill batches before execution, "
+                "joint batching prepares several prefill batches before execution, "
                 "which requires independent Triton prefill metadata; use "
                 "--attention-backend triton (or a hybrid string whose prefill "
                 f"backend is triton), got {config.attention_backend!r}"

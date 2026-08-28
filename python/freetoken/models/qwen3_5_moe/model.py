@@ -11,7 +11,7 @@ from freetoken.layers import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import LayerGroupState, ResidualLayerGroupCausalLM
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen3_5Attention
@@ -88,7 +88,7 @@ class Qwen3_5Model(BaseOP):
         return x
 
 
-class Qwen3_5MoEForCausalLM(BaseLLMModel):
+class Qwen3_5MoEForCausalLM(ResidualLayerGroupCausalLM):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3_5Model(config)
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
@@ -112,6 +112,32 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)
+
+    def finish_layer_group_prefill(
+        self,
+        state: LayerGroupState,
+        output_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if state.next_layer != self.layer_group_num_layers:
+            raise ValueError(
+                "cannot finish layer-group prefill before every decoder layer ran"
+            )
+        hidden = state.hidden
+        residual = state.residual
+        if output_indices is not None:
+            hidden = hidden[output_indices].contiguous()
+            residual = (
+                residual[output_indices].contiguous()
+                if residual is not None
+                else None
+            )
+        if residual is None:
+            hidden = self.model.norm.forward(hidden)
+        else:
+            hidden, _ = self.model.norm.forward_add_residual(hidden, residual)
+        if output_indices is None:
+            return self.lm_head.forward(hidden)
+        return self.lm_head.forward_selected(hidden)
 
 
 __all__ = ["Qwen3_5MoEForCausalLM"]

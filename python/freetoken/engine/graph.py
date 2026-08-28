@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Dict, List
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
-from freetoken.models.blocks import LayerGroupState
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -16,6 +15,7 @@ if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend
     from freetoken.models import BaseLLMModel
     from freetoken.moe.offload_cache import OffloadMoeCache
+    from .layered_execution import LayeredExecutionAdapter
 
 logger = init_logger(__name__)
 
@@ -23,7 +23,7 @@ logger = init_logger(__name__)
 @dataclass
 class _LayerRangeCapture:
     graph: torch.cuda.CUDAGraph
-    output: LayerGroupState
+    output: object
 
 
 @dataclass
@@ -115,6 +115,7 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
+        layered_execution_adapter: LayeredExecutionAdapter | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -126,6 +127,7 @@ class GraphRunner:
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
         self.moe_offload_cache = moe_offload_cache
+        self.layered_execution_adapter = layered_execution_adapter
         self.stream = stream
         self.device = device
         self.layer_range_graph_map: Dict[
@@ -133,8 +135,7 @@ class GraphRunner:
         ] = {}
         self.layer_range_group_ends: dict[int, int] = {}
         self.layer_range_batch_sizes: set[int] = set()
-        self._layer_range_hidden_input: torch.Tensor | None = None
-        self._layer_range_residual_input: torch.Tensor | None = None
+        self._layer_range_state_inputs: object | None = None
         self._prepared_layer_range_batch: Batch | None = None
         self._capture_graphs(max_seq_len, vocab_size, model)
 
@@ -216,24 +217,19 @@ class GraphRunner:
         The active resident group remains eager because its decode rows are merged with
         prefill rows; these graphs cover only the decode-only groups before and after it.
         """
-        from freetoken.attention.triton import TritonAttentionBackend
-
         cache = self.moe_offload_cache
+        adapter = self.layered_execution_adapter
         if (
             cache is None
             or getattr(cache, "prefill_group_decode_reserve_layers", 0) == 0
-            or not getattr(model, "supports_layer_group_prefill", False)
-            or not isinstance(self.attn_backend, TritonAttentionBackend)
+            or adapter is None
+            or not adapter.supports_range_graphs
         ):
             return
 
-        num_layers = model.layer_group_num_layers
-        group_size = cache.effective_prefill_group_size
-        if group_size < 1:
-            return
         groups = [
-            (start, min(start + group_size, num_layers))
-            for start in range(0, num_layers, group_size)
+            (stage.start_layer, stage.end_layer)
+            for stage in cache.resident_stages()
         ]
         batch_sizes = self.graph_bs_list
         if not batch_sizes:
@@ -257,14 +253,7 @@ class GraphRunner:
         with get_global_ctx().forward_batch(seed_batch):
             seed = model.begin_layer_group_prefill(seed_batch.input_ids)
             seed = model.advance_layer_group_prefill(seed, groups[0][1])
-        if seed.residual is None:
-            raise RuntimeError(
-                "layer-range graphs require residual state after the first decoder group"
-            )
-        self._layer_range_hidden_input = torch.empty_like(seed.hidden)
-        self._layer_range_residual_input = torch.empty_like(seed.residual)
-        self._layer_range_hidden_input.zero_()
-        self._layer_range_residual_input.zero_()
+        self._layer_range_state_inputs = adapter.create_range_graph_inputs(seed)
         self._reset_moe_offload_cache()
 
         for bs in reversed(batch_sizes):
@@ -291,21 +280,20 @@ class GraphRunner:
                                 captured, end_layer
                             )
                     else:
-                        assert self._layer_range_hidden_input is not None
-                        assert self._layer_range_residual_input is not None
-                        warm = LayerGroupState(
-                            self._layer_range_hidden_input[:bs],
-                            self._layer_range_residual_input[:bs],
+                        assert self._layer_range_state_inputs is not None
+                        warm = adapter.make_range_graph_state(
+                            self._layer_range_state_inputs,
                             start_layer,
+                            bs,
                         )
                         model.advance_layer_group_prefill(warm, end_layer)
                         with torch.cuda.graph(
                             graph, pool=range_pool, stream=self.stream
                         ):
-                            captured = LayerGroupState(
-                                self._layer_range_hidden_input[:bs],
-                                self._layer_range_residual_input[:bs],
+                            captured = adapter.make_range_graph_state(
+                                self._layer_range_state_inputs,
                                 start_layer,
+                                bs,
                             )
                             captured = model.advance_layer_group_prefill(
                                 captured, end_layer
@@ -352,43 +340,36 @@ class GraphRunner:
         if batch is self._prepared_layer_range_batch:
             return
         self.buffer.copy_from(batch)
-        from freetoken.attention.triton import TritonAttentionBackend
-
-        assert isinstance(self.attn_backend, TritonAttentionBackend)
         self.attn_backend.prepare_for_layer_range_replay(batch)
         self._prepared_layer_range_batch = batch
 
     def replay_layer_range(
         self,
         batch: Batch,
-        state: LayerGroupState | None,
+        state: object | None,
         start_layer: int,
         end_layer: int,
-    ) -> LayerGroupState:
+    ) -> object:
         capture = self.layer_range_graph_map[(start_layer, end_layer, batch.size)]
+        adapter = self.layered_execution_adapter
+        if adapter is None:
+            raise RuntimeError("layer-range replay has no execution adapter")
         if start_layer == 0:
             if state is not None:
                 raise ValueError("layer-zero range replay cannot accept decoder state")
         else:
-            if state is None or state.next_layer != start_layer:
-                raise ValueError(
-                    f"layer-range replay expected state at layer {start_layer}"
-                )
-            if state.residual is None:
-                raise ValueError("layer-range replay requires decoder residual state")
-            assert self._layer_range_hidden_input is not None
-            assert self._layer_range_residual_input is not None
-            self._layer_range_hidden_input[: batch.size].copy_(state.hidden)
-            self._layer_range_residual_input[: batch.size].copy_(state.residual)
+            if state is None or self._layer_range_state_inputs is None:
+                raise ValueError("layer-range replay is missing decoder state")
+            adapter.stage_range_graph_inputs(
+                self._layer_range_state_inputs,
+                state,
+                batch.size,
+                start_layer,
+            )
         capture.graph.replay()
-        output = capture.output
-        return LayerGroupState(
-            output.hidden[: batch.size],
-            (
-                output.residual[: batch.size]
-                if output.residual is not None
-                else None
-            ),
+        return adapter.finish_range_graph_replay(
+            capture.output,
+            batch.size,
             end_layer,
         )
 
@@ -411,8 +392,7 @@ class GraphRunner:
         self.layer_range_graph_map = {}
         self.layer_range_group_ends = {}
         self.layer_range_batch_sizes = set()
-        self._layer_range_hidden_input = None
-        self._layer_range_residual_input = None
+        self._layer_range_state_inputs = None
         self._prepared_layer_range_batch = None
         self.buffer = None
         gc.collect()

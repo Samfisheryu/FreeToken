@@ -21,6 +21,8 @@ activation quant + Hadamard rotation re-introduced; see ``ops.py`` / the dsv4 ke
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -45,6 +47,14 @@ from .layers import (  # noqa: F401
     get_window_topk_idxs,
 )
 from .moe import Expert, Gate  # noqa: F401
+
+
+@dataclass
+class DSV4LayerGroupState:
+    hidden: torch.Tensor
+    next_layer: int
+    layout: str
+    decode_stage_cap: int | None = None
 
 
 class Block(nn.Module):
@@ -223,6 +233,11 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         self._transformer = Transformer(self._args)
         self._bound = False
 
+    def create_layered_execution_adapter(self, engine):
+        from .layered_execution import DSV4LayeredExecutionAdapter
+
+        return DSV4LayeredExecutionAdapter(engine)
+
     def _ensure_bound(self) -> None:
         if self._bound:
             return
@@ -291,6 +306,163 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         else:
             cmp_stage_cap = int(pos.max().item())
         return self._transformer.decode(input_ids.view(B, 1), pos, cmp_stage_cap)
+
+    @property
+    def layer_group_num_layers(self) -> int:
+        return len(self._transformer.layers)
+
+    @staticmethod
+    def layer_group_state_layer(state: DSV4LayerGroupState) -> int:
+        return state.next_layer
+
+    def _decode_stage_cap(self, batch) -> int:
+        rows = batch.decode_size if batch.has_prefill else batch.padded_size
+        return int(batch.positions[:rows].max().item())
+
+    def begin_layer_group_prefill(
+        self,
+        input_ids: torch.Tensor,
+    ) -> DSV4LayerGroupState:
+        self._ensure_bound()
+        batch = get_global_ctx().batch
+        ids = input_ids.long()
+        if batch.uses_extend_path:
+            hidden = self._transformer.embed(ids.view(1, -1))
+            hidden = hidden.unsqueeze(2).repeat(
+                1,
+                1,
+                self._transformer.hc_mult,
+                1,
+            )
+            stage_cap = self._decode_stage_cap(batch) if batch.has_decode else None
+            return DSV4LayerGroupState(hidden, 0, "ragged", stage_cap)
+
+        batch_size = batch.padded_size
+        hidden = self._transformer.embed(ids.view(batch_size, 1))
+        hidden = hidden.unsqueeze(2).repeat(
+            1,
+            1,
+            self._transformer.hc_mult,
+            1,
+        )
+        return DSV4LayerGroupState(
+            hidden,
+            0,
+            "decode",
+            self._decode_stage_cap(batch),
+        )
+
+    def advance_layer_group_prefill(
+        self,
+        state: DSV4LayerGroupState,
+        end_layer: int,
+    ) -> DSV4LayerGroupState:
+        if not state.next_layer < end_layer <= self.layer_group_num_layers:
+            raise ValueError(
+                f"invalid layer-group range [{state.next_layer}, {end_layer}) for "
+                f"{self.layer_group_num_layers} layers"
+            )
+        batch = get_global_ctx().batch
+        input_ids = batch.input_ids.long()
+        if state.layout == "ragged":
+            metadata = batch.attn_metadata
+            if metadata.segments is None:
+                raise RuntimeError("DSV4 ragged execution is missing attention segments")
+            for layer_id in range(state.next_layer, end_layer):
+                state.hidden = self._transformer.layers[layer_id].prefill_batched(
+                    state.hidden,
+                    input_ids.view(1, -1),
+                    metadata.segments,
+                    batch.positions.long(),
+                )
+        elif state.layout == "decode":
+            batch_size = batch.padded_size
+            positions = batch.positions.long().view(-1)[:batch_size]
+            rows = torch.arange(batch_size, device=input_ids.device)
+            stage_cap = state.decode_stage_cap
+            if stage_cap is None:
+                raise RuntimeError("DSV4 decode state is missing its staging cap")
+            window_context = batch.attn_metadata.window_ctx(positions, rows)
+            decode_ids = input_ids.view(batch_size, 1)
+            for layer_id in range(state.next_layer, end_layer):
+                state.hidden = self._transformer.layers[layer_id].decode_step(
+                    state.hidden,
+                    positions,
+                    rows,
+                    stage_cap,
+                    decode_ids,
+                    window_context,
+                )
+        else:
+            raise RuntimeError(f"unknown DSV4 layer-group layout {state.layout!r}")
+        state.next_layer = end_layer
+        return state
+
+    @staticmethod
+    def layer_group_merge_states(
+        decode: DSV4LayerGroupState,
+        prefill: DSV4LayerGroupState,
+    ) -> DSV4LayerGroupState:
+        if decode.next_layer != prefill.next_layer:
+            raise RuntimeError("decode and prefill states are at different layers")
+        if decode.layout != "decode" or prefill.layout != "ragged":
+            raise RuntimeError("DSV4 mixed execution received incompatible state layouts")
+        hidden = torch.cat(
+            (decode.hidden.transpose(0, 1), prefill.hidden),
+            dim=1,
+        )
+        return DSV4LayerGroupState(
+            hidden,
+            decode.next_layer,
+            "ragged",
+            decode.decode_stage_cap,
+        )
+
+    @staticmethod
+    def layer_group_split_state(
+        state: DSV4LayerGroupState,
+        decode_rows: int,
+    ) -> tuple[DSV4LayerGroupState, DSV4LayerGroupState]:
+        if state.layout != "ragged":
+            raise RuntimeError("DSV4 mixed result is not in ragged layout")
+        decode = DSV4LayerGroupState(
+            state.hidden[:, :decode_rows].transpose(0, 1),
+            state.next_layer,
+            "decode",
+            state.decode_stage_cap,
+        )
+        prefill = DSV4LayerGroupState(
+            state.hidden[:, decode_rows:],
+            state.next_layer,
+            "ragged",
+        )
+        return decode, prefill
+
+    def finish_layer_group_prefill(
+        self,
+        state: DSV4LayerGroupState,
+        output_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if state.next_layer != self.layer_group_num_layers:
+            raise ValueError(
+                "cannot finish layer-group prefill before every decoder layer ran"
+            )
+        hidden = self._transformer.hc_head(state.hidden)
+        hidden = self._transformer.norm(hidden)
+        if state.layout == "decode":
+            selected = hidden[:, -1]
+            if output_indices is not None:
+                selected = selected[output_indices]
+        elif state.layout == "ragged":
+            if output_indices is None:
+                metadata = get_global_ctx().batch.attn_metadata
+                output_indices = metadata.get_last_indices(
+                    get_global_ctx().batch.size
+                ).long()
+            selected = hidden[0, output_indices]
+        else:
+            raise RuntimeError(f"unknown DSV4 layer-group layout {state.layout!r}")
+        return F.linear(selected, self._transformer.head)
 
 
 __all__ = ["Transformer", "DeepseekV4ForCausalLM"]

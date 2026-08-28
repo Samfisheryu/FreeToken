@@ -46,6 +46,11 @@ class BaseAttnMetadata(ABC):
 
 
 class BaseAttnBackend(ABC):
+    @property
+    def supports_layer_range_graphs(self) -> bool:
+        """Whether decode metadata can be staged for partial-model graph replay."""
+        return False
+
     @abstractmethod
     def forward(
         self,
@@ -68,6 +73,40 @@ class BaseAttnBackend(ABC):
 
     @abstractmethod
     def prepare_for_replay(self, batch: Batch) -> None: ...
+
+    def prepare_for_layer_range_capture(self, batch: Batch) -> None:
+        del batch
+        raise RuntimeError("attention backend does not support layer-range graphs")
+
+    def prepare_for_layer_range_replay(self, batch: Batch) -> None:
+        del batch
+        raise RuntimeError("attention backend does not support layer-range graphs")
+
+    def prepare_metadata_view(
+        self,
+        source: Batch,
+        target: Batch,
+    ) -> bool:
+        """Attach metadata to a request/row view of an already prepared batch.
+
+        Decode views rebuild by default. Prefill views may defer their rebuild
+        until they are actually executed without the source mixed batch.
+        """
+        del source
+        if target.is_decode_only:
+            self.prepare_metadata(target)
+            return True
+        return False
+
+    def capture_stable_decode_state(self, batch: Batch) -> object | None:
+        """Return opaque reusable decode metadata, or None if replay must rebuild."""
+        del batch
+        return None
+
+    def restore_stable_decode_state(self, batch: Batch, state: object) -> bool:
+        """Restore a state returned above; false invalidates scheduler reuse."""
+        del batch, state
+        return False
 
     def reset_capture(self) -> None:
         """Drop CUDA-graph capture scratch so ``init_capture_graph`` can re-run after a
@@ -115,6 +154,37 @@ class HybridBackend(BaseAttnBackend):
 
     def prepare_for_replay(self, batch: Batch) -> None:
         self.decode_backend.prepare_for_replay(batch)
+
+    @property
+    def supports_layer_range_graphs(self) -> bool:
+        return self.decode_backend.supports_layer_range_graphs
+
+    def prepare_for_layer_range_capture(self, batch: Batch) -> None:
+        self.decode_backend.prepare_for_layer_range_capture(batch)
+
+    def prepare_for_layer_range_replay(self, batch: Batch) -> None:
+        self.decode_backend.prepare_for_layer_range_replay(batch)
+
+    def prepare_metadata_view(self, source: Batch, target: Batch) -> bool:
+        backend = (
+            self.prefill_backend
+            if target.uses_extend_path
+            else self.decode_backend
+        )
+        if backend is self.prefill_backend:
+            return backend.prepare_metadata_view(source, target)
+        if self.prefill_backend is self.decode_backend:
+            return backend.prepare_metadata_view(source, target)
+        if target.is_decode_only:
+            backend.prepare_metadata(target)
+            return True
+        return backend.prepare_metadata_view(source, target)
+
+    def capture_stable_decode_state(self, batch: Batch) -> object | None:
+        return self.decode_backend.capture_stable_decode_state(batch)
+
+    def restore_stable_decode_state(self, batch: Batch, state: object) -> bool:
+        return self.decode_backend.restore_stable_decode_state(batch, state)
 
     def reset_capture(self) -> None:
         # Only the decode backend is ever captured (see init_capture_graph above).

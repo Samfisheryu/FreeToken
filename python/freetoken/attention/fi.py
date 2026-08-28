@@ -345,6 +345,28 @@ class FlashInferBackend(BaseAttnBackend):
             prefill=prefill,
         )
 
+    def prepare_metadata_view(self, source: Batch, target: Batch) -> bool:
+        metadata = source.attn_metadata
+        if not isinstance(metadata, FIMetadata):
+            raise TypeError("FlashInfer metadata view requires FlashInfer source metadata")
+        if target.is_decode_only:
+            if metadata.decode is None:
+                raise TypeError("FlashInfer source metadata has no decode path")
+            target.attn_metadata = FIMetadata(
+                query_indptr=metadata.query_indptr[: target.decode_size + 1],
+                decode=metadata.decode,
+            )
+            return True
+        if metadata.prefill is None:
+            return False
+        request_start = source.decode_size
+        row_start = sum(req.extend_len for req in source.decode_reqs)
+        target.attn_metadata = FIMetadata(
+            query_indptr=metadata.query_indptr[request_start:] - row_start,
+            prefill=metadata.prefill,
+        )
+        return True
+
     def reset_capture(self) -> None:
         # Base clears the common capture scratch; additionally drop the per-bs decode graph
         # wrappers (their indptr/indices alias freed capture scratch). Preserves the

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterator, Sequence
 
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat, lru_ensure
@@ -100,6 +100,104 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
+
+
+@dataclass(frozen=True)
+class ResidentExpertStage:
+    """Opaque execution stage backed by one stable resident expert working set."""
+
+    index: int
+    start_layer: int
+    end_layer: int
+
+
+class ResidentExpertSession:
+    """Own one resident-wave cache lifecycle without exposing slots or CUDA events."""
+
+    def __init__(
+        self,
+        cache: OffloadMoeCache,
+        stages: tuple[ResidentExpertStage, ...],
+    ) -> None:
+        self._cache = cache
+        self._stages = stages
+        self._active_index: int | None = None
+        self._prefetched_index: int | None = None
+        self._closed = False
+        self._prepares_at_start = cache.prefill_layer_prepares
+
+    @property
+    def stage_count(self) -> int:
+        return len(self._stages)
+
+    @property
+    def layer_prepares(self) -> int:
+        return self._cache.prefill_layer_prepares - self._prepares_at_start
+
+    def stage(self, index: int) -> ResidentExpertStage:
+        if self._closed:
+            raise RuntimeError("resident expert session is closed")
+        try:
+            return self._stages[index]
+        except IndexError as exc:
+            raise ValueError(f"resident stage index {index} is out of range") from exc
+
+    def begin(self, index: int) -> ResidentExpertStage:
+        stage = self.stage(index)
+        if self._active_index == index:
+            return stage
+        if self._active_index is not None:
+            raise RuntimeError("another resident expert stage is still active")
+        self._cache.begin_resident_prefill_group(
+            stage.start_layer,
+            stage.end_layer,
+        )
+        self._active_index = index
+        return stage
+
+    def hint_next(self, index: int) -> bool:
+        if self._active_index is None:
+            raise RuntimeError("next-stage hint requires an active resident stage")
+        if index != self._active_index + 1:
+            raise ValueError("resident next-stage hint must be consecutive")
+        stage = self.stage(index)
+        prefetched = self._cache.try_prefetch_next_resident_group(
+            stage.start_layer,
+            stage.end_layer,
+        )
+        if prefetched:
+            self._prefetched_index = index
+        return prefetched
+
+    def complete(self, index: int) -> None:
+        if self._active_index != index:
+            raise RuntimeError("completed resident stage is not active")
+        self._cache.end_prefill_group()
+        self._active_index = None
+        if self._prefetched_index is not None:
+            next_stage = self.stage(self._prefetched_index)
+            self._cache.promote_prefetched_resident_group(
+                next_stage.start_layer,
+                next_stage.end_layer,
+            )
+            self._active_index = self._prefetched_index
+            self._prefetched_index = None
+
+    def close(self) -> None:
+        if self._active_index is not None or self._prefetched_index is not None:
+            raise RuntimeError("cannot close a resident expert session with active work")
+        self._closed = True
+
+    def cancel(self) -> None:
+        if self._closed:
+            return
+        if self._active_index is not None:
+            self._cache.end_prefill_group()
+            self._active_index = None
+        if self._prefetched_index is not None:
+            self._cache.cancel_prefetched_resident_group()
+            self._prefetched_index = None
+        self._closed = True
 
 
 def plan_expert_cache_partition(
@@ -207,6 +305,11 @@ class OffloadMoeCache:
         assert not self.prefill_group_decode_reserve_layers or self.prefill_group_size, (
             "decode reserve applies only to resident prefill groups"
         )
+        # Cache attachment replaces this constructor registration with the
+        # actual per-layer working sets.  The rectangular canonical bank still
+        # validates equal expert-row counts today; stage packing itself no
+        # longer leaks that geometry to the scheduler.
+        self._resident_working_set_rows = (self.num_experts,) * self.num_layers
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.separate_prefill_buffer or self.prefill_overlap, (
@@ -433,11 +536,47 @@ class OffloadMoeCache:
         """Actual resident layer count after honoring the total HBM slot budget."""
         if self.prefill_group_size == 0:
             return 0
-        affordable = (
-            self.cache_size // self.num_experts
-            - self.prefill_group_decode_reserve_layers
+        stages = self._resident_stage_ranges()
+        return max((end - start for start, end in stages), default=0)
+
+    def register_resident_working_sets(self, rows_per_layer: Sequence[int]) -> None:
+        """Register the model adapter's logical expert working set per stage."""
+        rows = tuple(int(rows) for rows in rows_per_layer)
+        if len(rows) != self.num_layers or any(rows < 1 for rows in rows):
+            raise ValueError(
+                "resident working sets must provide one positive row count per layer"
+            )
+        if any(rows != self.num_experts for rows in rows):
+            raise ValueError(
+                "the canonical expert bank currently requires equal per-layer row counts"
+            )
+        self._resident_working_set_rows = rows
+
+    def _resident_stage_ranges(self) -> tuple[tuple[int, int], ...]:
+        if self.prefill_group_size == 0:
+            return ()
+        reserve_rows = (
+            self.prefill_group_decode_reserve_layers
+            * max(self._resident_working_set_rows)
         )
-        return min(self.prefill_group_size, self.num_layers, max(affordable, 0))
+        stage_capacity = self.decode_cache_size - reserve_rows
+        ranges: list[tuple[int, int]] = []
+        start = 0
+        while start < self.num_layers:
+            end = start
+            used = 0
+            while (
+                end < self.num_layers
+                and end - start < self.prefill_group_size
+                and used + self._resident_working_set_rows[end] <= stage_capacity
+            ):
+                used += self._resident_working_set_rows[end]
+                end += 1
+            if end == start:
+                break
+            ranges.append((start, end))
+            start = end
+        return tuple(ranges)
 
     @property
     def prefill_buffer_count(self) -> int:
@@ -465,6 +604,27 @@ class OffloadMoeCache:
             self.num_experts,
             self.prefill_buffer_count if self.separate_prefill_buffer else 0,
         )
+
+    def resident_stages(self) -> tuple[ResidentExpertStage, ...]:
+        """Return the cache-owned execution stages for one resident wave.
+
+        The cache registration already names the expert working set of every
+        offloaded layer.  Keep the capacity arithmetic here so schedulers never
+        infer it from a model's expert count.
+        """
+        ranges = self._resident_stage_ranges()
+        if not ranges or ranges[-1][1] != self.num_layers:
+            raise RuntimeError("resident expert stages do not fit in the cache")
+        return tuple(
+            ResidentExpertStage(index, start, end)
+            for index, (start, end) in enumerate(ranges)
+        )
+
+    def open_resident_wave(self) -> ResidentExpertSession:
+        """Open an opaque cache-residency lifecycle for one execution wave."""
+        if self._prefill_group_active or self._resident_prefetch_range is not None:
+            raise RuntimeError("another resident expert wave is already active")
+        return ResidentExpertSession(self, self.resident_stages())
 
     def set_bank_sources(
         self,
@@ -1232,6 +1392,22 @@ class OffloadMoeCache:
         )
         for buffer_id, layer_id in enumerate(range(start_layer, end_layer)):
             self._prepare_joint_slot_alphas(buffer_id, layer_id)
+        self._resident_prefetch_range = None
+        self._resident_prefetch_ready_events = []
+
+    def cancel_prefetched_resident_group(self) -> None:
+        """Release an exceptional-path prefetch without exposing its events."""
+        if self._resident_prefetch_range is None:
+            return
+        current_stream = torch.cuda.current_stream(self.device)
+        for event in self._resident_prefetch_ready_events:
+            current_stream.wait_event(event)
+        start_layer, end_layer = self._resident_prefetch_range
+        group_slots = self.slot_for_id[start_layer:end_layer].reshape(-1)
+        self.usage[group_slots] = self.step
+        if self._joint_group_release_event is not None:
+            self._joint_group_release_event.record(current_stream)
+            self._joint_group_has_release_event = True
         self._resident_prefetch_range = None
         self._resident_prefetch_ready_events = []
 

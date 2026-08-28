@@ -10,7 +10,6 @@ from freetoken.core import Batch, Req
 from .forward import ForwardInput, Indice2D
 
 if TYPE_CHECKING:
-    from freetoken.attention import BaseAttnMetadata
     from freetoken.engine import Engine
 
 
@@ -26,7 +25,7 @@ class StableDecodeInput:
     positions: torch.Tensor
     input_tuple: Indice2D
     write_tuple: Indice2D
-    attn_metadata: BaseAttnMetadata
+    metadata_state: object
 
 
 def prepare_stable_decode(
@@ -47,7 +46,7 @@ def prepare_stable_decode(
     table_indices = tuple(req.table_idx for req in reqs)
     cached_lens = tuple(req.cached_len for req in reqs)
     device_lens = tuple(req.device_len for req in reqs)
-    if (
+    can_reuse = (
         previous is not None
         and previous.reqs == reqs
         and previous.table_indices == table_indices
@@ -62,6 +61,10 @@ def prepare_stable_decode(
             current == prior + 1
             for current, prior in zip(device_lens, previous.device_lens)
         )
+    )
+    if can_reuse and engine.restore_stable_decode_state(
+        batch,
+        previous.metadata_state,
     ):
         real_rows = slice(batch.size)
         previous.positions[real_rows].add_(1)
@@ -70,7 +73,6 @@ def prepare_stable_decode(
         batch.positions = previous.positions
         batch.out_loc = engine.page_table[previous.input_tuple]
         batch.active_table_idx = previous.input_tuple[0].view(-1)
-        batch.attn_metadata = previous.attn_metadata
         previous.cached_lens = cached_lens
         previous.device_lens = device_lens
         return (
@@ -85,18 +87,8 @@ def prepare_stable_decode(
 
     forward_input = build_forward_input(batch)
 
-    # Stable reuse is valid only when Triton already points decode at graph-owned
-    # metadata and no model-specific linear state must be restaged.
-    from freetoken.attention.triton import TritonMetadata
-
-    metadata = batch.attn_metadata
-    if (
-        engine.linear_state_pool is None
-        and engine.graph_runner.can_use_cuda_graph(batch)
-        and isinstance(metadata, TritonMetadata)
-        and metadata.capture_staged
-    ):
-        batch.positions = metadata.q_positions
+    metadata_state = engine.capture_stable_decode_state(batch)
+    if metadata_state is not None:
         current = StableDecodeInput(
             reqs=reqs,
             table_indices=table_indices,
@@ -108,7 +100,7 @@ def prepare_stable_decode(
             positions=batch.positions,
             input_tuple=forward_input.input_tuple,
             write_tuple=forward_input.write_tuple,
-            attn_metadata=metadata,
+            metadata_state=metadata_state,
         )
         return forward_input, current
     return forward_input, None

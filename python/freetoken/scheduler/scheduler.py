@@ -4,7 +4,6 @@ import time
 from typing import TYPE_CHECKING, List, NoReturn, Set, Tuple
 
 import torch
-from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
@@ -138,7 +137,6 @@ class Scheduler(SchedulerIOMixin):
                 prepare_mixed_batch=self._prepare_resident_mixed_batch,
                 build_execution_input=self._build_layer_group_input,
                 report_prompt_admissions=self._report_prompt_admissions,
-                restore_linear_states=self._restore_linear_states,
                 free_req_resources=self._free_req_resources,
             )
         else:
@@ -1399,33 +1397,11 @@ class Scheduler(SchedulerIOMixin):
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
-        if self.engine.linear_state_pool is not None:
-            if batch.is_decode_only:
-                # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
-                # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
-                # NOT on whether any padded req has a linear_slot_idx -- the persistent dummy
-                # req always carries one (= padding_slot), so that test is True even for naive
-                # and would collapse all real naive reqs onto the padding slot. Hybrid: build
-                # per padded req from Req.linear_slot_idx (dummy -> padding_slot). Naive: keep
-                # the old keying = input_mapping's table_idx column (already staged, no H2D).
-                if self.cache_manager.is_hybrid:
-                    pool = self.engine.linear_state_pool
-                    slots = [r.linear_slot_idx if r.linear_slot_idx is not None
-                             else pool.padding_slot for r in batch.padded_reqs]
-                    batch.linear_table_idx = torch.tensor(
-                        slots, dtype=torch.int32, device="cpu", pin_memory=True
-                    ).to(self.device, non_blocking=True)
-                else:
-                    batch.linear_table_idx = input_mapping[0].to(torch.int32)
-            # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
-            # built once here instead of rebuilt in each of the 30 GDN layers. For decode
-            # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
-            batch.fla_metadata = build_fla_metadata(batch, self.device)
-        if batch.is_decode_only:
-            # This batch's padded per-row page-table rows. Backends that snapshot the table for
-            # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
-            batch.active_table_idx = input_mapping[0].view(-1)
-        self.engine.attn_backend.prepare_metadata(batch)
+        self.engine.prepare_execution_metadata(
+            batch,
+            input_mapping,
+            linear_cache_is_hybrid=self.cache_manager.is_hybrid,
+        )
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),

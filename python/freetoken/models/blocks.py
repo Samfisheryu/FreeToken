@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import torch
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -15,14 +16,10 @@ from freetoken.layers import (
 from freetoken.utils import nvtx_annotate
 
 if TYPE_CHECKING:
-    import torch
-
     from .config import ModelConfig
 
 
 class BaseLLMModel(ABC, BaseOP):
-    supports_layer_group_prefill = False
-
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
 
@@ -37,8 +34,6 @@ class LayerGroupState:
 class ResidualLayerGroupCausalLM(BaseLLMModel):
     """Explicit opt-in for the common hidden/residual decoder-layer interface."""
 
-    supports_layer_group_prefill = True
-
     @property
     def layer_group_num_layers(self) -> int:
         return len(self.model.layers.op_list)
@@ -47,6 +42,108 @@ class ResidualLayerGroupCausalLM(BaseLLMModel):
         return LayerGroupState(
             hidden=self.model.embed_tokens.forward(input_ids),
             residual=None,
+        )
+
+    @staticmethod
+    def layer_group_state_layer(state: LayerGroupState) -> int:
+        return state.next_layer
+
+    @staticmethod
+    def layer_group_merge_states(
+        decode: LayerGroupState,
+        prefill: LayerGroupState,
+    ) -> LayerGroupState:
+        if decode.next_layer != prefill.next_layer:
+            raise RuntimeError("decode and prefill states are at different layers")
+        if (decode.residual is None) != (prefill.residual is None):
+            raise RuntimeError("decode and prefill residual states do not match")
+        residual = (
+            None
+            if decode.residual is None
+            else torch.cat((decode.residual, prefill.residual), dim=0)
+        )
+        return LayerGroupState(
+            hidden=torch.cat((decode.hidden, prefill.hidden), dim=0),
+            residual=residual,
+            next_layer=decode.next_layer,
+        )
+
+    @staticmethod
+    def layer_group_split_state(
+        state: LayerGroupState,
+        decode_rows: int,
+    ) -> tuple[LayerGroupState, LayerGroupState]:
+        decode_residual = prefill_residual = None
+        if state.residual is not None:
+            decode_residual = state.residual[:decode_rows]
+            prefill_residual = state.residual[decode_rows:]
+        return (
+            LayerGroupState(
+                state.hidden[:decode_rows],
+                decode_residual,
+                state.next_layer,
+            ),
+            LayerGroupState(
+                state.hidden[decode_rows:],
+                prefill_residual,
+                state.next_layer,
+            ),
+        )
+
+    @staticmethod
+    def create_layer_range_graph_inputs(
+        seed: LayerGroupState,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if seed.residual is None:
+            raise RuntimeError(
+                "layer-range graphs require residual state after the first stage"
+            )
+        hidden = torch.zeros_like(seed.hidden)
+        residual = torch.zeros_like(seed.residual)
+        return hidden, residual
+
+    @staticmethod
+    def make_layer_range_graph_state(
+        inputs: tuple[torch.Tensor, torch.Tensor],
+        start_layer: int,
+        rows: int,
+    ) -> LayerGroupState:
+        hidden, residual = inputs
+        return LayerGroupState(
+            hidden[:rows],
+            residual[:rows],
+            start_layer,
+        )
+
+    @staticmethod
+    def stage_layer_range_graph_inputs(
+        inputs: tuple[torch.Tensor, torch.Tensor],
+        state: LayerGroupState,
+        rows: int,
+        start_layer: int,
+    ) -> None:
+        if state.next_layer != start_layer or state.residual is None:
+            raise ValueError(
+                f"layer-range replay expected residual state at layer {start_layer}"
+            )
+        hidden, residual = inputs
+        hidden[:rows].copy_(state.hidden)
+        residual[:rows].copy_(state.residual)
+
+    @staticmethod
+    def finish_layer_range_graph_replay(
+        captured: LayerGroupState,
+        rows: int,
+        end_layer: int,
+    ) -> LayerGroupState:
+        return LayerGroupState(
+            captured.hidden[:rows],
+            (
+                captured.residual[:rows]
+                if captured.residual is not None
+                else None
+            ),
+            end_layer,
         )
 
     def advance_layer_group_prefill(
