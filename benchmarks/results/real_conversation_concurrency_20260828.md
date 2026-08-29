@@ -1,11 +1,17 @@
-# Real-conversation concurrency on Qwen3.5-MoE
+# Real-conversation concurrency on Qwen3.6-MoE
+
+> Historical result: this measurement predates the static-tile executor. It is
+> retained as an earlier policy boundary, not as evidence for the current
+> implementation. See
+> [`dsv4_repo_concurrency_20260829.md`](dsv4_repo_concurrency_20260829.md) for a
+> current real-model result.
 
 ## Question and answer
 
 Does `layered-pipeline` beat unchunked `legacy` scheduling on real multi-turn
 chat text and real session timing?
 
-Not on the tested Qwen3.5-MoE configuration. `layered-pipeline` consistently
+Not on the tested Qwen3.6-MoE configuration. `layered-pipeline` consistently
 reduced token-to-token latency and visible decode stalls, but it did not produce
 a repeatable makespan win. Its first-token latency was much worse because a
 prefill wave advances through 40 one-layer resident groups before returning its
@@ -18,13 +24,16 @@ the pipeline is useful only when smoother in-flight decode is worth that trade.
   [AllenAI WildChat](https://huggingface.co/datasets/allenai/WildChat). Real
   session starts and human think times come from
   [BurstGPT v2](https://github.com/HPMLL/BurstGPT/blob/main/README.md).
-- Every policy replays the same materialized sessions, prompt text, arrival
-  schedule, output limit, and random seeds. Each user has two turns; BurstGPT
-  time is compressed by 120x. The direction sweep covers 5, 10, and 20 users.
+- Every policy replays the same materialized session identities, prompt text,
+  think times, and output limit. Each user has two turns; the second turn is
+  submitted after its first turn finishes and its compressed BurstGPT think
+  time elapses, so the resulting closed-loop arrival timeline depends on the
+  policy. The historical runner also used policy-dependent seeds. The direction
+  sweep covers 5, 10, and 20 users.
 - The fixed profiles have final-prompt ranges of 36--493 tokens (`short`),
   56--6,291 (`natural`), and 4,107--7,965 (`long`). All fit under `T=8192`, so
   the legacy baseline does not physically chunk these prompts.
-- Model: Qwen3.5-MoE 35B-A3B, BF16, 40 layers, 256 experts, Triton attention,
+- Model: Qwen3.6-MoE 35B-A3B, BF16, 40 layers, 256 experts, Triton attention,
   NoWAG expert offload, radix prefix cache, and `Graph8`.
 - Both policies use a 512-expert shared cache. This holds exactly two complete
   expert layers, so the pipeline's only legal resident group is `G=1`; `W=64`.
@@ -55,15 +64,15 @@ This single-repetition sweep uses a 128-token response cap. Lower is better.
 | long / 10 | 42.042 s | 49.800 s | +18.5% | 3,270 -> 6,750 ms | 113.79 -> 111.92 ms |
 | long / 20 | 58.617 s | 74.233 s | +26.6% | 1,422 -> 10,075 ms | 182.78 -> 167.72 ms |
 
-The apparent short/20 makespan win was the only favorable direction point, so
-it was repeated independently below.
+The apparent short/20 makespan win was the only favorable direction point, so a
+separately materialized short/20 workload was repeated below.
 
 ## Repeated boundary result
 
-The exact short/20, 128-token-cap point was run three times with alternating
-policy order. Each repetition contains 40 requests, 5,441 prompt tokens, and
-3,621 completion tokens. Makespan summarizes the three repetitions; request
-percentiles combine all 120 requests.
+The separate short/20, 128-token-cap workload was run three times with
+alternating policy order. Each repetition contains 40 requests, 5,441 prompt
+tokens, and 3,621 completion tokens. Makespan summarizes the three repetitions;
+request percentiles combine all 120 requests.
 
 | Metric | Legacy p50 / p95 | Pipeline p50 / p95 | Pipeline change |
 | --- | ---: | ---: | ---: |
@@ -107,7 +116,7 @@ first token. Legacy instead completes the whole unchunked prefill immediately,
 so it wins TTFT and usually makespan.
 
 This result does not prove that all group sizes lose. `G=2/C768` would halve the
-number of group iterations, but the tested Qwen3.5 service did not reach serving
+number of group iterations, but the tested Qwen3.6 service did not reach serving
 under either Graph0 or Graph8 at that geometry; there is no valid performance
 number for it. That startup/lifecycle defect must be fixed before testing a less
 constrained cache point. Until then, the evidence supports keeping legacy as the

@@ -1,5 +1,11 @@
 # Periodic long-prefill lab
 
+> Historical result: this measurement predates the static-tile executor. Its
+> one-segment interpretation and performance values do not describe the current
+> implementation. See
+> [`dsv4_repo_concurrency_20260829.md`](dsv4_repo_concurrency_20260829.md) for a
+> current real-model result.
+
 ## Workload
 
 This public-HTTP benchmark uses a generated FP16 Qwen3-MoE model with 8

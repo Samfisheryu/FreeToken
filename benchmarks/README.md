@@ -15,14 +15,18 @@ python benchmarks/bench_decode_moe.py --model /path/to/model --backend offload,c
 mixed, layered, joint, and layered-pipeline batching under a four-user, five-turn
 tool-agent burst. It validates exact prompt/output lengths and prefix-cache reuse,
 and records TTFT, TPOT, inter-token gaps and makespan. Layered-pipeline freezes a
-multi-request ragged wave and advances it by one resident group per iteration. It
-reserves one full expert layer outside the resident group for decode, so its shared
-cache must hold at least two expert layers. `--max-prefill-length` estimates each
-request's admission size; `--prefill-wave-max-chunks` is an aggregate complete-request
-soft cap and does not create physical forward boundaries. Completion logs and JSON
-expose `reqs`, `groups`, `group_forwards`, `iterations`, `decode_iterations`, and
-`prefill_layer_prepares`. The generated MoE is a directional test, not a real-model
-result.
+multi-request wave, packs its uncached prompt rows into static FIFO ragged tiles,
+and advances one tile through the current resident group per iteration. It
+finishes every tile before moving to the next group. The shared cache reserves
+one full expert layer outside the resident group for decode, so it must hold at
+least two expert layers. `--max-prefill-length` is the requested per-iteration
+tile limit and also estimates admission size; cache geometry may lower the
+effective limit, and neither value limits total prompt length.
+`--prefill-wave-max-chunks` is an aggregate complete-request admission soft cap,
+not a physical tile boundary. Completion logs and JSON expose `reqs`, `groups`,
+`group_forwards`, `iterations`, `decode_iterations`, and
+`prefill_layer_prepares`. The generated MoE is a directional test, not a
+real-model result.
 
 ```bash
 python benchmarks/bench_lab_agent_policies.py --repetitions 3 --gpu 0 \
@@ -39,10 +43,10 @@ The sustained-decode experiment with serial periodic long prefills is in
 [`results/periodic_long_prefill_lab_20260827.md`](results/periodic_long_prefill_lab_20260827.md).
 
 **`bench_real_conversation_concurrency.py`** — replays real WildChat multi-turn
-text under BurstGPT session starts and human think times. It compares identical
-fixed sessions across batching policies and records TTFT, TPOT, request latency,
-inter-token gaps, expert traffic, and peak concurrency. The Qwen3.5-MoE result
-and policy boundary are in
+text under BurstGPT session starts and human think times. It compares the same
+manifest-selected sessions across batching policies and records TTFT, TPOT,
+request latency, streamed-text event gaps, expert traffic, and peak concurrency.
+The historical Qwen3.6-MoE result and policy boundary are in
 [`results/real_conversation_concurrency_20260828.md`](results/real_conversation_concurrency_20260828.md).
 
 ```bash
@@ -70,6 +74,8 @@ python benchmarks/bench_dsv4_repo_concurrency.py \
 
 The runner has no machine-specific NoWAG plugin default. When the real plugin is
 provided as a source checkout, `--nowag-plugin-src` must be passed explicitly.
+The current four-user DSV4 result and service-policy boundary are in
+[`results/dsv4_repo_concurrency_20260829.md`](results/dsv4_repo_concurrency_20260829.md).
 
 **`bench_load_weight_generic.py`** — expert-bank load time: serial vs parallel O_DIRECT
 vs pre-repacked FTW, each mode in its own subprocess. Linux-only; stages the FTW under

@@ -1,5 +1,11 @@
 # Layered-pipeline paper-granularity comparison
 
+> Historical result: this measurement predates the static-tile executor. Its
+> one-ragged-batch semantics and performance values do not describe the current
+> implementation. See
+> [`dsv4_repo_concurrency_20260829.md`](dsv4_repo_concurrency_20260829.md) for a
+> current real-model result.
+
 ## Comparison contract
 
 `layered-pipeline` implements the paper's one-group-per-iteration schedule. A
