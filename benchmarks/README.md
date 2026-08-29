@@ -46,8 +46,9 @@ The sustained-decode experiment with serial periodic long prefills is in
 text under BurstGPT session starts and human think times. It compares the same
 manifest-selected sessions across batching policies and records TTFT, TPOT,
 request latency, streamed-text event gaps, expert traffic, and peak concurrency.
-The historical Qwen3.6-MoE result and policy boundary are in
-[`results/real_conversation_concurrency_20260828.md`](results/real_conversation_concurrency_20260828.md).
+The current Qwen3.6-MoE crossover and its TTFT, response-length, and Graph0
+boundaries are in
+[`results/qwen36_real_conversation_crossover_20260829.md`](results/qwen36_real_conversation_crossover_20260829.md).
 
 ```bash
 python benchmarks/bench_real_conversation_concurrency.py \
