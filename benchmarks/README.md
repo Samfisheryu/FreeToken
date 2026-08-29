@@ -80,6 +80,13 @@ The current four-user DSV4 result and service-policy boundary are in
 The cache-policy A/B and independent Qwen3.6/DSV4 matrix are in
 [`results/resident_next_use_eviction_20260829.md`](results/resident_next_use_eviction_20260829.md).
 
+**`bench_natural_repo_agent.py`** — replays the same ten real SWE-bench BM25
+repository prompts on Qwen3.6 and DSV4 using uncompressed BurstGPT arrival times
+and per-request source response lengths. It has no artificial driver barrier and
+reports paired per-request TTFT, TPOT, latency, and streamed-text gaps. The
+natural-load result and its latency/stall trade-off are in
+[`results/natural_repo_agent_qwen_dsv4_20260829.md`](results/natural_repo_agent_qwen_dsv4_20260829.md).
+
 **`bench_load_weight_generic.py`** — expert-bank load time: serial vs parallel O_DIRECT
 vs pre-repacked FTW, each mode in its own subprocess. Linux-only; stages the FTW under
 `/var/tmp` (`--ftw-dir` overrides; roughly checkpoint-sized).
