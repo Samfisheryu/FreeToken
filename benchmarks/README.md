@@ -77,6 +77,8 @@ The runner has no machine-specific NoWAG plugin default. When the real plugin is
 provided as a source checkout, `--nowag-plugin-src` must be passed explicitly.
 The current four-user DSV4 result and service-policy boundary are in
 [`results/dsv4_repo_concurrency_20260829.md`](results/dsv4_repo_concurrency_20260829.md).
+The cache-policy A/B and independent Qwen3.6/DSV4 matrix are in
+[`results/resident_next_use_eviction_20260829.md`](results/resident_next_use_eviction_20260829.md).
 
 **`bench_load_weight_generic.py`** — expert-bank load time: serial vs parallel O_DIRECT
 vs pre-repacked FTW, each mode in its own subprocess. Linux-only; stages the FTW under
