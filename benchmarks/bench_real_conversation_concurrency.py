@@ -758,6 +758,15 @@ def main() -> int:
 
     assert args.manifest is not None
     manifest = load_manifest(args.manifest)
+    manifest_user_counts = tuple(manifest["user_counts"])
+    missing_user_counts = [
+        count for count in user_counts if count not in manifest_user_counts
+    ]
+    if missing_user_counts:
+        raise ValueError(
+            f"requested user counts {missing_user_counts} are not present in the "
+            f"manifest; available counts: {list(manifest_user_counts)}"
+        )
     modes = [parse_mode(value) for value in args.modes]
     if args.dry_run:
         print(json.dumps(dry_run_plan(args, manifest, modes), indent=2))
@@ -801,10 +810,11 @@ def main() -> int:
     references: dict[tuple[str, int, str, int], str] = {}
     schedules = manifest["arrival_schedules"]
     for profile_index, profile_name in enumerate(args.profiles):
-        warmup_sessions, cases = profile_session_slices(
-            manifest["profiles"][profile_name], user_counts
+        warmup_sessions, manifest_cases = profile_session_slices(
+            manifest["profiles"][profile_name], manifest_user_counts
         )
-        for mode_index, mode in enumerate(modes):
+        cases = {count: manifest_cases[count] for count in user_counts}
+        for mode in modes:
             run: dict[str, Any] = {
                 "profile": profile_name,
                 "mode": mode["name"],
@@ -860,7 +870,6 @@ def main() -> int:
                         args.response_token_cap,
                         8_000_000
                         + profile_index * 100_000
-                        + mode_index * 10_000
                         + case_index * 1000,
                         args.request_timeout,
                     )
