@@ -254,7 +254,10 @@ class LayeredPipelineExecutor:
         if group_input is None or prefill_input is None:
             raise RuntimeError("layered pipeline iteration was not prepared")
 
-        stage = wave.cache_session.begin(wave.current_stage)
+        stage = wave.cache_session.begin(
+            wave.current_stage,
+            has_decode=self._decode_input is not None,
+        )
         run = self._execution.begin_group(
             group_input,
             prefill_input,

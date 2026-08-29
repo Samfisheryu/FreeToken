@@ -45,7 +45,8 @@ def ensure_decode_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> Non
 
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.decode_cache_size)
-    _ensure_decode_experts_layer_distance_kernel[(1,)](
+    _ensure_experts_layer_distance_kernel[(1,)](
+        expert_ids,
         expert_ids,
         cache.slot_for_id,
         cache.id_of_slot,
@@ -56,6 +57,9 @@ def ensure_decode_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> Non
         cache.num_indices,
         cache.lru_stats[layer_id],
         layer_id,
+        layer_id,
+        0,
+        0,
         expert_ids.numel(),
         num_layers=cache.num_layers,
         num_experts=cache.num_experts,
@@ -63,6 +67,58 @@ def ensure_decode_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> Non
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         COLLECT_STATS=cache.collect_stats,
+        PROTECT_ID_RANGE=False,
+        ZERO_DISTANCE_IS_FULL_CYCLE=True,
+        FULL_LAYER_QUERY=False,
+        num_warps=8 if block_c >= 2048 else 4,
+    )
+
+
+def ensure_resident_experts(
+    cache,
+    layer_id: int,
+    next_layer: int,
+    protected_start_layer: int,
+    protected_end_layer: int,
+    expert_ids: torch.Tensor,
+    out_indices: torch.Tensor,
+    evict_slots: torch.Tensor,
+    src_indices: torch.Tensor,
+    num_indices: torch.Tensor,
+) -> None:
+    """Admit one resident layer using the next causal layer as victim order.
+
+    The caller owns all tensors and supplies a protected resident-layer range, so
+    this launch neither allocates nor exposes cache slots outside the cache module.
+    """
+
+    block_e = triton.next_power_of_2(cache.num_experts)
+    block_c = triton.next_power_of_2(cache.decode_cache_size)
+    _ensure_experts_layer_distance_kernel[(1,)](
+        expert_ids,
+        out_indices,
+        cache.slot_for_id,
+        cache.id_of_slot,
+        cache.usage,
+        cache.step,
+        evict_slots,
+        src_indices,
+        num_indices,
+        cache.joint_prefill_lru_stats[layer_id],
+        layer_id,
+        next_layer,
+        protected_start_layer * cache.num_experts,
+        protected_end_layer * cache.num_experts,
+        expert_ids.numel(),
+        num_layers=cache.num_layers,
+        num_experts=cache.num_experts,
+        cache_size=cache.decode_cache_size,
+        BLOCK_E=block_e,
+        BLOCK_C=block_c,
+        COLLECT_STATS=True,
+        PROTECT_ID_RANGE=True,
+        ZERO_DISTANCE_IS_FULL_CYCLE=False,
+        FULL_LAYER_QUERY=True,
         num_warps=8 if block_c >= 2048 else 4,
     )
 
@@ -274,9 +330,18 @@ def _reset_cache_kernel(
         tl.store(num_indices_ptr, 0)
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active"])
-def _ensure_decode_experts_layer_distance_kernel(
+@triton.jit(
+    do_not_specialize=[
+        "layer_id",
+        "next_layer",
+        "protected_id_start",
+        "protected_id_end",
+        "num_active",
+    ]
+)
+def _ensure_experts_layer_distance_kernel(
     expert_ids_ptr,
+    out_indices_ptr,
     slot_for_id_ptr,
     id_of_slot_ptr,
     usage_ptr,
@@ -286,6 +351,9 @@ def _ensure_decode_experts_layer_distance_kernel(
     num_indices_ptr,
     stats_ptr,
     layer_id,
+    next_layer,
+    protected_id_start,
+    protected_id_end,
     num_active,
     num_layers: tl.constexpr,
     num_experts: tl.constexpr,
@@ -293,13 +361,16 @@ def _ensure_decode_experts_layer_distance_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     COLLECT_STATS: tl.constexpr,
+    PROTECT_ID_RANGE: tl.constexpr,
+    ZERO_DISTANCE_IS_FULL_CYCLE: tl.constexpr,
+    FULL_LAYER_QUERY: tl.constexpr,
 ):
-    """One-launch decode admission with causal layer-distance replacement.
+    """One-launch admission with causal layer-distance replacement.
 
-    The current layer's next reuse is a full layer cycle away.  For an owner layer
-    ``x``, distance is therefore ``(x - layer_id) mod num_layers`` with zero mapped
-    to ``num_layers``.  Empty slots win first; filled victims order by distance
-    descending, then usage and physical slot ascending.
+    Empty slots win first. Filled victims order by distance descending, then
+    usage and physical slot ascending. Decode maps distance zero to a full cycle
+    because non-query experts from the current layer have just missed their turn;
+    resident admission instead measures directly from its next causal layer.
     """
     usage_max: tl.constexpr = 9223372036854775807
     base = layer_id * num_experts
@@ -310,11 +381,14 @@ def _ensure_decode_experts_layer_distance_kernel(
     # dedup matrix while accepting arbitrary routed-query length K.
     off_e = tl.arange(0, BLOCK_E)
     expert_lane = off_e < num_experts
-    active = tl.zeros((BLOCK_E,), dtype=tl.int1)
-    for i in tl.range(num_active):
-        expert = tl.load(expert_ids_ptr + i)
-        active = active | (off_e == expert)
-    active = active & expert_lane
+    if FULL_LAYER_QUERY:
+        active = expert_lane
+    else:
+        active = tl.zeros((BLOCK_E,), dtype=tl.int1)
+        for i in tl.range(num_active):
+            expert = tl.load(expert_ids_ptr + i)
+            active = active | (off_e == expert)
+        active = active & expert_lane
 
     slot = tl.load(
         slot_for_id_ptr + base + off_e, mask=expert_lane, other=-1
@@ -339,19 +413,32 @@ def _ensure_decode_experts_layer_distance_kernel(
 
         # Hits from this query cannot be evicted even if their usage store has not
         # become visible to the vector reload yet.
-        owner_active = tl.zeros((BLOCK_C,), dtype=tl.int1)
-        for i in tl.range(num_active):
-            expert = tl.load(expert_ids_ptr + i)
-            owner_active = owner_active | (owner == base + expert)
-        eligible = cache_lane & (~owner_active) & (usage != usage_max)
+        if FULL_LAYER_QUERY:
+            owner_active = (owner >= base) & (owner < base + num_experts)
+        else:
+            owner_active = tl.zeros((BLOCK_C,), dtype=tl.int1)
+            for i in tl.range(num_active):
+                expert = tl.load(expert_ids_ptr + i)
+                owner_active = owner_active | (owner == base + expert)
+        protected = tl.zeros((BLOCK_C,), dtype=tl.int1)
+        if PROTECT_ID_RANGE:
+            protected = (owner >= protected_id_start) & (owner < protected_id_end)
+        eligible = (
+            cache_lane & (~owner_active) & (~protected) & (usage != usage_max)
+        )
 
         for rank in tl.range(num_missing):
             empty = eligible & (owner < 0)
             has_empty = tl.sum(empty.to(tl.int32)) > 0
 
             owner_layer = owner // num_experts
-            distance = owner_layer - layer_id
-            distance = tl.where(distance <= 0, distance + num_layers, distance)
+            distance = owner_layer - next_layer
+            if ZERO_DISTANCE_IS_FULL_CYCLE:
+                distance = tl.where(
+                    distance <= 0, distance + num_layers, distance
+                )
+            else:
+                distance = tl.where(distance < 0, distance + num_layers, distance)
             filled_distance = tl.where(
                 eligible & (owner >= 0), distance, -1
             )
@@ -383,11 +470,17 @@ def _ensure_decode_experts_layer_distance_kernel(
             tl.store(src_indices_ptr + rank, expert)
             eligible = eligible & (off_c != victim)
 
-    # In-place rewrite is safe: every query read above precedes these stores.
-    for i in tl.range(num_active):
-        expert = tl.load(expert_ids_ptr + i)
-        resident_slot = tl.load(slot_for_id_ptr + base + expert)
-        tl.store(expert_ids_ptr + i, resident_slot)
+    # In-place decode rewrite is safe: every query read above precedes these stores.
+    if FULL_LAYER_QUERY:
+        resident_slot = tl.load(
+            slot_for_id_ptr + base + off_e, mask=expert_lane, other=-1
+        )
+        tl.store(out_indices_ptr + off_e, resident_slot, mask=expert_lane)
+    else:
+        for i in tl.range(num_active):
+            expert = tl.load(expert_ids_ptr + i)
+            resident_slot = tl.load(slot_for_id_ptr + base + expert)
+            tl.store(out_indices_ptr + i, resident_slot)
 
     if COLLECT_STATS:
         stat_lane = tl.arange(0, 4)
