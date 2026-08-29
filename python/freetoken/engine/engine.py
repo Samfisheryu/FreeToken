@@ -1008,38 +1008,18 @@ class Engine:
             batch.active_table_idx = input_mapping[0][:decode_rows].view(-1)
         self.attn_backend.prepare_metadata(batch)
 
-    def prepare_execution_metadata_view(
-        self,
-        source: Batch,
-        target: Batch,
-    ) -> bool:
-        """Build backend-owned metadata for an allocation-free execution view."""
-        if self.linear_state_pool is not None:
-            from freetoken.attention.linear import FLAMetadata
-
-            source_metadata = source.fla_metadata
-            if source_metadata is None:
-                raise RuntimeError("source batch is missing linear attention metadata")
-            if target.is_decode_only:
-                if source_metadata.decode is None:
-                    raise RuntimeError("source batch has no linear decode metadata")
-                target.linear_table_idx = source_metadata.decode.cache_indices
-                target.fla_metadata = FLAMetadata(decode=source_metadata.decode)
-            elif target.has_prefill:
-                if source_metadata.prefill is None:
-                    raise RuntimeError("source batch has no linear prefill metadata")
-                target.fla_metadata = FLAMetadata(prefill=source_metadata.prefill)
-        return self.attn_backend.prepare_metadata_view(source, target)
-
     def capture_stable_decode_state(self, batch: Batch) -> object | None:
-        if (
-            self.linear_state_pool is not None
-            or not self.graph_runner.can_use_cuda_graph(batch)
-        ):
+        adapter = self._layered_execution_adapter
+        if adapter is not None:
+            return adapter.capture_stable_decode_state(batch)
+        if not self.graph_runner.can_use_cuda_graph(batch):
             return None
         return self.attn_backend.capture_stable_decode_state(batch)
 
     def restore_stable_decode_state(self, batch: Batch, state: object) -> bool:
+        adapter = self._layered_execution_adapter
+        if adapter is not None:
+            return adapter.restore_stable_decode_state(batch, state)
         return self.attn_backend.restore_stable_decode_state(batch, state)
 
     @property
@@ -1330,12 +1310,10 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     # 'naive' stays naive with the pool's swa currency riding swa_paged.
     if getattr(config, "cache_type", "radix") != "naive":
         override("cache_type", "swa_radix")
-    # 'radix' (SWARadixCache on the full-loc currency, carry-aware re-prefill) is the default and is
-    # honored, as is an explicit 'naive'. Don't let max_extend_tokens force a second chunk within
-    # one prompt (the pool's prefill_chunk_budget still chunks prompts larger than the window
-    # pool); prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
-    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
-        override("max_extend_tokens", config.max_seq_len)
+    # 'radix' (SWARadixCache on the full-loc currency, carry-aware re-prefill) is
+    # the default and is honored, as is an explicit 'naive'. Layered-pipeline
+    # uses max_extend_tokens as its physical row-tile limit; legacy scheduling
+    # continues to chunk through PrefillAdder.
 
     # DSV4 decode batches at most max_running_req rows; its full-loc snapshot is sized to that,
     # so a graph bs above it would exceed the backend's captured snapshot rows. Clamp any

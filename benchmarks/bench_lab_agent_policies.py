@@ -987,7 +987,7 @@ class PublicServer:
         process_group: int,
         timeout: float,
     ) -> list[int]:
-        """Return live members left at the deadline; zombies count as drained."""
+        """Wait for live group members to drain; zombies count as exited."""
         deadline = time.monotonic() + timeout
         while True:
             members = cls._live_process_group_members(process_group)
@@ -1016,29 +1016,30 @@ class PublicServer:
         if process.poll() is None:
             process.terminate()
         try:
-            process.wait(timeout=30)
+            process.wait(timeout=self.timeout)
         except subprocess.TimeoutExpired:
             # The parent did not complete its owned shutdown. Fall back to the exact session
             # process group so no descendant can outlive this benchmark server.
             self._signal_process_group(process_group, signal.SIGTERM)
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._signal_process_group(process_group, signal.SIGKILL)
-                process.wait(timeout=10)
 
         live_members = self._wait_for_process_group_exit(
             process_group,
-            timeout=5,
+            timeout=self.timeout,
         )
         if not live_members:
+            process.wait(timeout=0)
             return
         # A returned parent with live group members is an abnormal incomplete shutdown.
         self._signal_process_group(process_group, signal.SIGKILL)
         live_members = self._wait_for_process_group_exit(
             process_group,
-            timeout=10,
+            timeout=self.timeout,
         )
+        if process.poll() is None:
+            try:
+                process.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                pass
         if live_members:
             raise RuntimeError(
                 f"server process group {process_group} still has live members after "

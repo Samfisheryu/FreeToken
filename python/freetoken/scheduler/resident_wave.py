@@ -161,7 +161,7 @@ class ResidentWaveAdmission:
         }
 
     def record_materialized_requests(self, reqs: list[Req]) -> None:
-        """Attach the one physical request segment materialized for each member."""
+        """Attach the one logical request range materialized for each member."""
         for req in reqs:
             member = self.members.get(req.uid)
             if member is None:

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, List, Tuple
 
 import torch
-from freetoken.core import Req
+from freetoken.core import Batch, Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
 from freetoken.utils import align_down, div_ceil
 
@@ -44,6 +44,144 @@ class _DecodePageReservation:
     allocated: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _DeferredPrefillAllocation:
+    first_pos: int
+    last_pos: int
+    allocated: torch.Tensor
+
+
+class _PrefillExecutionSession:
+    """Cache-owned SWA bindings replayed for each resident expert stage."""
+
+    def __init__(self, manager: CacheManager, reqs: List[Req]) -> None:
+        self._manager = manager
+        self._owners = {req.table_idx: req for req in reqs}
+        if len(self._owners) != len(reqs):
+            raise RuntimeError("layered prefill requests must have distinct page-table rows")
+        self._deferred: dict[int, _DeferredPrefillAllocation] = {}
+        self._initial_pos = {req.table_idx: req.cached_len for req in reqs}
+        self._next_pos = dict(self._initial_pos)
+        self._evicted_pos = {
+            req.table_idx: max(
+                req.swa_evicted_seqlen,
+                req.cache_handle.cached_len,
+            )
+            for req in reqs
+        }
+        self._initial_evicted_pos = dict(self._evicted_pos)
+        self._active_signature: tuple[tuple[int, int, int], ...] | None = None
+        self._closed = False
+
+    def owns(self, req: Req) -> bool:
+        return req.table_idx in self._owners
+
+    def record_allocation(
+        self,
+        req: Req,
+        first_page: int,
+        last_page: int,
+        allocated: torch.Tensor,
+    ) -> None:
+        if not self.owns(req):
+            raise RuntimeError("prefill execution received an unowned allocation")
+        if req.table_idx in self._deferred:
+            raise RuntimeError("prefill execution allocated one request more than once")
+        first_pos = first_page * self._manager.page_size
+        last_pos = last_page * self._manager.page_size
+        if int(allocated.numel()) != last_pos - first_pos:
+            raise RuntimeError("prefill execution allocation has the wrong page span")
+        self._deferred[req.table_idx] = _DeferredPrefillAllocation(
+            first_pos=first_pos,
+            last_pos=last_pos,
+            allocated=allocated,
+        )
+
+    def activate(self, reqs: Iterable[Req]) -> None:
+        """Release the prior window and bind the next tile's allocated pages."""
+        if self._closed:
+            raise RuntimeError("prefill execution session is closed")
+        tile_reqs = list(reqs)
+        signature = tuple(
+            (req.table_idx, req.cached_len, req.device_len) for req in tile_reqs
+        )
+        if signature == self._active_signature:
+            return
+
+        for req in tile_reqs:
+            owner = self._owners.get(req.table_idx)
+            if owner is None:
+                raise RuntimeError("prefill tile contains a request outside its logical wave")
+            expected = self._next_pos[req.table_idx]
+            if req.cached_len != expected or req.device_len <= req.cached_len:
+                raise RuntimeError(
+                    "prefill tiles must advance each request contiguously"
+                )
+
+        manager = self._manager
+        page_size = manager.page_size
+        for table_idx, _, device_len in self._active_signature or ():
+            new_evicted = align_down(
+                device_len - manager.sliding_window_size - page_size,
+                page_size,
+            )
+            start = self._evicted_pos[table_idx]
+            if new_evicted > start:
+                manager._free_swa(manager.page_table[table_idx, start:new_evicted])
+                self._evicted_pos[table_idx] = new_evicted
+
+        bindings: list[torch.Tensor] = []
+        for req in tile_reqs:
+            deferred = self._deferred.get(req.table_idx)
+            if deferred is None:
+                continue
+            first_pos = max(
+                div_ceil(req.cached_len, page_size) * page_size,
+                deferred.first_pos,
+            )
+            last_pos = min(
+                div_ceil(req.device_len, page_size) * page_size,
+                deferred.last_pos,
+            )
+            if last_pos > first_pos:
+                offset = first_pos - deferred.first_pos
+                bindings.append(deferred.allocated[offset : offset + last_pos - first_pos])
+
+        for allocated in bindings:
+            manager._bind_swa(allocated)
+        for req in tile_reqs:
+            self._next_pos[req.table_idx] = req.device_len
+        self._active_signature = signature
+
+    def rewind(self) -> None:
+        """Return session-owned bindings and replay the same tiles at the next stage."""
+        if self._closed:
+            raise RuntimeError("prefill execution session is closed")
+        for deferred in self._deferred.values():
+            self._manager._free_swa(deferred.allocated)
+        self._next_pos = dict(self._initial_pos)
+        self._evicted_pos = dict(self._initial_evicted_pos)
+        self._active_signature = None
+
+    def close(self) -> None:
+        if not self._closed:
+            for table_idx, owner in self._owners.items():
+                owner.swa_evicted_seqlen = max(
+                    owner.swa_evicted_seqlen,
+                    self._evicted_pos[table_idx],
+                )
+            self._closed = True
+            self._manager._close_prefill_execution(self)
+
+    def cancel(self) -> None:
+        if self._closed:
+            return
+        for deferred in self._deferred.values():
+            self._manager._free_swa(deferred.allocated)
+        self._closed = True
+        self._manager._close_prefill_execution(self)
+
+
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None):
@@ -77,6 +215,7 @@ class CacheManager:
         self.page_size = page_size
         self.cache_type = type
         self._decode_page_reservations: dict[Req, _DecodePageReservation] = {}
+        self._prefill_execution: _PrefillExecutionSession | None = None
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -272,6 +411,40 @@ class CacheManager:
                 self._free_swa(self.page_table[req.table_idx, start:new_evicted])
                 req.swa_evicted_seqlen = new_evicted
 
+    def open_prefill_execution(self, batch: Batch) -> _PrefillExecutionSession | None:
+        """Open incremental SWA bindings when a logical prefill exceeds the pool budget."""
+        if not self.swa_paged or self.prefill_chunk_budget is None:
+            return None
+        binding_limit = int(self.prefill_chunk_budget)
+        if binding_limit < 1:
+            raise RuntimeError("prefill execution budget must be positive")
+        if batch.log_new_tokens <= binding_limit:
+            return None
+        reqs = batch.prefill_reqs
+        if self._prefill_execution is not None:
+            raise RuntimeError("a prefill execution session is already active")
+        session = _PrefillExecutionSession(self, reqs)
+        self._prefill_execution = session
+        return session
+
+    def incremental_prefill_window_reservation(self, extend_len: int) -> int | None:
+        """SWA slots reserved per request when a cache session binds the range incrementally."""
+        if (
+            not self.swa_paged
+            or self.prefill_chunk_budget is None
+            or self.sliding_window_size is None
+        ):
+            return None
+        return div_ceil(
+            min(max(extend_len, 1), self.sliding_window_size) + 1,
+            self.page_size,
+        ) * self.page_size
+
+    def _close_prefill_execution(self, session: _PrefillExecutionSession) -> None:
+        if self._prefill_execution is not session:
+            raise RuntimeError("closing an inactive prefill execution session")
+        self._prefill_execution = None
+
     def lock(self, handle: BaseCacheHandle) -> None:
         if self.is_swa:
             # records the window boundary on the (frozen) handle for unlock/dec_lock.
@@ -298,6 +471,7 @@ class CacheManager:
     def allocate_paged(self, reqs: List[Req]) -> None:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
+        allocation_reqs: List[Req] = []
         for req in reqs:
             first_page = div_ceil(req.cached_len, self.page_size)
             last_page = div_ceil(req.device_len, self.page_size)
@@ -311,8 +485,34 @@ class CacheManager:
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
+                allocation_reqs.append(req)
         if needed_pages > 0:
-            self._allocate_paged_rows(needed_pages, allocation_info)
+            execution = self._prefill_execution
+            if execution is None or not any(execution.owns(req) for req in allocation_reqs):
+                self._allocate_paged_rows(needed_pages, allocation_info)
+                return
+
+            allocated = self._allocate_paged_rows(
+                needed_pages,
+                allocation_info,
+                bind_swa=False,
+            )
+            offset = 0
+            for req, (_, first_page, last_page) in zip(
+                allocation_reqs, allocation_info, strict=True
+            ):
+                length = (last_page - first_page) * self.page_size
+                req_allocated = allocated[offset : offset + length]
+                if execution.owns(req):
+                    execution.record_allocation(
+                        req,
+                        first_page,
+                        last_page,
+                        req_allocated,
+                    )
+                else:
+                    self._bind_swa(req_allocated)
+                offset += length
 
     def reserve_next_decode(self, reqs: List[Req]) -> None:
         """Reserve the next query pages while the current decode graph is running.
@@ -362,18 +562,24 @@ class CacheManager:
         self,
         needed_pages: int,
         allocation_info: List[Tuple[int, int, int]],
+        *,
+        bind_swa: bool = True,
     ) -> torch.Tensor:
         allocated = self._page_to_token(self._allocate(needed_pages))
-        if self.swa_paged:
-            # Each newly-allocated full token needs a swa-pool slot (where its SWA-layer KV is
-            # written; read back via the full->swa mapping). radix reuses the existing prefix's
-            # (live, mapped) swa slots and evicts tree swa if the pool is short; naive has no
-            # tree (the pool is sized concurrency x window so it always fits).
-            if self.is_swa:
-                self.ensure_swa_slots(len(allocated))
-            self.swa_pool.alloc_swa(allocated)
+        if bind_swa:
+            self._bind_swa(allocated)
         _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
         return allocated
+
+    def _bind_swa(self, allocated: torch.Tensor) -> None:
+        if not self.swa_paged or allocated.numel() == 0:
+            return
+        # Each newly-allocated full token needs a swa-pool slot (where its SWA-layer KV is
+        # written; read back via the full->swa mapping). radix reuses the existing prefix's
+        # live slots and evicts tree swa if the pool is short; naive has no tree.
+        if self.is_swa:
+            self.ensure_swa_slots(len(allocated))
+        self.swa_pool.alloc_swa(allocated)
 
     @staticmethod
     def _reservation_matches(

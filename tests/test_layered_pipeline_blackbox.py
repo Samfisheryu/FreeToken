@@ -29,6 +29,14 @@ NUM_LAYERS = 8
 NUM_EXPERTS = 8
 QWEN36_MODEL_PATH = Path("/data1/lmcache_kv/models/Qwen3.6-35B-A3B")
 DSV4_MODEL_PATH = Path("/data1/lmcache_kv/models/DeepSeek-V4-Flash-0731")
+DSV4_NOWAG_EXPERT_PATH = Path(
+    "/data1/lmcache_kv/nowag_4090_experiment/quantized/"
+    "dsv4_expert_only_global_d6b12_wikitext2_train_seed0_128x2048_kpp5"
+)
+DSV4_NOWAG_PLUGIN_SRC = Path(
+    "/home/nengneng/AIPrometheus/servebig/servebig-project/"
+    ".kernel-worktrees/nowag_final2_tail64_profile/src"
+)
 
 for import_root in (str(PYTHON_ROOT), str(PROJECT_ROOT)):
     if import_root not in sys.path:
@@ -44,12 +52,26 @@ PIPELINE_WAVE_PATTERN = re.compile(
     r"prefill_layer_prepares=(?P<prefill_layer_prepares>\d+)"
     r"(?:\r?\n|$)"
 )
+PIPELINE_ITERATION_LIMIT_PATTERN = re.compile(
+    r"Layered pipeline iteration limit: "
+    r"requested_tokens=(?P<requested_tokens>\d+), "
+    r"effective_tokens=(?P<effective_tokens>\d+), "
+    r"event=(?P<event>startup|cache_rebuild|rollback)"
+    r"(?:\r?\n|$)"
+)
 PIPELINE_WAVE_FIELDS = {
     "reqs",
     "groups",
     "group_forwards",
     "iterations",
     "decode_iterations",
+    "prefill_layer_prepares",
+}
+PIPELINE_CROSS_GRAPH_STRUCTURE_FIELDS = {
+    "reqs",
+    "groups",
+    "group_forwards",
+    "iterations",
     "prefill_layer_prepares",
 }
 MOE_STATS_FIELDS = {
@@ -262,9 +284,14 @@ def _real_model_service_command(
     port: int,
     attention_backend: str,
     cuda_graph_max_bs: int,
-    num_tokens: int,
+    num_tokens: int | None,
+    max_prefill_length: int = 32,
+    max_seq_len_override: int = 4_096,
+    wave_max_chunks: int = 8,
+    max_running_requests: int = 8,
+    memory_ratio: float | None = None,
 ) -> list[str]:
-    return [
+    command = [
         str(_ft_executable()),
         "serve",
         "--model-path",
@@ -278,13 +305,11 @@ def _real_model_service_command(
         "--dtype",
         "bfloat16",
         "--max-running-requests",
-        "8",
+        str(max_running_requests),
         "--max-seq-len-override",
-        "4096",
-        "--num-tokens",
-        str(num_tokens),
+        str(max_seq_len_override),
         "--max-prefill-length",
-        "32",
+        str(max_prefill_length),
         "--attention-backend",
         attention_backend,
         "--moe-backend",
@@ -301,9 +326,17 @@ def _real_model_service_command(
         "--prefill-layer-group-size",
         "1",
         "--prefill-wave-max-chunks",
-        "8",
+        str(wave_max_chunks),
         "--moe-collect-stats",
     ]
+    insertion_index = command.index("--max-prefill-length")
+    planner_arguments = []
+    if num_tokens is not None:
+        planner_arguments.extend(["--num-tokens", str(num_tokens)])
+    if memory_ratio is not None:
+        planner_arguments.extend(["--memory-ratio", str(memory_ratio)])
+    command[insertion_index:insertion_index] = planner_arguments
+    return command
 
 
 def _completion_payload(
@@ -597,6 +630,40 @@ def _records(log_path: Path) -> list[dict[str, int]]:
     return _records_from_text(_log_text(log_path))
 
 
+def _iteration_limits_from_text(
+    content: str,
+) -> list[dict[str, int | str]]:
+    limits: list[dict[str, int | str]] = []
+    for match in PIPELINE_ITERATION_LIMIT_PATTERN.finditer(content):
+        requested_tokens = int(match.group("requested_tokens"))
+        effective_tokens = int(match.group("effective_tokens"))
+        assert requested_tokens > 0
+        assert 0 < effective_tokens <= requested_tokens
+        limits.append(
+            {
+                "requested_tokens": requested_tokens,
+                "effective_tokens": effective_tokens,
+                "event": match.group("event"),
+            }
+        )
+    return limits
+
+
+def _latest_iteration_token_limit(
+    content: str,
+    *,
+    requested_tokens: int,
+) -> int:
+    limits = _iteration_limits_from_text(content)
+    assert limits, "service emitted no public pipeline iteration limit"
+    assert any(limit["event"] == "startup" for limit in limits)
+    latest = limits[-1]
+    assert latest["requested_tokens"] == requested_tokens
+    effective_tokens = latest["effective_tokens"]
+    assert type(effective_tokens) is int
+    return effective_tokens
+
+
 def _wait_for_pipeline_requests(
     log_path: Path,
     *,
@@ -661,9 +728,10 @@ def _assert_pipeline_wave(
     group_size: int,
     cache_size: int,
     expected_reqs: int | None = None,
+    expected_tiles: int | None = 1,
     num_layers: int = NUM_LAYERS,
     num_experts: int = NUM_EXPERTS,
-) -> None:
+) -> int:
     assert set(wave) == PIPELINE_WAVE_FIELDS
     assert all(
         type(wave[field]) is int and wave[field] >= 0
@@ -680,10 +748,48 @@ def _assert_pipeline_wave(
     )
     groups = math.ceil(num_layers / effective_group_size)
     assert wave["groups"] == groups
-    assert wave["group_forwards"] == groups
-    assert wave["iterations"] == groups
-    assert 0 <= wave["decode_iterations"] <= groups
+    assert wave["group_forwards"] > 0
+    assert wave["group_forwards"] % groups == 0
+    tiles = wave["group_forwards"] // groups
+    if expected_tiles is not None:
+        assert tiles == expected_tiles
+    assert wave["iterations"] == wave["group_forwards"]
+    assert 0 <= wave["decode_iterations"] <= wave["iterations"]
     assert wave["prefill_layer_prepares"] == num_layers
+    return tiles
+
+
+def _assert_fifo_packed_waves(
+    waves: list[dict[str, int]],
+    *,
+    request_prefill_tokens: list[int],
+    iteration_token_limit: int,
+    group_size: int,
+    cache_size: int,
+    num_layers: int = NUM_LAYERS,
+    num_experts: int = NUM_EXPERTS,
+) -> None:
+    request_cursor = 0
+    for wave in waves:
+        request_count = wave["reqs"]
+        wave_prefill_tokens = request_prefill_tokens[
+            request_cursor : request_cursor + request_count
+        ]
+        assert len(wave_prefill_tokens) == request_count
+        expected_tiles = math.ceil(
+            sum(wave_prefill_tokens) / iteration_token_limit
+        )
+        _assert_pipeline_wave(
+            wave,
+            group_size=group_size,
+            cache_size=cache_size,
+            expected_reqs=request_count,
+            expected_tiles=expected_tiles,
+            num_layers=num_layers,
+            num_experts=num_experts,
+        )
+        request_cursor += request_count
+    assert request_cursor == len(request_prefill_tokens)
 
 
 def _assert_pipeline_structure(
@@ -1163,6 +1269,10 @@ def test_public_parameter_matrix_and_admission_boundaries(
         cache_size=cache_size,
         readiness_prompt_text=readiness_prompt,
     ) as (base_url, service_log, process):
+        iteration_token_limit = _latest_iteration_token_limit(
+            _log_text(service_log),
+            requested_tokens=max_prefill_length,
+        )
         sequential_offset = len(_records(service_log))
         if max_prefill_length <= 512:
             token_lengths = [
@@ -1188,6 +1298,7 @@ def test_public_parameter_matrix_and_admission_boundaries(
             token_lengths = [2_048]
 
         observed_ks = []
+        actual_new_prefill_tokens = []
         for request_index, prompt_tokens in enumerate(token_lengths):
             prompt = scaled_prompt_materializer(
                 prompt_tokens,
@@ -1208,6 +1319,7 @@ def test_public_parameter_matrix_and_admission_boundaries(
                 _usage(response)["prompt_tokens"]
                 - _usage(response)["cached_tokens"]
             )
+            actual_new_prefill_tokens.append(actual_new_prefill)
             observed_ks.append(
                 math.ceil(actual_new_prefill / max_prefill_length)
             )
@@ -1218,12 +1330,18 @@ def test_public_parameter_matrix_and_admission_boundaries(
             expected_requests=len(token_lengths),
         )
         assert len(sequential_waves) == len(token_lengths)
-        for wave in sequential_waves:
+        for wave, actual_new_prefill in zip(
+            sequential_waves,
+            actual_new_prefill_tokens,
+        ):
             _assert_pipeline_wave(
                 wave,
                 group_size=requested_group_size,
                 cache_size=cache_size,
                 expected_reqs=1,
+                expected_tiles=math.ceil(
+                    actual_new_prefill / iteration_token_limit
+                ),
             )
         assert observed_ks == [
             math.ceil(prompt_tokens / max_prefill_length)
@@ -1270,10 +1388,18 @@ def test_public_parameter_matrix_and_admission_boundaries(
             else wave_max_chunks // concurrent_k
         )
         for wave in concurrent_waves:
+            expected_tiles = math.ceil(
+                (
+                    wave["reqs"]
+                    * concurrent_prompt_tokens
+                )
+                / iteration_token_limit
+            )
             _assert_pipeline_wave(
                 wave,
                 group_size=requested_group_size,
                 cache_size=cache_size,
+                expected_tiles=expected_tiles,
             )
             assert wave["reqs"] <= max_wave_reqs
         assert sum(wave["reqs"] for wave in concurrent_waves) == concurrency
@@ -1314,6 +1440,9 @@ def test_public_parameter_matrix_and_admission_boundaries(
                 group_size=requested_group_size,
                 cache_size=cache_size,
                 expected_reqs=1,
+                expected_tiles=math.ceil(
+                    16 / iteration_token_limit
+                ),
             )
         assert process.poll() is None
 
@@ -1341,6 +1470,10 @@ def test_first_sse_ragged_fifo_cached_and_repeated_lifecycle(
         cache_size=cache_size,
         readiness_prompt_text=readiness_prompt,
     ) as (base_url, service_log, process):
+        iteration_token_limit = _latest_iteration_token_limit(
+            _log_text(service_log),
+            requested_tokens=max_prefill_length,
+        )
         wave_offset = len(_records(service_log))
         driver_prompt = scaled_prompt_materializer(
             128, 300_000, "ragged-driver", 0
@@ -1388,19 +1521,29 @@ def test_first_sse_ragged_fifo_cached_and_repeated_lifecycle(
         )
         assert waves[0]["reqs"] == 1
         assert waves[0]["decode_iterations"] == 0
+        _assert_pipeline_wave(
+            waves[0],
+            group_size=group_size,
+            cache_size=cache_size,
+            expected_reqs=1,
+            expected_tiles=math.ceil(
+                128 / iteration_token_limit
+            ),
+        )
         burst_waves = waves[1:]
         assert burst_waves
         assert sum(wave["reqs"] for wave in burst_waves) == len(ragged_ks)
         assert all(1 <= wave["reqs"] <= len(ragged_ks) for wave in burst_waves)
         assert any(
-            wave["decode_iterations"] == wave["groups"]
+            wave["decode_iterations"] == wave["iterations"]
             for wave in burst_waves
         )
-        for wave in waves:
+        for wave in burst_waves:
             _assert_pipeline_wave(
                 wave,
                 group_size=group_size,
                 cache_size=cache_size,
+                expected_tiles=None,
             )
 
         tokenizer = load_tokenizer(scaled_model)
@@ -1460,6 +1603,55 @@ def test_first_sse_ragged_fifo_cached_and_repeated_lifecycle(
         )
         assert pure_decode_usage["cached_tokens"] > 0
 
+        packed_ragged_offset = len(_records(service_log))
+        packed_ragged_lengths = [
+            max_prefill_length - 1,
+            max_prefill_length - 1,
+            max_prefill_length + 1,
+            max_prefill_length + 1,
+        ]
+        packed_ragged_payloads = [
+            _completion_payload(
+                scaled_prompt_materializer(
+                    prompt_tokens,
+                    300_250 + request_index,
+                    f"static-ragged-{prompt_tokens}-{request_index}",
+                    13 + request_index,
+                ),
+                max_tokens=1,
+                stream=False,
+            )
+            for request_index, prompt_tokens in enumerate(
+                packed_ragged_lengths
+            )
+        ]
+        packed_ragged_responses = _run_staggered_batch(
+            base_url,
+            packed_ragged_payloads,
+            interval_seconds=0.005,
+        )
+        for response, prompt_tokens in zip(
+            packed_ragged_responses,
+            packed_ragged_lengths,
+        ):
+            _assert_nonstream_completion(
+                response,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=1,
+            )
+        packed_ragged_waves = _wait_for_pipeline_requests(
+            service_log,
+            offset=packed_ragged_offset,
+            expected_requests=len(packed_ragged_lengths),
+        )
+        _assert_fifo_packed_waves(
+            packed_ragged_waves,
+            request_prefill_tokens=packed_ragged_lengths,
+            iteration_token_limit=iteration_token_limit,
+            group_size=group_size,
+            cache_size=cache_size,
+        )
+
         not_fit_offset = len(_records(service_log))
         not_fit_ks = [9, 8]
         not_fit_payloads = [
@@ -1492,13 +1684,16 @@ def test_first_sse_ragged_fifo_cached_and_repeated_lifecycle(
             expected_requests=2,
         )
         assert len(not_fit_waves) == 2
-        for wave in not_fit_waves:
-            _assert_pipeline_wave(
-                wave,
-                group_size=group_size,
-                cache_size=cache_size,
-                expected_reqs=1,
-            )
+        _assert_fifo_packed_waves(
+            not_fit_waves,
+            request_prefill_tokens=[
+                k_value * max_prefill_length
+                for k_value in not_fit_ks
+            ],
+            iteration_token_limit=iteration_token_limit,
+            group_size=group_size,
+            cache_size=cache_size,
+        )
 
         oversized_offset = len(_records(service_log))
         oversized_and_following_ks = [17, 8, 8]
@@ -1537,17 +1732,22 @@ def test_first_sse_ragged_fifo_cached_and_repeated_lifecycle(
         )
         assert oversized_waves[0]["reqs"] == 1
         assert sum(wave["reqs"] for wave in oversized_waves) == 3
-        for wave in oversized_waves:
-            _assert_pipeline_wave(
-                wave,
-                group_size=group_size,
-                cache_size=cache_size,
-            )
+        _assert_fifo_packed_waves(
+            oversized_waves,
+            request_prefill_tokens=[
+                k_value * max_prefill_length
+                for k_value in oversized_and_following_ks
+            ],
+            iteration_token_limit=iteration_token_limit,
+            group_size=group_size,
+            cache_size=cache_size,
+        )
         for wave in _records(service_log)[wave_offset:]:
             _assert_pipeline_wave(
                 wave,
                 group_size=group_size,
                 cache_size=cache_size,
+                expected_tiles=None,
             )
         assert process.poll() is None
 
@@ -1576,6 +1776,10 @@ def _exercise_graph_configuration(
         cuda_graph_max_bs=cuda_graph_max_bs,
         readiness_prompt_text=readiness_prompt,
     ) as (base_url, service_log, process):
+        iteration_token_limit = _latest_iteration_token_limit(
+            _log_text(service_log),
+            requested_tokens=128,
+        )
         all_waves = []
         first_token_bases = {1: 0, 4: 1, 8: 5}
         for batch_size, prompt_tokens in ((1, 128), (4, 256), (8, 512)):
@@ -1617,6 +1821,11 @@ def _exercise_graph_configuration(
                     wave,
                     group_size=2,
                     cache_size=24,
+                    expected_tiles=math.ceil(
+                        wave["reqs"]
+                        * prompt_tokens
+                        / iteration_token_limit
+                    ),
                 )
             assert sum(wave["reqs"] for wave in waves) == batch_size
             observations["batches"][batch_size] = batch_observations
@@ -1699,6 +1908,10 @@ def _exercise_real_model_backend(
         wait_for_snapshot_count(server, minimum=1, timeout=600.0)
         readiness_cursor = len(_records_from_text(server.log_tail()))
         assert readiness_cursor >= 1
+        iteration_token_limit = _latest_iteration_token_limit(
+            server.log_tail(),
+            requested_tokens=32,
+        )
         server.mark_measurement_start()
         wave_offset = len(_records_from_text(server.log_tail()))
         assert wave_offset >= readiness_cursor
@@ -1728,14 +1941,12 @@ def _exercise_real_model_backend(
             prompt_tokens=32,
             completion_tokens=16,
         )
-        prefill_outputs = [
+        for result in prefill_results:
             _assert_stream_completion(
                 result,
                 prompt_tokens=64,
                 completion_tokens=1,
             )
-            for result in prefill_results
-        ]
         results = [driver_result, *prefill_results]
         assert sum(_usage(result)["prompt_tokens"] for result in results) == 160
         assert sum(
@@ -1755,6 +1966,7 @@ def _exercise_real_model_backend(
             group_size=1,
             cache_size=512,
             expected_reqs=1,
+            expected_tiles=math.ceil(32 / iteration_token_limit),
             num_layers=num_layers,
             num_experts=num_experts,
         )
@@ -1764,12 +1976,15 @@ def _exercise_real_model_backend(
             group_size=1,
             cache_size=512,
             expected_reqs=2,
+            expected_tiles=math.ceil(128 / iteration_token_limit),
             num_layers=num_layers,
             num_experts=num_experts,
         )
-        assert 0 < second_wave["decode_iterations"] <= num_layers
+        assert 0 < second_wave["decode_iterations"] <= second_wave[
+            "iterations"
+        ]
         return {
-            "outputs": [driver_output, *prefill_outputs],
+            "driver_output": driver_output,
             "usages": [_usage(result) for result in results],
             "waves": waves,
         }
@@ -1778,6 +1993,279 @@ def _exercise_real_model_backend(
         raise
     finally:
         server.stop()
+
+
+def _exercise_activation_budgeted_dsv4(
+    model_path: Path,
+    prompts: dict[str, Any],
+    *,
+    cuda_graph_max_bs: int,
+) -> dict[str, Any]:
+    from benchmarks.bench_real_conversation_concurrency import (
+        BenchmarkServer,
+    )
+    from benchmarks.bench_scaled_expert_contention import (
+        wait_for_snapshot_count,
+    )
+
+    port = _free_port()
+    base_url = f"http://{HOST}:{port}"
+    command = _real_model_service_command(
+        model_path,
+        port=port,
+        attention_backend="dsv4_sparse",
+        cuda_graph_max_bs=cuda_graph_max_bs,
+        num_tokens=None,
+        max_prefill_length=8_192,
+        max_seq_len_override=131_072,
+        wave_max_chunks=1,
+        max_running_requests=16,
+        memory_ratio=0.7,
+    )
+    command.extend(
+        ["--nowag-expert-path", str(DSV4_NOWAG_EXPERT_PATH)]
+    )
+    assert "--num-tokens" not in command
+    assert _has_pair(command, "--memory-ratio", "0.7")
+    assert _has_pair(
+        command,
+        "--nowag-expert-path",
+        str(DSV4_NOWAG_EXPERT_PATH),
+    )
+    server = BenchmarkServer(
+        command=command,
+        gpu=str(torch.cuda.current_device()),
+        base_url=base_url,
+        timeout=3_600.0,
+        readiness_prompt_text=prompts["readiness"],
+        nowag_plugin_src=DSV4_NOWAG_PLUGIN_SRC,
+    )
+    try:
+        try:
+            server.start()
+        except Exception as exc:
+            raise AssertionError(
+                "activation-budgeted DSV4 failed during public startup: "
+                f"{type(exc).__name__}: {exc}\n{server.log_tail()}"
+            ) from exc
+        wait_for_snapshot_count(server, minimum=1, timeout=600.0)
+        readiness_cursor = len(_records_from_text(server.log_tail()))
+        assert readiness_cursor >= 1
+        iteration_token_limit = _latest_iteration_token_limit(
+            server.log_tail(),
+            requested_tokens=8_192,
+        )
+        server.mark_measurement_start()
+
+        short_offset = len(_records_from_text(server.log_tail()))
+        short_result: dict[str, Any] = {}
+        _stream_completion(
+            base_url,
+            _completion_payload(
+                prompts["short"],
+                max_tokens=4,
+                stream=True,
+                ignore_eos=True,
+            ),
+            threading.Event(),
+            short_result,
+        )
+        _assert_stream_completion(
+            short_result,
+            prompt_tokens=32,
+            completion_tokens=4,
+        )
+        short_waves = _wait_for_public_server_pipeline_requests(
+            server,
+            offset=short_offset,
+            expected_requests=1,
+            timeout=600.0,
+        )
+        assert len(short_waves) == 1
+        _assert_pipeline_wave(
+            short_waves[0],
+            group_size=1,
+            cache_size=512,
+            expected_reqs=1,
+            expected_tiles=math.ceil(32 / iteration_token_limit),
+            num_layers=43,
+            num_experts=256,
+        )
+        assert short_waves[0]["decode_iterations"] == 0
+
+        concurrent_offset = len(_records_from_text(server.log_tail()))
+        driver_result, ragged_results = (
+            _run_decode_then_stream_prefill_batch(
+                base_url,
+                decode_payload=_completion_payload(
+                    prompts["driver"],
+                    max_tokens=16,
+                    stream=True,
+                    ignore_eos=True,
+                ),
+                prefill_payloads=[
+                    _completion_payload(
+                        prompts["long"],
+                        max_tokens=1,
+                        stream=True,
+                        ignore_eos=True,
+                    ),
+                    _completion_payload(
+                        prompts["ragged_short"],
+                        max_tokens=1,
+                        stream=True,
+                        ignore_eos=True,
+                    ),
+                ],
+            )
+        )
+        _assert_stream_completion(
+            driver_result,
+            prompt_tokens=32,
+            completion_tokens=16,
+        )
+        _assert_stream_completion(
+            ragged_results[0],
+            prompt_tokens=40_000,
+            completion_tokens=1,
+        )
+        long_actual_prefill_tokens = (
+            _usage(ragged_results[0])["prompt_tokens"]
+            - _usage(ragged_results[0])["cached_tokens"]
+        )
+        long_tiles = math.ceil(
+            long_actual_prefill_tokens / iteration_token_limit
+        )
+        assert long_tiles > 1
+        _assert_stream_completion(
+            ragged_results[1],
+            prompt_tokens=128,
+            completion_tokens=1,
+        )
+        concurrent_results = [driver_result, *ragged_results]
+        assert sum(
+            _usage(result)["prompt_tokens"]
+            for result in concurrent_results
+        ) == 40_160
+        assert sum(
+            _usage(result)["completion_tokens"]
+            for result in concurrent_results
+        ) == 18
+
+        concurrent_waves = _wait_for_public_server_pipeline_requests(
+            server,
+            offset=concurrent_offset,
+            expected_requests=3,
+            timeout=1_800.0,
+        )
+        assert len(concurrent_waves) == 3
+        assert concurrent_waves[0]["decode_iterations"] == 0
+        _assert_pipeline_wave(
+            concurrent_waves[0],
+            group_size=1,
+            cache_size=512,
+            expected_reqs=1,
+            expected_tiles=math.ceil(32 / iteration_token_limit),
+            num_layers=43,
+            num_experts=256,
+        )
+        long_tiled_waves = [
+            wave
+            for wave in concurrent_waves[1:]
+            if wave["group_forwards"] > 43
+        ]
+        short_single_tile_waves = [
+            wave
+            for wave in concurrent_waves[1:]
+            if wave["group_forwards"] == 43
+        ]
+        assert len(long_tiled_waves) == 1
+        assert len(short_single_tile_waves) == 1
+        _assert_pipeline_wave(
+            long_tiled_waves[0],
+            group_size=1,
+            cache_size=512,
+            expected_reqs=1,
+            expected_tiles=long_tiles,
+            num_layers=43,
+            num_experts=256,
+        )
+        _assert_pipeline_wave(
+            short_single_tile_waves[0],
+            group_size=1,
+            cache_size=512,
+            expected_reqs=1,
+            expected_tiles=math.ceil(128 / iteration_token_limit),
+            num_layers=43,
+            num_experts=256,
+        )
+        assert any(
+            0 < wave["decode_iterations"] <= wave["iterations"]
+            for wave in concurrent_waves[1:]
+        )
+
+        cached_offset = len(_records_from_text(server.log_tail()))
+        cached_result: dict[str, Any] = {}
+        _stream_completion(
+            base_url,
+            _completion_payload(
+                prompts["cached_followup"],
+                max_tokens=1,
+                stream=True,
+                ignore_eos=True,
+            ),
+            threading.Event(),
+            cached_result,
+        )
+        cached_usage = _usage(cached_result)
+        assert cached_usage["cached_tokens"] >= 128
+        cached_actual_prefill_tokens = (
+            cached_usage["prompt_tokens"]
+            - cached_usage["cached_tokens"]
+        )
+        _assert_stream_completion(
+            cached_result,
+            prompt_tokens=prompts["cached_followup_tokens"],
+            completion_tokens=1,
+            cached_tokens=cached_usage["cached_tokens"],
+        )
+        cached_waves = _wait_for_public_server_pipeline_requests(
+            server,
+            offset=cached_offset,
+            expected_requests=1,
+            timeout=600.0,
+        )
+        assert len(cached_waves) == 1
+        _assert_pipeline_wave(
+            cached_waves[0],
+            group_size=1,
+            cache_size=512,
+            expected_reqs=1,
+            expected_tiles=math.ceil(
+                cached_actual_prefill_tokens / iteration_token_limit
+            ),
+            num_layers=43,
+            num_experts=256,
+        )
+        return {
+            "short_usage": _usage(short_result),
+            "concurrent_usages": [
+                _usage(result) for result in concurrent_results
+            ],
+            "cached_usage": cached_usage,
+            "wave_structure": {
+                "single_tile_short": short_waves[0],
+                "decode_driver": concurrent_waves[0],
+                "long_tiled": long_tiled_waves[0],
+                "ragged_short": short_single_tile_waves[0],
+                "cached_followup": cached_waves[0],
+            },
+        }
+    except AssertionError as exc:
+        exc.add_note(server.log_tail())
+        raise
+    finally:
+        server.close()
 
 
 @pytest.mark.parametrize(
@@ -1830,10 +2318,94 @@ def test_real_moe_backends_support_layered_pipeline_graph0_and_graph8(
     _require_cuda_e2e()
     if not model_path.exists():
         pytest.skip(f"public checkpoint is unavailable: {model_path}")
+    if (
+        attention_backend == "dsv4_sparse"
+        and not DSV4_NOWAG_EXPERT_PATH.exists()
+    ):
+        pytest.skip(
+            "public DSV4 NoWAG expert checkpoint is unavailable: "
+            f"{DSV4_NOWAG_EXPERT_PATH}"
+        )
+    if (
+        attention_backend == "dsv4_sparse"
+        and not DSV4_NOWAG_PLUGIN_SRC.exists()
+    ):
+        pytest.skip(
+            "public DSV4 NoWAG plugin source is unavailable: "
+            f"{DSV4_NOWAG_PLUGIN_SRC}"
+        )
     if requires_flashinfer and importlib.util.find_spec("flashinfer") is None:
         pytest.skip("flashinfer is unavailable")
 
     materialize = _public_prompt_materializer(model_path)
+    if attention_backend == "dsv4_sparse":
+        from benchmarks.bench_lab_agent_policies import load_tokenizer
+
+        ragged_short = materialize(
+            128, 510_003, "activation-ragged-page-prefix", 3
+        )
+        continuation = materialize(
+            32, 510_004, "activation-cached-continuation", 4
+        )
+        cached_followup = ragged_short + continuation
+        tokenizer = load_tokenizer(model_path)
+        ragged_short_ids = tokenizer.encode(ragged_short)
+        cached_followup_ids = tokenizer.encode(cached_followup)
+        assert len(ragged_short_ids) == 128
+        assert len(cached_followup_ids) == 160
+        assert cached_followup_ids[: len(ragged_short_ids)] == (
+            ragged_short_ids
+        )
+        activation_prompts: dict[str, Any] = {
+            "readiness": materialize(
+                8, 510_000, "activation-readiness", 5
+            ),
+            "short": materialize(
+                32, 510_001, "activation-single-tile-short", 0
+            ),
+            "driver": materialize(
+                32, 510_002, "activation-decode-driver", 1
+            ),
+            "long": materialize(
+                40_000, 510_005, "activation-long-40k", 2
+            ),
+            "ragged_short": ragged_short,
+            "cached_followup": cached_followup,
+            "cached_followup_tokens": len(cached_followup_ids),
+        }
+        observations = {
+            graph_size: _exercise_activation_budgeted_dsv4(
+                model_path,
+                activation_prompts,
+                cuda_graph_max_bs=graph_size,
+            )
+            for graph_size in (0, 8)
+        }
+        assert observations[8]["short_usage"] == observations[0][
+            "short_usage"
+        ]
+        assert observations[8]["concurrent_usages"] == observations[0][
+            "concurrent_usages"
+        ]
+        assert observations[8]["cached_usage"] == observations[0][
+            "cached_usage"
+        ]
+        assert set(observations[8]["wave_structure"]) == set(
+            observations[0]["wave_structure"]
+        )
+        for wave_name, graph0_wave in observations[0][
+            "wave_structure"
+        ].items():
+            graph8_wave = observations[8]["wave_structure"][wave_name]
+            assert {
+                field: graph8_wave[field]
+                for field in PIPELINE_CROSS_GRAPH_STRUCTURE_FIELDS
+            } == {
+                field: graph0_wave[field]
+                for field in PIPELINE_CROSS_GRAPH_STRUCTURE_FIELDS
+            }
+        return
+
     prompts = {
         "readiness": materialize(
             8, 500_000, "real-model-readiness", 3
@@ -1859,7 +2431,9 @@ def test_real_moe_backends_support_layered_pipeline_graph0_and_graph8(
         for graph_size in (0, 8)
     }
     assert observations[8]["usages"] == observations[0]["usages"]
-    assert observations[8]["outputs"] == observations[0]["outputs"]
+    assert observations[8]["driver_output"] == observations[0][
+        "driver_output"
+    ]
 
 
 def test_layered_pipeline_shared_pool_bounds_three_driver_decode_misses(
@@ -1902,6 +2476,10 @@ def test_layered_pipeline_shared_pool_bounds_three_driver_decode_misses(
     server.start()
     try:
         baseline = wait_for_snapshot_count(server, minimum=1, timeout=180.0)
+        iteration_token_limit = _latest_iteration_token_limit(
+            server.log_tail(),
+            requested_tokens=128,
+        )
         server.mark_measurement_start()
         wave_offset = len(_records_from_text(server.log_tail()))
 
@@ -2004,14 +2582,16 @@ def test_layered_pipeline_shared_pool_bounds_three_driver_decode_misses(
         assert waves
         assert sum(wave["reqs"] for wave in waves) == 4
         assert any(
-            wave["decode_iterations"] == wave["groups"] for wave in waves
+            wave["decode_iterations"] == wave["iterations"]
+            for wave in waves
         )
-        for wave in waves:
-            _assert_pipeline_wave(
-                wave,
-                group_size=1,
-                cache_size=24,
-            )
+        _assert_fifo_packed_waves(
+            waves,
+            request_prefill_tokens=[128, 128, 128, 2_048],
+            iteration_token_limit=iteration_token_limit,
+            group_size=1,
+            cache_size=24,
+        )
     except AssertionError as exc:
         exc.add_note(server.log_tail())
         raise
@@ -2052,6 +2632,15 @@ def test_scaled_runtime_json_uses_only_final_pipeline_wave_schema(
     waves = mode["layered_pipeline_waves"]
     assert isinstance(waves, list) and waves
     assert sum(wave["reqs"] for wave in waves) == 5
-    for wave in waves:
-        _assert_pipeline_wave(wave, group_size=1, cache_size=24)
+    iteration_token_limit = _latest_iteration_token_limit(
+        mode["server_log_tail"],
+        requested_tokens=128,
+    )
+    _assert_fifo_packed_waves(
+        waves,
+        request_prefill_tokens=[128, 2_048, 2_048, 2_048, 2_048],
+        iteration_token_limit=iteration_token_limit,
+        group_size=1,
+        cache_size=24,
+    )
     _assert_pipeline_structure(mode["layered_pipeline_structure"], waves)

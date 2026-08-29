@@ -52,6 +52,25 @@ python benchmarks/bench_real_conversation_concurrency.py \
   --output /tmp/real_conversation_concurrency.json
 ```
 
+**`bench_dsv4_repo_concurrency.py`** — compares legacy and layered-pipeline on
+fixed SWE-bench BM25 repository prompts arriving during sustained decode. Prepare
+the companion manifest once, then pass its path to the run; results record that
+path but do not copy or hash the manifest.
+
+```bash
+python benchmarks/bench_dsv4_repo_concurrency.py \
+  --prepare-manifest /tmp/dsv4_repo_concurrency_manifest.json
+
+python benchmarks/bench_dsv4_repo_concurrency.py \
+  --manifest /tmp/dsv4_repo_concurrency_manifest.json \
+  --modes legacy layered-pipeline --gpu 0 \
+  --nowag-plugin-src /path/to/nowag/plugin/src \
+  --output /tmp/dsv4_repo_concurrency.json
+```
+
+The runner has no machine-specific NoWAG plugin default. When the real plugin is
+provided as a source checkout, `--nowag-plugin-src` must be passed explicitly.
+
 **`bench_load_weight_generic.py`** — expert-bank load time: serial vs parallel O_DIRECT
 vs pre-repacked FTW, each mode in its own subprocess. Linux-only; stages the FTW under
 `/var/tmp` (`--ftw-dir` overrides; roughly checkpoint-sized).

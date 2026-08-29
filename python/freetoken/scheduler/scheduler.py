@@ -134,8 +134,10 @@ class Scheduler(SchedulerIOMixin):
                 table_manager=self.table_manager,
                 max_wave_chunks=config.prefill_wave_max_chunks,
                 prepare_batch=self._prepare_resident_batch,
+                prepare_tiled_batch=self._prepare_resident_tiled_batch,
                 prepare_mixed_batch=self._prepare_resident_mixed_batch,
                 build_execution_input=self._build_layer_group_input,
+                open_prefill_execution=self.cache_manager.open_prefill_execution,
                 report_prompt_admissions=self._report_prompt_admissions,
                 free_req_resources=self._free_req_resources,
             )
@@ -186,14 +188,8 @@ class Scheduler(SchedulerIOMixin):
                 toolcall_opener_for(getattr(config, "tool_call_parser", "")),
             )
         self.token_pool = self.table_manager.token_pool
-        # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
-        # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
-        # instead of OOMing _alloc_window on a prompt longer than the window pool.
-        _chunk_cap = self.cache_manager.prefill_chunk_budget
-        self.prefill_budget = (
-            min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
-        )
         self.config = config
+        self._refresh_prefill_budget("startup")
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -222,6 +218,7 @@ class Scheduler(SchedulerIOMixin):
         num_pages: int | None = None,
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
+        _prefill_budget_event: str = "cache_rebuild",
     ) -> None:
         """Idle-only runtime cache rebuild: resize the MoE slot cache, KV pages, GDN (mamba) state
         pool, and/or the window pool (num_swa_pages), re-capture CUDA graphs, and re-thread the
@@ -259,16 +256,21 @@ class Scheduler(SchedulerIOMixin):
                 self.table_manager.rebuild(self.engine.page_table)
                 self.token_pool = self.table_manager.token_pool
             self.cache_manager.check_integrity()
-        # The prefill chunk cap tracks the CURRENT window-pool size (DSV4); a rebuild that
-        # shrank the pool must shrink the cap too, or the next long prompt is chunked against
-        # the stale budget and crashes _alloc_window.
-        _chunk_cap = self.cache_manager.prefill_chunk_budget
-        self.prefill_budget = (
-            min(self.config.max_extend_tokens, _chunk_cap)
-            if _chunk_cap else self.config.max_extend_tokens
-        )
+        self._refresh_prefill_budget(_prefill_budget_event)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
+
+    def _refresh_prefill_budget(self, event: str) -> None:
+        """Apply the current cache's physical prefill limit and publish it for pipeline runs."""
+        requested = self.config.max_extend_tokens
+        cache_limit = self.cache_manager.prefill_chunk_budget
+        self.prefill_budget = min(requested, cache_limit) if cache_limit else requested
+        if self.config.batching_policy == "layered-pipeline":
+            logger.info_rank0(
+                "Layered pipeline iteration limit: "
+                f"requested_tokens={requested}, effective_tokens={self.prefill_budget}, "
+                f"event={event}"
+            )
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """
@@ -1228,7 +1230,7 @@ class Scheduler(SchedulerIOMixin):
             # forcing a restart.)
             logger.error(f"cache rebuild failed: {e!r} — rolling back to the previous geometry")
             try:
-                self.rebuild_cache(**prior)
+                self.rebuild_cache(**prior, _prefill_budget_event="rollback")
             except Exception as e2:  # noqa: BLE001 — rollback failed too; genuinely unrecoverable
                 logger.error(f"cache rebuild rollback failed: {e2!r} — server latched failed")
                 self._reply_rebuild(
@@ -1368,6 +1370,14 @@ class Scheduler(SchedulerIOMixin):
         self._resident_decode_input = None
         return self._prepare_batch(batch, graph_pad=False)
 
+    def _prepare_resident_tiled_batch(self, batch: Batch) -> ForwardInput:
+        """Allocate a logical wave once; tile adapters own execution metadata."""
+        self._resident_decode_input = None
+        self._prepare_batch_resources(batch, graph_pad=False)
+        if batch.has_prefill:
+            self._gather_multimodal(batch)
+        return self._build_forward_input(batch, prepare_metadata=False)
+
     def _prepare_resident_decode_batch(self, batch: Batch) -> ForwardInput:
         """Prepare pure decode once and reuse stable resident-policy metadata."""
         forward_input, self._resident_decode_input = prepare_stable_decode(
@@ -1392,16 +1402,22 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[forward_input.input_tuple]
         return forward_input
 
-    def _build_forward_input(self, batch: Batch) -> ForwardInput:
+    def _build_forward_input(
+        self,
+        batch: Batch,
+        *,
+        prepare_metadata: bool = True,
+    ) -> ForwardInput:
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
-        self.engine.prepare_execution_metadata(
-            batch,
-            input_mapping,
-            linear_cache_is_hybrid=self.cache_manager.is_hybrid,
-        )
+        if prepare_metadata:
+            self.engine.prepare_execution_metadata(
+                batch,
+                input_mapping,
+                linear_cache_is_hybrid=self.cache_manager.is_hybrid,
+            )
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),

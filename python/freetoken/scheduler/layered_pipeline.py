@@ -4,7 +4,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import torch
 from freetoken.core import Batch, Req
 from freetoken.utils import init_logger
 
@@ -20,6 +19,7 @@ from .resident_wave import (
 
 if TYPE_CHECKING:
     from freetoken.engine import Engine
+    from freetoken.engine.layered_execution import PrefillExecutionSession
 
     from .decode import DecodeManager
     from .table import TableManager
@@ -36,8 +36,10 @@ class _LayeredPipelineWave:
     prefill_input: ForwardInput
     attention_metadata_ready: bool
     cache_session: object
+    prefill_execution: PrefillExecutionSession | None
     state: object | None = None
     current_stage: int = 0
+    wave_complete: bool = False
     resident_groups: int = 0
     group_forwards: int = 0
     iterations: int = 0
@@ -45,7 +47,7 @@ class _LayeredPipelineWave:
 
     @property
     def done(self) -> bool:
-        return self.current_stage >= self.cache_session.stage_count
+        return self.wave_complete
 
 
 class LayeredPipelineExecutor:
@@ -60,8 +62,10 @@ class LayeredPipelineExecutor:
         table_manager: TableManager,
         max_wave_chunks: int,
         prepare_batch: Callable[[Batch], ForwardInput],
+        prepare_tiled_batch: Callable[[Batch], ForwardInput],
         prepare_mixed_batch: Callable[[Batch, Batch], ForwardInput],
         build_execution_input: Callable[[Batch], ForwardInput],
+        open_prefill_execution: Callable[[Batch], PrefillExecutionSession | None],
         report_prompt_admissions: Callable[[Batch], None],
         free_req_resources: Callable[[Req], None],
     ) -> None:
@@ -71,8 +75,10 @@ class LayeredPipelineExecutor:
         self._table_manager = table_manager
         self._max_wave_chunks = max_wave_chunks
         self._prepare_batch = prepare_batch
+        self._prepare_tiled_batch = prepare_tiled_batch
         self._prepare_mixed_batch = prepare_mixed_batch
         self._build_execution_input = build_execution_input
+        self._open_prefill_execution = open_prefill_execution
         self._report_prompt_admissions = report_prompt_admissions
         self._free_req_resources = free_req_resources
         self._execution = engine.layered_execution_adapter
@@ -80,6 +86,7 @@ class LayeredPipelineExecutor:
         self._staged_admission: ResidentWaveAdmission | None = None
         self._decode_input: ForwardInput | None = None
         self._group_input: ForwardInput | None = None
+        self._current_prefill_input: ForwardInput | None = None
 
     @property
     def active(self) -> bool:
@@ -108,7 +115,6 @@ class LayeredPipelineExecutor:
         return compose_mixed_batch(decode_reqs, prefill_batch)
 
     def begin_wave(self, first_batch: Batch, token_budget: int) -> None:
-        del token_budget
         if self._wave is not None:
             raise RuntimeError("a layered pipeline wave is already active")
         admission = self._staged_admission
@@ -116,31 +122,86 @@ class LayeredPipelineExecutor:
         if admission is None or not first_batch.prefill_reqs:
             raise RuntimeError("layered pipeline wave has no staged prefill admission")
 
-        prepared = self._prepare_batch(first_batch)
-        self._report_prompt_admissions(first_batch)
-        first_batch.input_ids = self._table_manager.token_pool[prepared.input_tuple]
-
-        if first_batch.has_decode:
-            prefill_input, attention_metadata_ready = (
-                self._execution.prefill_view(prepared)
+        prefill_execution = self._open_prefill_execution(first_batch)
+        try:
+            uses_tiles = self._execution.uses_prefill_tiles(
+                first_batch,
+                token_budget,
             )
-            self._decode_input = self._execution.decode_view(prepared)
-        else:
-            prefill_input = prepared
-            attention_metadata_ready = True
+            prepared = (
+                self._prepare_tiled_batch(first_batch)
+                if uses_tiles
+                else self._prepare_batch(first_batch)
+            )
+            self._report_prompt_admissions(first_batch)
+            first_batch.input_ids = self._table_manager.token_pool[prepared.input_tuple]
+
+            if first_batch.has_decode:
+                prefill_input, attention_metadata_ready = (
+                    self._execution.prefill_view(
+                        prepared,
+                        prepare_metadata=not uses_tiles,
+                    )
+                )
+            else:
+                prefill_input = prepared
+                attention_metadata_ready = True
+
+            prefill_state = self._execution.initialize_prefill_state(
+                prefill_input,
+                token_budget,
+                prefill_execution,
+            )
+            execution_prefill = self._execution.current_prefill_input(
+                prefill_input,
+                prefill_state,
+            )
+            self._current_prefill_input = execution_prefill
+            if execution_prefill is prefill_input:
+                self._group_input = prepared
+                self._decode_input = (
+                    self._execution.decode_view(prepared)
+                    if first_batch.has_decode
+                    else None
+                )
+            elif first_batch.has_decode:
+                group_batch = compose_mixed_batch(
+                    list(first_batch.decode_reqs),
+                    execution_prefill.batch,
+                )
+                metadata_state = self._execution.capture_prefill_metadata_state(
+                    execution_prefill
+                )
+                self._group_input = self._build_execution_input(group_batch)
+                self._execution.restore_prefill_metadata_state(
+                    self._group_input,
+                    execution_prefill,
+                    metadata_state,
+                )
+                self._decode_input = self._execution.decode_view(self._group_input)
+            else:
+                self._group_input = execution_prefill
+                self._decode_input = None
+
+            for req in prefill_input.batch.prefill_reqs:
+                self._prefill_manager.reserve_layered_continuation(req)
+
+            cache_session = self._execution.open_resident_wave()
+        except Exception:
+            if prefill_execution is not None:
+                prefill_execution.cancel()
             self._decode_input = None
-
-        for req in prefill_input.batch.prefill_reqs:
-            self._prefill_manager.reserve_layered_continuation(req)
-
-        cache_session = self._execution.open_resident_wave()
+            self._group_input = None
+            self._current_prefill_input = None
+            raise
         self._wave = _LayeredPipelineWave(
             admission=admission,
             prefill_input=prefill_input,
             attention_metadata_ready=attention_metadata_ready,
             cache_session=cache_session,
+            prefill_execution=prefill_execution,
+            state=prefill_state,
         )
-        self._group_input = prepared
 
     def prepare_step(self, token_budget: int) -> None:
         del token_budget
@@ -148,22 +209,39 @@ class LayeredPipelineExecutor:
         if self._decode_input is not None or self._group_input is not None:
             raise RuntimeError("a layered pipeline iteration is already staged")
 
+        execution_prefill = self._execution.current_prefill_input(
+            wave.prefill_input,
+            wave.state,
+        )
         decode_batch = self._decode_manager.schedule_next_batch()
         if decode_batch is None:
-            if not wave.attention_metadata_ready:
+            if (
+                execution_prefill is wave.prefill_input
+                and not wave.attention_metadata_ready
+            ):
                 wave.prefill_input = self._build_execution_input(
                     wave.prefill_input.batch
                 )
                 wave.attention_metadata_ready = True
-            self._group_input = wave.prefill_input
+                execution_prefill = wave.prefill_input
+            self._current_prefill_input = execution_prefill
+            self._group_input = execution_prefill
             return
 
+        self._current_prefill_input = execution_prefill
         mixed_batch = compose_mixed_batch(
             list(decode_batch.reqs),
-            wave.prefill_input.batch,
+            execution_prefill.batch,
         )
-        assert mixed_batch is not None
+        metadata_state = self._execution.capture_prefill_metadata_state(
+            execution_prefill
+        )
         self._group_input = self._prepare_mixed_batch(decode_batch, mixed_batch)
+        self._execution.restore_prefill_metadata_state(
+            self._group_input,
+            execution_prefill,
+            metadata_state,
+        )
         self._decode_input = self._execution.decode_view(
             self._group_input,
             decode_batch,
@@ -172,40 +250,54 @@ class LayeredPipelineExecutor:
     def advance_step(self) -> list[ForwardData]:
         wave = self._require_wave()
         group_input = self._group_input
-        if group_input is None:
+        prefill_input = self._current_prefill_input
+        if group_input is None or prefill_input is None:
             raise RuntimeError("layered pipeline iteration was not prepared")
 
         stage = wave.cache_session.begin(wave.current_stage)
         run = self._execution.begin_group(
             group_input,
-            wave.prefill_input,
+            prefill_input,
             wave.state,
             self._decode_input,
             stage.start_layer,
         )
         if (
             self._decode_input is not None
+            and self._execution.group_finishes_after_current_tile(wave.state)
             and wave.current_stage + 1 < wave.cache_session.stage_count
         ):
             wave.cache_session.hint_next(wave.current_stage + 1)
         try:
             result = self._execution.advance_group(
                 group_input,
-                wave.prefill_input,
+                prefill_input,
+                wave.state,
                 run,
                 self._decode_input,
                 stage.end_layer,
             )
         except Exception:
             wave.cache_session.cancel()
+            if wave.prefill_execution is not None:
+                wave.prefill_execution.cancel()
             raise
 
         wave.state = result.prefill_state
-        wave.cache_session.complete(wave.current_stage)
-        wave.resident_groups += 1
         wave.group_forwards += 1
         wave.iterations += 1
-        wave.current_stage += 1
+        wave.wave_complete = result.wave_complete
+        if result.group_complete:
+            next_layer = None if wave.wave_complete else stage.end_layer
+            next_stage = wave.cache_session.complete(
+                wave.current_stage,
+                next_start_layer=next_layer,
+            )
+            wave.resident_groups += 1
+            if not wave.wave_complete:
+                if wave.prefill_execution is not None:
+                    wave.prefill_execution.rewind()
+                wave.current_stage = next_stage
 
         outputs = self._finish_iteration_decode(
             wave,
@@ -214,8 +306,11 @@ class LayeredPipelineExecutor:
         )
         self._decode_input = None
         self._group_input = None
+        self._current_prefill_input = None
         if wave.done:
             outputs.extend(self._finish_wave(wave))
+            if wave.prefill_execution is not None:
+                wave.prefill_execution.close()
             wave.cache_session.close()
             self._log_completed_wave(wave)
             self._wave = None
@@ -255,11 +350,8 @@ class LayeredPipelineExecutor:
             raise RuntimeError("layered pipeline wave completed without final model state")
 
         selected_requests: list[int] = []
-        selected_rows: list[int] = []
         aborted_owners: list[Req] = []
-        row = 0
         for request_index, req in enumerate(wave.prefill_input.batch.prefill_reqs):
-            row += req.extend_len
             member = wave.admission.members[req.uid]
             if member.aborted or req.aborted:
                 aborted_owners.append(req)
@@ -267,32 +359,25 @@ class LayeredPipelineExecutor:
                 req.commit_prefill_kv()
             else:
                 selected_requests.append(request_index)
-                selected_rows.append(row - 1)
 
         outputs: list[ForwardData] = []
         if selected_requests:
-            output_indices = torch.tensor(
-                selected_rows,
-                dtype=torch.int32,
-                pin_memory=self._engine.device.type == "cuda",
-            ).to(self._engine.device, non_blocking=True)
-            output = self._execution.finish_prefill(
+            for request_indices, output in self._execution.finish_prefill_wave(
                 wave.prefill_input,
                 state,
-                output_indices=output_indices,
-                request_indices=selected_requests,
-            )
-            output_input = request_output_view(
-                wave.prefill_input,
                 selected_requests,
-            )
-            write_and_filter(
-                output_input,
-                output.next_tokens_gpu,
-                self._table_manager,
-                self._decode_manager,
-            )
-            outputs.append((output_input, output))
+            ):
+                output_input = request_output_view(
+                    wave.prefill_input,
+                    request_indices,
+                )
+                write_and_filter(
+                    output_input,
+                    output.next_tokens_gpu,
+                    self._table_manager,
+                    self._decode_manager,
+                )
+                outputs.append((output_input, output))
 
         if aborted_owners:
             self._engine.stream.synchronize()

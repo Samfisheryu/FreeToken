@@ -22,7 +22,7 @@ class DSV4LayeredExecutionAdapter(LayeredExecutionAdapter):
     """Run decode and ragged prefill inside one resident-group lifetime.
 
     DSV4 decode state is ``[B, 1, hc_mult, dim]`` and uses ``decode_step``;
-    prefill state is ``[1, T, hc_mult, dim]`` and uses ragged attention.  They
+    prefill state is ``[1, T, hc_mult, dim]`` and uses ragged attention. They
     share expert residency but cannot be concatenated into one attention batch.
     """
 
@@ -35,40 +35,28 @@ class DSV4LayeredExecutionAdapter(LayeredExecutionAdapter):
         start_stage: int,
     ) -> LayeredGroupRun:
         del group_input
-        if start_stage == 0:
-            if prefill_state is not None:
-                raise RuntimeError("layered wave was embedded more than once")
-            self._engine.restore_layered_linear_states(prefill_input.batch)
-            prefill_state = self._engine.begin_layer_group_prefill(
-                prefill_input.batch
-            )
+        model_state = self._begin_prefill_state(
+            prefill_input,
+            prefill_state,
+            start_stage,
+        )
+        decode_state = None
+        if decode_input is not None:
             decode_state = (
                 self._engine.begin_layer_group_prefill(decode_input.batch)
-                if decode_input is not None
-                else None
-            )
-        else:
-            if (
-                prefill_state is None
-                or self.state_stage(prefill_state) != start_stage
-            ):
-                raise RuntimeError(
-                    "layered prefill state is not at the active stage"
-                )
-            decode_state = (
-                self._engine.begin_layer_group_decode(
+                if start_stage == 0
+                else self._engine.begin_layer_group_decode(
                     decode_input.batch,
                     start_stage,
                 )
-                if decode_input is not None
-                else None
             )
-        return LayeredGroupRun(_SeparateGroupStates(prefill_state, decode_state))
+        return LayeredGroupRun(_SeparateGroupStates(model_state, decode_state))
 
     def advance_group(
         self,
         group_input: ForwardInput,
         prefill_input: ForwardInput,
+        prefill_state: object | None,
         run: LayeredGroupRun,
         decode_input: ForwardInput | None,
         end_stage: int,
@@ -88,12 +76,22 @@ class DSV4LayeredExecutionAdapter(LayeredExecutionAdapter):
                 end_stage,
             )
 
-        prefill_state = self._engine.advance_layer_group_prefill(
+        model_state = self._engine.advance_layer_group_prefill(
             prefill_input.batch,
             states.prefill,
             end_stage,
         )
-        return LayeredGroupResult(prefill_state, decode_state)
+        next_state, group_complete, wave_complete = self._complete_prefill_tile(
+            prefill_state,
+            model_state,
+            end_stage,
+        )
+        return LayeredGroupResult(
+            next_state,
+            decode_state,
+            group_complete,
+            wave_complete,
+        )
 
 
 __all__ = ["DSV4LayeredExecutionAdapter"]

@@ -60,17 +60,8 @@ class SchedulerConfig(EngineConfig):
     @property
     def max_forward_len(self) -> int:
         if self.batching_policy == "layered-pipeline":
-            # A layered-pipeline wave removes physical T-sized chunk boundaries.
-            # Multi-request admission bounds total prompt rows by W*T; an oversized
-            # first request remains exclusive and is bounded by max_seq_len. Decode
-            # contributes at most one row per running request to the mixed group.
-            return (
-                max(
-                    self.max_seq_len,
-                    self.prefill_wave_max_chunks * self.max_extend_tokens,
-                )
-                + self.max_running_req
-            )
+            # One physical tile plus at most one decode row per running request.
+            return self.max_extend_tokens + self.max_running_req
         return self.max_extend_tokens
 
     @property

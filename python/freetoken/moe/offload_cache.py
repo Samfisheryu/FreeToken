@@ -169,19 +169,42 @@ class ResidentExpertSession:
             self._prefetched_index = index
         return prefetched
 
-    def complete(self, index: int) -> None:
+    def complete(
+        self,
+        index: int,
+        *,
+        next_start_layer: int | None,
+    ) -> int | None:
+        """Release one stage and resolve its sequential successor."""
         if self._active_index != index:
             raise RuntimeError("completed resident stage is not active")
         self._cache.end_prefill_group()
         self._active_index = None
         if self._prefetched_index is not None:
             next_stage = self.stage(self._prefetched_index)
+            if next_start_layer != next_stage.start_layer:
+                raise RuntimeError(
+                    "prefetched resident stage does not match execution progress"
+                )
             self._cache.promote_prefetched_resident_group(
                 next_stage.start_layer,
                 next_stage.end_layer,
             )
             self._active_index = self._prefetched_index
             self._prefetched_index = None
+            return self._active_index
+
+        if next_start_layer is None:
+            return None
+        next_index = index + 1
+        if (
+            next_index < self.stage_count
+            and self._stages[next_index].start_layer == next_start_layer
+        ):
+            return next_index
+        raise RuntimeError(
+            f"resident stage {index} cannot advance to layer {next_start_layer}"
+        )
 
     def close(self) -> None:
         if self._active_index is not None or self._prefetched_index is not None:

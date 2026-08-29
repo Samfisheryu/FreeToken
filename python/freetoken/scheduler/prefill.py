@@ -52,6 +52,7 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    incremental_window_prefill: bool = False
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -131,7 +132,17 @@ class PrefillAdder:
         chunk_size = min(self.token_budget, remain_len)
         if self.chunk_token_limit is not None:
             chunk_size = min(chunk_size, self.chunk_token_limit)
-        if self.cache_manager.swa_paged:
+        incremental_swa = (
+            self.cache_manager.incremental_prefill_window_reservation(remain_len)
+            if self.incremental_window_prefill
+            else None
+        )
+        if incremental_swa is not None:
+            # The full KV/page-table range is allocated once. The cache-owned execution
+            # session binds only the current physical tile, so admission charges one live
+            # window per member instead of cutting the logical request into another wave.
+            self.reserved_swa += incremental_swa
+        elif self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
             # shorter prompt -- so this cap is what forces a prompt whose swa footprint exceeds the
@@ -259,6 +270,7 @@ class PrefillManager:
         chunk_token_limit: int | None = None,
         allowed_uids: set[int] | None = None,
         max_reqs: int | None = None,
+        incremental_window_prefill: bool = False,
     ) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
@@ -279,6 +291,7 @@ class PrefillManager:
             reserved_swa=self.cache_manager.decode_swa_reservation(
                 self.decode_manager.running_reqs
             ),
+            incremental_window_prefill=incremental_window_prefill,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -356,9 +369,9 @@ class PrefillManager:
 
         Layered prefill uses the configured chunk length only to size wave
         admission.  Its physical batch keeps each request's remaining prompt as
-        one causal range.  The existing allocator may still shorten a request
-        when an SWA pool cannot hold that range; that UID's continuation remains
-        pending for a later wave instead of adding another forward boundary here.
+        one causal range. A cache that exposes incremental prefill-window execution
+        binds that range by physical tile without turning it into a continuation;
+        other SWA caches retain their ordinary chunk-cap behavior.
         """
         token_budget = 0
         selected = 0
@@ -378,6 +391,7 @@ class PrefillManager:
             token_budget,
             allowed_uids=allowed_uids,
             max_reqs=max_reqs,
+            incremental_window_prefill=True,
         )
 
     def has_pending_uid(self, uid: int) -> bool:
