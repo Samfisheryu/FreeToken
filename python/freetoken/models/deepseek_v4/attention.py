@@ -83,8 +83,6 @@ class Attention(nn.Module):
         # only the pool HANDLE; buffers + slot maps are read off it per access via @property, so a
         # runtime pool rebuild needs no per-buffer unbind.
         L = self.layer_id
-        win = self.window_size
-        self.P = pool.P
         self.freqs_cis = get_freqs_cis(*self._freqs_params, device)
         if self.compress_ratio:
             self.compressor.bind_paged(pool, L, self.freqs_cis, device, tier="attn")
@@ -108,8 +106,9 @@ class Attention(nn.Module):
         """One request's prefill work inside a (possibly ragged) batch: persist its window KV,
         advance its compressor/indexer carry, and return its per-query candidate lists.
 
-        ``start_pos == 0`` is a cold prompt (carry re-seeded from scratch); ``start_pos > 0`` is a
-        radix hit, whose carry is seeded BY VALUE from the matched tail page's ring block. Returns
+        ``start_pos == 0`` is a cold prompt (carry re-seeded from scratch); ``start_pos > 0``
+        resumes BY VALUE from the prior token's page-ring carry.  That owner may be a matched
+        radix prefix or the preceding physical tile of the same logical prefill. Returns
         ``(win_global [1, n, w], cmp_global [1, n, c] | None)`` at natural widths (cold: w =
         min(n, win); extend: w = win); the caller pads BOTH halves to the batch-uniform widths
         and concatenates.
@@ -135,8 +134,8 @@ class Attention(nn.Module):
 
         if not ratio:
             return win_global, None
-        # Only the compressor/indexer read the matched tail page's slot; resolving it costs a
-        # host sync (.item()), so do it after the ratio-0 early-out.
+        # Only the compressor/indexer read the prior token's page-ring slot; resolving it costs
+        # a host sync (.item()), so do it after the ratio-0 early-out.
         tail_ws = (
             int(self.attn.window_slots_of(ti, start_pos - 1, start_pos).item())
             if start_pos > 0 else None
@@ -161,12 +160,13 @@ class Attention(nn.Module):
         """Ragged batched prefill (cu_seqlens). ``x`` is [1, T, dim] -- the requests' NEW token
         streams concatenated (NO padding); ``segments`` is [(offset, n, table_idx, start_pos)]
         tiling [0, T); ``flat_positions`` [T] is each token's ABSOLUTE position, so a radix-hit
-        request continues from its cached length.
+        request continues from this physical segment's cached length.
 
         q / kv / o run FLAT over all T tokens (one GEMM, one rope each). The compressor + indexer
         carry is stateful (a bs=1 register + per-page ring), so they run PER REQUEST on the
         request's [offset, offset+n) slice with its own slot-map row -- cold segments re-seed the
-        carry, radix-hit segments resume it from the matched tail page. The per-request top-k lists
+        carry, while radix and physical-tile continuations resume it from the prior page. The
+        per-request top-k lists
         are padded to a UNIFORM width (window -> ``win`` cols at bs>1, the natural width at
         bs==1; compressed -> the batch max) with
         ``-1`` (the kernel masks ``-1`` to a no-op, so padding is bit-identical), then concatenated
@@ -214,7 +214,7 @@ class Attention(nn.Module):
         # batched behavior).
         n_window = win if len(segments) > 1 else win_parts[0].shape[-1]
         flat = []
-        for i, (off, n, ti, _start) in enumerate(segments):
+        for i in range(len(segments)):
             wg = win_parts[i]
             if wg.shape[-1] < n_window:  # pad window picks to the uniform width
                 wg = F.pad(wg, (0, n_window - wg.shape[-1]), value=-1)

@@ -134,7 +134,7 @@ class GraphRunner:
             tuple[int, int, int], _LayerRangeCapture
         ] = {}
         self.layer_range_group_ends: dict[int, int] = {}
-        self.layer_range_batch_sizes: set[int] = set()
+        self.layer_range_batch_sizes: tuple[int, ...] = ()
         self._layer_range_state_inputs: object | None = None
         self._prepared_layer_range_batch: Batch | None = None
         self._capture_graphs(max_seq_len, vocab_size, model)
@@ -183,13 +183,9 @@ class GraphRunner:
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
-            # capture on the dummy linear-state slot so GatedDeltaNet gather/scatter
-            # touches scratch (real slot indices are written by copy_from on replay). Hybrid-
-            # radix decouples the GDN slot from table_idx -> use the GDN padding slot.
-            dummy_slot = (self.dummy_req.linear_slot_idx
-                          if self.dummy_req.linear_slot_idx is not None
-                          else self.dummy_req.table_idx)
-            self.buffer.table_idx[:bs].fill_(dummy_slot)
+            # Capture on the dummy linear-state slot so GatedDeltaNet
+            # gather/scatter touches scratch rather than a request-owned slot.
+            self._set_dummy_linear_slots(bs)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces
@@ -211,7 +207,7 @@ class GraphRunner:
         self,
         model: BaseLLMModel,
     ) -> None:
-        """Capture exact-size decode graphs for resident prefill layer groups.
+        """Capture decode graphs for resident prefill layer groups.
 
         Capturing one graph per group keeps startup graph work linear in model depth.
         The active resident group remains eager because its decode rows are merged with
@@ -235,7 +231,7 @@ class GraphRunner:
         if not batch_sizes:
             return
 
-        self.layer_range_batch_sizes = set(batch_sizes)
+        self.layer_range_batch_sizes = tuple(batch_sizes)
         self.layer_range_group_ends = dict(groups)
         logger.info_rank0(
             "Capturing resident-prefill decode range graphs: "
@@ -305,13 +301,15 @@ class GraphRunner:
                     _LayerRangeCapture(graph=graph, output=captured)
                 )
 
-    def _set_dummy_linear_slots(self, bs: int) -> None:
-        dummy_slot = (
+    def _dummy_state_slot(self) -> int:
+        return (
             self.dummy_req.linear_slot_idx
             if self.dummy_req.linear_slot_idx is not None
             else self.dummy_req.table_idx
         )
-        self.buffer.table_idx[:bs].fill_(dummy_slot)
+
+    def _set_dummy_linear_slots(self, bs: int) -> None:
+        self.buffer.table_idx[:bs].fill_(self._dummy_state_slot())
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode_only and batch.size <= self.max_graph_bs
@@ -391,7 +389,7 @@ class GraphRunner:
         self.graph_map = {}
         self.layer_range_graph_map = {}
         self.layer_range_group_ends = {}
-        self.layer_range_batch_sizes = set()
+        self.layer_range_batch_sizes = ()
         self._layer_range_state_inputs = None
         self._prepared_layer_range_batch = None
         self.buffer = None

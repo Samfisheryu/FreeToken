@@ -34,7 +34,6 @@ class _LayeredPipelineWave:
 
     admission: ResidentWaveAdmission
     prefill_input: ForwardInput
-    attention_metadata_ready: bool
     cache_session: object
     prefill_execution: PrefillExecutionSession | None
     state: object | None = None
@@ -62,9 +61,8 @@ class LayeredPipelineExecutor:
         table_manager: TableManager,
         max_wave_chunks: int,
         prepare_batch: Callable[[Batch], ForwardInput],
-        prepare_tiled_batch: Callable[[Batch], ForwardInput],
-        prepare_mixed_batch: Callable[[Batch, Batch], ForwardInput],
-        build_execution_input: Callable[[Batch], ForwardInput],
+        prepare_allocation_only_batch: Callable[[Batch], ForwardInput],
+        prepare_decode_batch: Callable[[Batch], ForwardInput],
         open_prefill_execution: Callable[[Batch], PrefillExecutionSession | None],
         report_prompt_admissions: Callable[[Batch], None],
         free_req_resources: Callable[[Req], None],
@@ -75,9 +73,8 @@ class LayeredPipelineExecutor:
         self._table_manager = table_manager
         self._max_wave_chunks = max_wave_chunks
         self._prepare_batch = prepare_batch
-        self._prepare_tiled_batch = prepare_tiled_batch
-        self._prepare_mixed_batch = prepare_mixed_batch
-        self._build_execution_input = build_execution_input
+        self._prepare_allocation_only_batch = prepare_allocation_only_batch
+        self._prepare_decode_batch = prepare_decode_batch
         self._open_prefill_execution = open_prefill_execution
         self._report_prompt_admissions = report_prompt_admissions
         self._free_req_resources = free_req_resources
@@ -128,24 +125,28 @@ class LayeredPipelineExecutor:
                 first_batch,
                 token_budget,
             )
+            allocation_only = uses_tiles or (
+                first_batch.has_decode
+                and self._execution.uses_separate_group_inputs
+            )
             prepared = (
-                self._prepare_tiled_batch(first_batch)
-                if uses_tiles
+                self._prepare_allocation_only_batch(first_batch)
+                if allocation_only
                 else self._prepare_batch(first_batch)
             )
             self._report_prompt_admissions(first_batch)
             first_batch.input_ids = self._table_manager.token_pool[prepared.input_tuple]
 
             if first_batch.has_decode:
-                prefill_input, attention_metadata_ready = (
+                prefill_input, prefill_metadata_ready = (
                     self._execution.prefill_view(
                         prepared,
-                        prepare_metadata=not uses_tiles,
+                        prepare_metadata=not allocation_only,
                     )
                 )
             else:
                 prefill_input = prepared
-                attention_metadata_ready = True
+                prefill_metadata_ready = True
 
             prefill_state = self._execution.initialize_prefill_state(
                 prefill_input,
@@ -156,29 +157,42 @@ class LayeredPipelineExecutor:
                 prefill_input,
                 prefill_state,
             )
+            if (
+                execution_prefill is prefill_input
+                and not prefill_metadata_ready
+            ):
+                self._execution.prepare_layered_prefill_input(prefill_input)
             self._current_prefill_input = execution_prefill
             if execution_prefill is prefill_input:
-                self._group_input = prepared
-                self._decode_input = (
-                    self._execution.decode_view(prepared)
-                    if first_batch.has_decode
-                    else None
-                )
+                if (
+                    first_batch.has_decode
+                    and self._execution.uses_separate_group_inputs
+                ):
+                    self._decode_input = self._execution.decode_view(
+                        prepared,
+                        source_metadata_ready=False,
+                    )
+                    self._group_input = execution_prefill
+                else:
+                    self._group_input = prepared
+                    self._decode_input = (
+                        self._execution.decode_view(prepared)
+                        if first_batch.has_decode
+                        else None
+                    )
             elif first_batch.has_decode:
-                group_batch = compose_mixed_batch(
-                    list(first_batch.decode_reqs),
-                    execution_prefill.batch,
+                self._decode_input = self._execution.decode_view(
+                    prepared,
+                    source_metadata_ready=False,
                 )
-                metadata_state = self._execution.capture_prefill_metadata_state(
+                self._group_input = (
                     execution_prefill
+                    if self._execution.uses_separate_group_inputs
+                    else self._execution.compose_group_input(
+                        self._decode_input,
+                        execution_prefill,
+                    )
                 )
-                self._group_input = self._build_execution_input(group_batch)
-                self._execution.restore_prefill_metadata_state(
-                    self._group_input,
-                    execution_prefill,
-                    metadata_state,
-                )
-                self._decode_input = self._execution.decode_view(self._group_input)
             else:
                 self._group_input = execution_prefill
                 self._decode_input = None
@@ -197,7 +211,6 @@ class LayeredPipelineExecutor:
         self._wave = _LayeredPipelineWave(
             admission=admission,
             prefill_input=prefill_input,
-            attention_metadata_ready=attention_metadata_ready,
             cache_session=cache_session,
             prefill_execution=prefill_execution,
             state=prefill_state,
@@ -215,36 +228,20 @@ class LayeredPipelineExecutor:
         )
         decode_batch = self._decode_manager.schedule_next_batch()
         if decode_batch is None:
-            if (
-                execution_prefill is wave.prefill_input
-                and not wave.attention_metadata_ready
-            ):
-                wave.prefill_input = self._build_execution_input(
-                    wave.prefill_input.batch
-                )
-                wave.attention_metadata_ready = True
-                execution_prefill = wave.prefill_input
             self._current_prefill_input = execution_prefill
             self._group_input = execution_prefill
             return
 
         self._current_prefill_input = execution_prefill
-        mixed_batch = compose_mixed_batch(
-            list(decode_batch.reqs),
-            execution_prefill.batch,
-        )
-        metadata_state = self._execution.capture_prefill_metadata_state(
+        decode_input = self._prepare_decode_batch(decode_batch)
+        self._decode_input = decode_input
+        self._group_input = (
             execution_prefill
-        )
-        self._group_input = self._prepare_mixed_batch(decode_batch, mixed_batch)
-        self._execution.restore_prefill_metadata_state(
-            self._group_input,
-            execution_prefill,
-            metadata_state,
-        )
-        self._decode_input = self._execution.decode_view(
-            self._group_input,
-            decode_batch,
+            if self._execution.uses_separate_group_inputs
+            else self._execution.compose_group_input(
+                decode_input,
+                execution_prefill,
+            )
         )
 
     def advance_step(self) -> list[ForwardData]:

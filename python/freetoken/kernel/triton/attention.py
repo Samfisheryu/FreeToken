@@ -50,6 +50,9 @@ def _paged_attention_kernel(
     o_ptr,
     indptr_ptr,
     indices_ptr,
+    page_table_ptr,
+    table_idx_ptr,
+    slot_mapping_ptr,
     q_to_req_ptr,
     q_pos_ptr,
     sm_scale,
@@ -62,12 +65,15 @@ def _paged_attention_kernel(
     stride_vh,
     stride_ot,
     stride_oh,
+    stride_pt,
     GROUP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    USE_PAGE_TABLE: tl.constexpr,
+    HAS_SLOT_MAPPING: tl.constexpr,
 ):
     q_tok = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -106,7 +112,21 @@ def _paged_attention_kernel(
 
         skip_tile = tl.max(mask_n.to(tl.int32), axis=0) == 0
         if not skip_tile:
-            slots = tl.load(indices_ptr + kv_start + offs_n, mask=offs_n < kv_len, other=0)
+            if USE_PAGE_TABLE:
+                table_row = tl.load(table_idx_ptr + req)
+                slots = tl.load(
+                    page_table_ptr + table_row * stride_pt + offs_n,
+                    mask=offs_n < kv_len,
+                    other=0,
+                )
+                if HAS_SLOT_MAPPING:
+                    slots = tl.load(slot_mapping_ptr + slots)
+            else:
+                slots = tl.load(
+                    indices_ptr + kv_start + offs_n,
+                    mask=offs_n < kv_len,
+                    other=0,
+                )
             k = tl.load(
                 k_ptr
                 + slots[:, None] * stride_ks
@@ -154,6 +174,7 @@ def _decode_grouped_stage1_kernel(
     indices_ptr,
     page_table_ptr,
     table_idx_ptr,
+    slot_mapping_ptr,
     q_pos_ptr,
     mid_o_ptr,
     mid_lse_ptr,
@@ -183,6 +204,7 @@ def _decode_grouped_stage1_kernel(
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     USE_PAGE_TABLE: tl.constexpr,
+    HAS_SLOT_MAPPING: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -245,6 +267,8 @@ def _decode_grouped_stage1_kernel(
                     mask=mask_n,
                     other=0,
                 )
+                if HAS_SLOT_MAPPING:
+                    slots = tl.load(slot_mapping_ptr + slots)
             else:
                 slots = tl.load(
                     indices_ptr + kv_start + logical_offs,
@@ -390,6 +414,7 @@ def decode_paged_attention(
     out: torch.Tensor | None = None,
     page_table: torch.Tensor | None = None,
     table_idx: torch.Tensor | None = None,
+    slot_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """SGLang-style split-k grouped decode attention for one query per request."""
 
@@ -415,6 +440,8 @@ def decode_paged_attention(
         sinks = sinks.contiguous()
     use_page_table = page_table is not None
     assert use_page_table == (table_idx is not None)
+    if slot_mapping is not None:
+        assert use_page_table
     if use_page_table:
         assert page_table is not None and table_idx is not None
         assert page_table.is_cuda and page_table.dim() == 2
@@ -424,6 +451,7 @@ def decode_paged_attention(
     sinks_arg = sinks if sinks is not None else q
     page_table_arg = page_table if page_table is not None else indices
     table_idx_arg = table_idx if table_idx is not None else q_positions
+    slot_mapping_arg = slot_mapping if slot_mapping is not None else indices
     page_table_stride = page_table.stride(0) if page_table is not None else 0
     group = num_q_heads // num_kv_heads
     # valid_block_h = heads computed per program (drives the grid + head indexing); block_h =
@@ -445,6 +473,7 @@ def decode_paged_attention(
         indices,
         page_table_arg,
         table_idx_arg,
+        slot_mapping_arg,
         q_positions,
         attn_logits,
         attn_lse,
@@ -474,6 +503,7 @@ def decode_paged_attention(
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
         USE_PAGE_TABLE=use_page_table,
+        HAS_SLOT_MAPPING=slot_mapping is not None,
         num_warps=4,
         num_stages=2,
     )
@@ -515,6 +545,9 @@ def _extend_attention_kernel(
     qo_indptr_ptr,
     kv_indptr_ptr,
     kv_indices_ptr,
+    page_table_ptr,
+    table_idx_ptr,
+    slot_mapping_ptr,
     prefix_lens_ptr,
     sm_scale,
     sinks_ptr,
@@ -526,6 +559,7 @@ def _extend_attention_kernel(
     stride_vh,
     stride_ot,
     stride_oh,
+    stride_pt,
     GROUP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -534,6 +568,8 @@ def _extend_attention_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    USE_PAGE_TABLE: tl.constexpr,
+    HAS_SLOT_MAPPING: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -584,7 +620,21 @@ def _extend_attention_kernel(
 
         skip_tile = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
         if not skip_tile:
-            slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
+            if USE_PAGE_TABLE:
+                table_row = tl.load(table_idx_ptr + seq_id)
+                slots = tl.load(
+                    page_table_ptr + table_row * stride_pt + kv_offsets,
+                    mask=mask_n,
+                    other=0,
+                )
+                if HAS_SLOT_MAPPING:
+                    slots = tl.load(slot_mapping_ptr + slots)
+            else:
+                slots = tl.load(
+                    kv_indices_ptr + kv_start + kv_offsets,
+                    mask=mask_n,
+                    other=0,
+                )
             k = tl.load(
                 k_ptr
                 + slots[None, :] * stride_ks
@@ -636,6 +686,9 @@ def _extend_attention_split_kernel(
     qo_indptr_ptr,
     kv_indptr_ptr,
     kv_indices_ptr,
+    page_table_ptr,
+    table_idx_ptr,
+    slot_mapping_ptr,
     prefix_lens_ptr,
     sm_scale,
     sinks_ptr,
@@ -651,6 +704,7 @@ def _extend_attention_split_kernel(
     stride_vch,
     stride_ot,
     stride_oh,
+    stride_pt,
     GROUP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -659,6 +713,8 @@ def _extend_attention_split_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    USE_PAGE_TABLE: tl.constexpr,
+    HAS_SLOT_MAPPING: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -711,7 +767,21 @@ def _extend_attention_split_kernel(
             skip_tile = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not skip_tile:
-            slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
+            if USE_PAGE_TABLE:
+                table_row = tl.load(table_idx_ptr + seq_id)
+                slots = tl.load(
+                    page_table_ptr + table_row * stride_pt + kv_offsets,
+                    mask=mask_n,
+                    other=0,
+                )
+                if HAS_SLOT_MAPPING:
+                    slots = tl.load(slot_mapping_ptr + slots)
+            else:
+                slots = tl.load(
+                    kv_indices_ptr + kv_start + kv_offsets,
+                    mask=mask_n,
+                    other=0,
+                )
             k = tl.load(
                 k_cache_ptr
                 + slots[None, :] * stride_kcs
@@ -813,6 +883,9 @@ def extend_paged_attention(
     out: torch.Tensor | None = None,
     k_extend: torch.Tensor | None = None,
     v_extend: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
+    table_idx: torch.Tensor | None = None,
+    slot_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Block-tiled causal prefill/extend attention over paged KV cache."""
 
@@ -830,9 +903,21 @@ def extend_paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+    use_page_table = page_table is not None
+    assert use_page_table == (table_idx is not None)
+    if slot_mapping is not None:
+        assert use_page_table
+    if use_page_table:
+        assert page_table is not None and table_idx is not None
+        assert page_table.is_cuda and page_table.dim() == 2
+        assert table_idx.is_cuda and table_idx.numel() >= qo_indptr.numel() - 1
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
+    page_table_arg = page_table if page_table is not None else kv_indices
+    table_idx_arg = table_idx if table_idx is not None else prefix_lens
+    slot_mapping_arg = slot_mapping if slot_mapping is not None else kv_indices
+    page_table_stride = page_table.stride(0) if page_table is not None else 0
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
     # Tile size is shared-memory bound: keep the fast (large) tiles on GPUs whose opt-in
@@ -859,6 +944,9 @@ def extend_paged_attention(
             qo_indptr,
             kv_indptr,
             kv_indices,
+            page_table_arg,
+            table_idx_arg,
+            slot_mapping_arg,
             prefix_lens,
             sm_scale,
             sinks_arg,
@@ -874,6 +962,7 @@ def extend_paged_attention(
             v_cache.stride(1),
             o.stride(0),
             o.stride(1),
+            page_table_stride,
             GROUP=num_q_heads // num_kv_heads,
             D=head_dim,
             BLOCK_D=block_d,
@@ -882,6 +971,8 @@ def extend_paged_attention(
             BLOCK_N=block_n,
             SLIDING_WINDOW=sliding_window or 0,
             HAS_SINKS=sinks is not None,
+            USE_PAGE_TABLE=use_page_table,
+            HAS_SLOT_MAPPING=slot_mapping is not None,
             num_warps=8,
             num_stages=1,
         )
@@ -895,6 +986,9 @@ def extend_paged_attention(
         qo_indptr,
         kv_indptr,
         kv_indices,
+        page_table_arg,
+        table_idx_arg,
+        slot_mapping_arg,
         prefix_lens,
         sm_scale,
         sinks_arg,
@@ -906,6 +1000,7 @@ def extend_paged_attention(
         v_cache.stride(1),
         o.stride(0),
         o.stride(1),
+        page_table_stride,
         GROUP=num_q_heads // num_kv_heads,
         D=head_dim,
         BLOCK_D=block_d,
@@ -914,6 +1009,8 @@ def extend_paged_attention(
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        USE_PAGE_TABLE=use_page_table,
+        HAS_SLOT_MAPPING=slot_mapping is not None,
         num_warps=8,
         num_stages=1,
     )
@@ -933,6 +1030,9 @@ def paged_attention(
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     block_n: int = 32,
+    page_table: torch.Tensor | None = None,
+    table_idx: torch.Tensor | None = None,
+    slot_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paged causal attention for one layer.
 
@@ -953,9 +1053,21 @@ def paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+    use_page_table = page_table is not None
+    assert use_page_table == (table_idx is not None)
+    if slot_mapping is not None:
+        assert use_page_table
+    if use_page_table:
+        assert page_table is not None and table_idx is not None
+        assert page_table.is_cuda and page_table.dim() == 2
+        assert table_idx.is_cuda and table_idx.numel() >= indptr.numel() - 1
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
+    page_table_arg = page_table if page_table is not None else indices
+    table_idx_arg = table_idx if table_idx is not None else q_to_req
+    slot_mapping_arg = slot_mapping if slot_mapping is not None else indices
+    page_table_stride = page_table.stride(0) if page_table is not None else 0
     block_d = triton.next_power_of_2(head_dim)
     grid = (num_tokens, num_q_heads)
     _paged_attention_kernel[grid](
@@ -965,6 +1077,9 @@ def paged_attention(
         o,
         indptr,
         indices,
+        page_table_arg,
+        table_idx_arg,
+        slot_mapping_arg,
         q_to_req,
         q_positions,
         sm_scale,
@@ -977,12 +1092,15 @@ def paged_attention(
         v_cache.stride(1),
         o.stride(0),
         o.stride(1),
+        page_table_stride,
         GROUP=num_q_heads // num_kv_heads,
         D=head_dim,
         BLOCK_D=block_d,
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        USE_PAGE_TABLE=use_page_table,
+        HAS_SLOT_MAPPING=slot_mapping is not None,
         num_warps=8 if head_dim >= 256 else 4,
         num_stages=2,
     )

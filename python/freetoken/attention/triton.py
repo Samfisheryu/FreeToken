@@ -75,8 +75,12 @@ class TritonMetadata(BaseAttnMetadata):
     attn_lse: torch.Tensor | None = None
     num_kv_splits: torch.Tensor | None = None
     swa_indices: torch.Tensor | None = None
-    decode_page_table: torch.Tensor | None = None
-    decode_table_idx: torch.Tensor | None = None
+    # Direct addressing avoids flattened page-history copies when table rows
+    # remain stable (resident prefill) or are staged in capture storage (decode).
+    # SWA layers additionally translate full-pool slots through this mapping.
+    direct_page_table: torch.Tensor | None = None
+    direct_table_idx: torch.Tensor | None = None
+    direct_slot_mapping: torch.Tensor | None = None
     capture_staged: bool = False
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -103,6 +107,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             (group.head_dim for group in kv_groups),
             default=int(getattr(config, "head_dim", 1)),
         )
+        self._empty_indices = torch.empty(0, dtype=torch.int32, device=self.device)
 
     def _ensure_decode_scratch(
         self,
@@ -168,6 +173,11 @@ class TritonAttentionBackend(BaseAttnBackend):
         indices = metadata.indices
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
+        direct_slot_mapping = (
+            metadata.direct_slot_mapping
+            if spec.sliding_window is not None
+            else None
+        )
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
         if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
             bs = metadata.indptr.numel() - 1
@@ -189,8 +199,9 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
-                page_table=metadata.decode_page_table,
-                table_idx=metadata.decode_table_idx,
+                page_table=metadata.direct_page_table,
+                table_idx=metadata.direct_table_idx,
+                slot_mapping=direct_slot_mapping,
             )
         if (
             (not metadata.is_decode)
@@ -211,6 +222,9 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                page_table=metadata.direct_page_table,
+                table_idx=metadata.direct_table_idx,
+                slot_mapping=direct_slot_mapping,
             )
         return paged_attention(
             q=q,
@@ -223,7 +237,175 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            page_table=metadata.direct_page_table,
+            table_idx=metadata.direct_table_idx,
+            slot_mapping=direct_slot_mapping,
         )
+
+    def _layered_direct_metadata(self, batch: Batch) -> TritonMetadata:
+        """Build compact resident metadata without flattening KV history."""
+        reqs = batch.padded_reqs
+        device = self.device
+        seqlens_q = [req.extend_len for req in reqs]
+        seqlens_k = [req.device_len for req in reqs]
+        cached_lens = [req.cached_len for req in reqs]
+        num_query_tokens = sum(seqlens_q)
+        indptr = torch.tensor(
+            [0, *seqlens_k], dtype=torch.int32, device=device
+        ).cumsum_(0)
+        cu_seqlens_q_gpu = torch.tensor(
+            [0, *seqlens_q], dtype=torch.int32, device=device
+        ).cumsum_(0)
+        q_to_req = torch.repeat_interleave(
+            torch.arange(len(reqs), dtype=torch.int32, device=device),
+            torch.tensor(seqlens_q, dtype=torch.int64, device=device),
+            output_size=num_query_tokens,
+        )
+        q_positions = getattr(batch, "positions", None)
+        if q_positions is None:
+            q_positions = torch.zeros(
+                num_query_tokens, dtype=torch.int64, device=device
+            )
+        page_table = get_global_ctx().page_table
+        table_idx = torch.tensor(
+            [req.table_idx for req in reqs], dtype=torch.int64, device=device
+        )
+        swa_mapping = (
+            self.kvcache.full_to_swa_index_mapping
+            if getattr(self.kvcache, "swa_paged", False)
+            else None
+        )
+        return TritonMetadata(
+            cu_seqlens_q_gpu=cu_seqlens_q_gpu,
+            indptr=indptr,
+            indices=self._empty_indices,
+            q_to_req=q_to_req,
+            q_positions=q_positions,
+            is_decode=False,
+            prefix_lens=torch.tensor(
+                cached_lens, dtype=torch.int32, device=device
+            ),
+            max_q_len=max(seqlens_q),
+            direct_page_table=page_table,
+            direct_table_idx=table_idx,
+            direct_slot_mapping=swa_mapping,
+        )
+
+    def prepare_layered_prefill_metadata(self, batch: Batch) -> None:
+        if not batch.has_prefill or batch.has_decode:
+            raise ValueError(
+                "Triton layered metadata requires a prefill-only batch"
+            )
+        batch.attn_metadata = self._layered_direct_metadata(batch)
+
+    def compose_layered_metadata(
+        self,
+        decode: Batch,
+        prefill: Batch,
+        target: Batch,
+    ) -> None:
+        """Join prepared resident views while retaining direct page-table addressing."""
+        decode_rows = sum(req.extend_len for req in decode.reqs)
+        if decode_rows != decode.size:
+            raise RuntimeError("layered decode requires one query row per request")
+        prefill_metadata = prefill.attn_metadata
+        if not isinstance(prefill_metadata, TritonMetadata):
+            raise TypeError("layered Triton prefill metadata is missing")
+        if prefill_metadata.direct_page_table is None:
+            # A non-tiled wave may have entered through the ordinary snapshot path.
+            # Convert it once; subsequent groups reuse the compact representation.
+            prefill_metadata = self._layered_direct_metadata(prefill)
+            prefill.attn_metadata = prefill_metadata
+
+        cached = getattr(prefill, "_layered_triton_composed_metadata", None)
+        metadata = (
+            cached[1]
+            if isinstance(cached, tuple)
+            and len(cached) == 2
+            and cached[0] == decode_rows
+            else None
+        )
+        if metadata is None:
+            cu_seqlens_q_gpu = torch.cat(
+                (
+                    torch.arange(
+                        decode_rows + 1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    prefill_metadata.cu_seqlens_q_gpu[1:] + decode_rows,
+                )
+            )
+            q_to_req = torch.cat(
+                (
+                    torch.arange(
+                        decode_rows,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    prefill_metadata.q_to_req + decode_rows,
+                )
+            )
+            indptr = torch.empty(
+                target.size + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            prefix_lens = torch.empty(
+                target.size,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            prefix_lens[decode_rows:].copy_(prefill_metadata.prefix_lens)
+            table_idx = torch.empty(
+                target.size,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            assert prefill_metadata.direct_table_idx is not None
+            table_idx[decode_rows:].copy_(
+                prefill_metadata.direct_table_idx
+            )
+            metadata = TritonMetadata(
+                cu_seqlens_q_gpu=cu_seqlens_q_gpu,
+                indptr=indptr,
+                indices=self._empty_indices,
+                q_to_req=q_to_req,
+                q_positions=target.positions,
+                is_decode=False,
+                prefix_lens=prefix_lens,
+                max_q_len=max(1, prefill_metadata.max_q_len),
+                direct_page_table=prefill_metadata.direct_page_table,
+                direct_table_idx=table_idx,
+                direct_slot_mapping=prefill_metadata.direct_slot_mapping,
+            )
+            prefill._layered_triton_composed_metadata = (
+                decode_rows,
+                metadata,
+            )
+
+        # The scheduler stream waits for the prior resident forward before it
+        # prepares the next iteration, so these reusable buffers are no longer
+        # visible to a running kernel when updated.  Only decode prefixes vary.
+        metadata.indptr[0].zero_()
+        torch.cumsum(
+            decode.positions + 1,
+            dim=0,
+            out=metadata.indptr[1 : decode_rows + 1],
+        )
+        decode_k_rows = sum(req.device_len for req in decode.reqs)
+        torch.add(
+            prefill_metadata.indptr[1:],
+            decode_k_rows,
+            out=metadata.indptr[decode_rows + 1 :],
+        )
+        metadata.prefix_lens[:decode_rows].copy_(decode.positions)
+        decode_table_idx = decode.active_table_idx
+        if decode_table_idx is None:
+            raise RuntimeError("layered decode is missing page-table rows")
+        metadata.direct_table_idx[:decode_rows].copy_(decode_table_idx)
+        metadata.q_positions = target.positions
+        target.attn_metadata = metadata
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
@@ -260,8 +442,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 attn_logits=capture.attn_logits[:padded_size],
                 attn_lse=capture.attn_lse[:padded_size],
                 num_kv_splits=capture.num_kv_splits[:padded_size],
-                decode_page_table=page_table,
-                decode_table_idx=capture.table_idx[:padded_size],
+                direct_page_table=page_table,
+                direct_table_idx=capture.table_idx[:padded_size],
                 capture_staged=True,
             )
             return
@@ -339,6 +521,13 @@ class TritonAttentionBackend(BaseAttnBackend):
                 if metadata.swa_indices is not None
                 else None
             ),
+            direct_page_table=metadata.direct_page_table,
+            direct_table_idx=(
+                metadata.direct_table_idx[:decode_size]
+                if metadata.direct_table_idx is not None
+                else None
+            ),
+            direct_slot_mapping=metadata.direct_slot_mapping,
         )
         return True
 
@@ -451,8 +640,12 @@ class TritonAttentionBackend(BaseAttnBackend):
             attn_lse=capture.attn_lse[:bs],
             num_kv_splits=capture.num_kv_splits[:bs],
             swa_indices=self._capture_swa_indices(),
-            decode_page_table=(get_global_ctx().page_table if direct_page_table else None),
-            decode_table_idx=(capture.table_idx[:bs] if direct_page_table else None),
+            direct_page_table=(
+                get_global_ctx().page_table if direct_page_table else None
+            ),
+            direct_table_idx=(
+                capture.table_idx[:bs] if direct_page_table else None
+            ),
         )
 
     def prepare_for_capture(self, batch: Batch) -> None:

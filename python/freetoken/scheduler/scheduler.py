@@ -100,6 +100,7 @@ class Scheduler(SchedulerIOMixin):
         self.layered_wave: LayeredPrefillWave | None = None
         self.layered_stats = LayeredExecutionStats()
         self.resident_executor: ResidentExecutor | None = None
+        self.layered_pipeline_executor: LayeredPipelineExecutor | None = None
         self._resident_decode_input: StableDecodeInput | None = None
         if config.batching_policy == "legacy":
             composer_cls = LegacyBatchComposer
@@ -127,20 +128,22 @@ class Scheduler(SchedulerIOMixin):
             )
         elif config.batching_policy == "layered-pipeline":
             composer_cls = None
-            self.resident_executor = LayeredPipelineExecutor(
+            self.layered_pipeline_executor = LayeredPipelineExecutor(
                 engine=self.engine,
                 prefill_manager=self.prefill_manager,
                 decode_manager=self.decode_manager,
                 table_manager=self.table_manager,
                 max_wave_chunks=config.prefill_wave_max_chunks,
                 prepare_batch=self._prepare_resident_batch,
-                prepare_tiled_batch=self._prepare_resident_tiled_batch,
-                prepare_mixed_batch=self._prepare_resident_mixed_batch,
-                build_execution_input=self._build_layer_group_input,
+                prepare_allocation_only_batch=(
+                    self._prepare_resident_allocation_only_batch
+                ),
+                prepare_decode_batch=self._prepare_resident_group_decode_batch,
                 open_prefill_execution=self.cache_manager.open_prefill_execution,
                 report_prompt_admissions=self._report_prompt_admissions,
                 free_req_resources=self._free_req_resources,
             )
+            self.resident_executor = self.layered_pipeline_executor
         else:
             raise ValueError(f"Unknown batching policy: {config.batching_policy!r}")
         self.batch_composer = (
@@ -265,7 +268,7 @@ class Scheduler(SchedulerIOMixin):
         requested = self.config.max_extend_tokens
         cache_limit = self.cache_manager.prefill_chunk_budget
         self.prefill_budget = min(requested, cache_limit) if cache_limit else requested
-        if self.config.batching_policy == "layered-pipeline":
+        if self.layered_pipeline_executor is not None:
             logger.info_rank0(
                 "Layered pipeline iteration limit: "
                 f"requested_tokens={requested}, effective_tokens={self.prefill_budget}, "
@@ -774,22 +777,34 @@ class Scheduler(SchedulerIOMixin):
             self.engine.stream.wait_stream(self.stream)
             with self.engine_stream_ctx:
                 outputs = executor.advance_step()
+            if self.config.batching_policy == "layered-pipeline":
+                for data in outputs:
+                    output_batch = data[0].batch
+                    if output_batch.is_decode_only:
+                        # finish_decode has enqueued the sampled-token copy and advanced every
+                        # request's lengths. Reserve a page-boundary-crossing next query now,
+                        # on the scheduler stream, while the current group forward is still in
+                        # flight. The following prepare_step consumes the reservation through
+                        # the normal allocate_paged path, exactly like resident pure decode.
+                        self.cache_manager.reserve_next_decode(
+                            output_batch.decode_reqs
+                        )
 
         # Any page-table/cache writes performed while draining the prior iteration must follow
         # the just-enqueued forward, which can still read those entries. This is the same
         # stream-ordering barrier used by overlap_loop; copy_done then normally completes while
         # the scheduler prepares and enqueues the next iteration instead of stalling the host.
         self.stream.wait_stream(self.engine.stream)
-        for data in last_outputs:
-            self._process_last_data(data)
+        ready_outputs = list(last_outputs)
         deferred_outputs: list[ForwardData] = []
         for data in outputs:
             if data[0].batch.has_prefill:
                 # The prefill result is this request's first user-visible token. Publishing it
                 # now preserves TTFT; only steady-state decode benefits from a one-stage drain.
-                self._process_last_data(data)
+                ready_outputs.append(data)
             else:
                 deferred_outputs.append(data)
+        self._process_last_outputs(ready_outputs)
         self._resident_last_outputs = deferred_outputs
         self._flush_abort_acks()
 
@@ -826,9 +841,42 @@ class Scheduler(SchedulerIOMixin):
         self.sync_all_ranks()
         self.engine.shutdown()
 
-    def _process_last_data(self, last_data: ForwardData | None) -> None:
-        if last_data is None:
+    def _process_last_outputs(self, outputs: list[ForwardData]) -> None:
+        """Drain one scheduler round without losing any newly-finished request.
+
+        Resident execution can make several outputs ready together: the prior decode output,
+        followed by one or more terminal prefill outputs. ``finished_reqs`` from the preceding
+        round must suppress already-launched speculative tokens in every one of those outputs,
+        while requests that finish in an earlier output of this round must remain visible to
+        later outputs and to the next round. Commit the union only after the whole ordered group
+        has drained; an empty group intentionally preserves the prior suppression set.
+        """
+        if not outputs:
             return
+
+        suppressed_reqs = set(self.finished_reqs)
+        round_finished_reqs: Set[Req] = set()
+        for data in outputs:
+            newly_finished = self._process_last_data(
+                data,
+                suppressed_finished_reqs=suppressed_reqs,
+            )
+            round_finished_reqs.update(newly_finished)
+            suppressed_reqs.update(newly_finished)
+        self.finished_reqs = round_finished_reqs
+
+    def _process_last_data(
+        self,
+        last_data: ForwardData | None,
+        *,
+        suppressed_finished_reqs: Set[Req] | None = None,
+    ) -> Set[Req]:
+        if last_data is None:
+            return set()
+
+        commit_finished_reqs = suppressed_finished_reqs is None
+        if suppressed_finished_reqs is None:
+            suppressed_finished_reqs = self.finished_reqs
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
@@ -854,7 +902,7 @@ class Scheduler(SchedulerIOMixin):
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
                     continue
-                if req in self.finished_reqs:
+                if req in suppressed_finished_reqs:
                     # Overlap scheduling launched one more decode step for a request that
                     # already terminated (filter_reqs keeps it while output budget remains,
                     # and the next batch is scheduled before this drain runs). Its resources
@@ -900,7 +948,7 @@ class Scheduler(SchedulerIOMixin):
                 )
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
+                if finished and req not in suppressed_finished_reqs:
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
@@ -915,7 +963,8 @@ class Scheduler(SchedulerIOMixin):
                     # None'd GDN ping-pong slots).
                     self.cache_manager.cache_req(req, finished=False)
 
-        self.finished_reqs = new_finished_reqs
+        if commit_finished_reqs:
+            self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
         used, total = self._kv_usage_pages()
@@ -944,6 +993,7 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+        return new_finished_reqs
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -1357,21 +1407,25 @@ class Scheduler(SchedulerIOMixin):
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
 
-    def _prepare_resident_mixed_batch(
-        self, allocation_batch: Batch, mixed_batch: Batch
+    def _prepare_resident_group_decode_batch(
+        self,
+        batch: Batch,
     ) -> ForwardInput:
-        """Allocate decode once, then build only the group-local mixed metadata."""
+        """Allocate decode once, then build its resident-group input."""
         self._resident_decode_input = None
-        self._prepare_batch_resources(allocation_batch, graph_pad=False)
-        return self._build_layer_group_input(mixed_batch)
+        self._prepare_batch_resources(batch, graph_pad=False)
+        return self._build_layer_group_input(batch)
 
     def _prepare_resident_batch(self, batch: Batch) -> ForwardInput:
         """Prepare one resident-wave request batch without graph padding."""
         self._resident_decode_input = None
         return self._prepare_batch(batch, graph_pad=False)
 
-    def _prepare_resident_tiled_batch(self, batch: Batch) -> ForwardInput:
-        """Allocate a logical wave once; tile adapters own execution metadata."""
+    def _prepare_resident_allocation_only_batch(
+        self,
+        batch: Batch,
+    ) -> ForwardInput:
+        """Allocate a resident wave while leaving metadata to its adapter views."""
         self._resident_decode_input = None
         self._prepare_batch_resources(batch, graph_pad=False)
         if batch.has_prefill:

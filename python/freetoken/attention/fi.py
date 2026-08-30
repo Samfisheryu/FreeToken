@@ -51,7 +51,7 @@ class FIPathMetadata:
     kind:                Literal["decode", "prefill"]
     cu_seqlens_q_cpu:   torch.Tensor  # on cpu
     cu_seqlens_k_cpu:   torch.Tensor  # on cpu
-    indices:            torch.Tensor  # on backend device
+    indices:            torch.Tensor | None  # on backend device; deferred for layered tiles
     last_page_len_cpu:  torch.Tensor  # on cpu
     num_qo_heads:       int
     num_kv_heads:       int
@@ -62,6 +62,8 @@ class FIPathMetadata:
     dtype:              torch.dtype
     num_query_tokens:   int
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper | CUDAGraphBatchDecodeWithPagedKVCacheWrapper
+    deferred_table_rows: tuple[int, ...] | None = None
+    deferred_kv_lens:  tuple[int, ...] | None = None
     initialized:        bool = False
     # fmt: on
 
@@ -156,19 +158,59 @@ class FlashInferBackend(BaseAttnBackend):
         self.capture: FICaptureData | None = None
         self.last_event = torch.cuda.Event()
         self.last_event.record()
+        self._active_prefill_path: FIPathMetadata | None = None
+        self._layered_indices_buffer = torch.empty(
+            0, dtype=torch.int32, device=self.device
+        )
 
-    def _initialize_path_once(self, metadata: FIPathMetadata) -> None:
-        if metadata.initialized:
+    def _path_indices(self, metadata: FIPathMetadata) -> torch.Tensor:
+        if metadata.indices is not None:
+            return metadata.indices
+        rows = metadata.deferred_table_rows
+        kv_lens = metadata.deferred_kv_lens
+        if rows is None or kv_lens is None or len(rows) != len(kv_lens):
+            raise RuntimeError("deferred FlashInfer indices are incomplete")
+        total = sum(kv_lens)
+        if self._layered_indices_buffer.numel() < total:
+            self._layered_indices_buffer = torch.empty(
+                _next_power_of_2(total),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        indices = self._layered_indices_buffer[:total]
+        if total:
+            page_table = get_global_ctx().page_table
+            torch.cat(
+                tuple(
+                    page_table[row, :kv_len]
+                    for row, kv_len in zip(rows, kv_lens, strict=True)
+                ),
+                out=indices,
+            )
+        return indices
+
+    def _ensure_path_plan(self, metadata: FIPathMetadata) -> None:
+        shares_prefill_wrapper = (
+            metadata.kind == "prefill"
+            and metadata.wrapper is self.prefill_wrapper
+        )
+        # ``initialized`` belongs to the path, but eager prefill plan state belongs
+        # to the single mutable wrapper. A resident tile may skip planning only while
+        # it is still that wrapper's current owner.
+        if metadata.initialized and (
+            not shares_prefill_wrapper
+            or self._active_prefill_path is metadata
+        ):
             return
 
-        metadata.initialized = True
         # FlashInfer planning reuses a pinned host staging buffer and launches an
         # async H2D copy. Wait here before the next plan mutates that host buffer.
         self.last_event.synchronize()
+        indices = self._path_indices(metadata)
         if metadata.kind == "decode":
             metadata.wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
-                indices=metadata.indices,
+                indices=indices,
                 last_page_len=metadata.last_page_len_cpu,
                 num_qo_heads=metadata.num_qo_heads,
                 num_kv_heads=metadata.num_kv_heads,
@@ -185,7 +227,7 @@ class FlashInferBackend(BaseAttnBackend):
             metadata.wrapper.plan(
                 qo_indptr=metadata.cu_seqlens_q_cpu,
                 paged_kv_indptr=metadata.cu_seqlens_k_cpu,
-                paged_kv_indices=metadata.indices,
+                paged_kv_indices=indices,
                 paged_kv_last_page_len=metadata.last_page_len_cpu,
                 num_qo_heads=metadata.num_qo_heads,
                 num_kv_heads=metadata.num_kv_heads,
@@ -198,13 +240,16 @@ class FlashInferBackend(BaseAttnBackend):
                 non_blocking=True,
                 causal=True,
             )
+        metadata.initialized = True
+        if shares_prefill_wrapper:
+            self._active_prefill_path = metadata
         self.last_event.record()
 
-    def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
+    def _ensure_metadata_plans(self, metadata: FIMetadata) -> None:
         if metadata.decode is not None:
-            self._initialize_path_once(metadata.decode)
+            self._ensure_path_plan(metadata.decode)
         if metadata.prefill is not None:
-            self._initialize_path_once(metadata.prefill)
+            self._ensure_path_plan(metadata.prefill)
 
     def _get_ones_cpu(self, bs: int) -> torch.Tensor:
         if bs <= len(self.cached_ones_cpu):
@@ -235,7 +280,7 @@ class FlashInferBackend(BaseAttnBackend):
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
-        self._initialize_metadata_once(metadata)
+        self._ensure_metadata_plans(metadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
@@ -270,6 +315,7 @@ class FlashInferBackend(BaseAttnBackend):
         wrapper,
         page_table: torch.Tensor,
         cpu_kwargs: dict,
+        defer_indices: bool = False,
     ) -> FIPathMetadata:
         seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]
@@ -287,8 +333,12 @@ class FlashInferBackend(BaseAttnBackend):
             kind=kind,
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
-            indices=torch.cat(
-                [page_table[req.table_idx, : req.device_len] for req in reqs]
+            indices=(
+                None
+                if defer_indices
+                else torch.cat(
+                    [page_table[req.table_idx, : req.device_len] for req in reqs]
+                )
             ),
             last_page_len_cpu=self._get_ones_cpu(len(reqs)),
             num_qo_heads=self.qo_head_local,
@@ -300,9 +350,20 @@ class FlashInferBackend(BaseAttnBackend):
             dtype=self.kvcache.dtype,
             num_query_tokens=sum(seqlens_q),
             wrapper=wrapper,
+            deferred_table_rows=(
+                tuple(req.table_idx for req in reqs)
+                if defer_indices
+                else None
+            ),
+            deferred_kv_lens=(tuple(seqlens_k) if defer_indices else None),
         )
 
-    def prepare_metadata(self, batch: Batch) -> None:
+    def _prepare_metadata(
+        self,
+        batch: Batch,
+        *,
+        defer_prefill_indices: bool,
+    ) -> None:
         page_table = get_global_ctx().page_table
         cpu_kwargs = {
             "device": "cpu",
@@ -327,6 +388,7 @@ class FlashInferBackend(BaseAttnBackend):
                 wrapper=self.prefill_wrapper,
                 page_table=page_table,
                 cpu_kwargs=cpu_kwargs,
+                defer_indices=defer_prefill_indices,
             )
 
         if decode is not None and prefill is not None:
@@ -344,6 +406,16 @@ class FlashInferBackend(BaseAttnBackend):
             decode=decode,
             prefill=prefill,
         )
+
+    def prepare_metadata(self, batch: Batch) -> None:
+        self._prepare_metadata(batch, defer_prefill_indices=False)
+
+    def prepare_layered_prefill_metadata(self, batch: Batch) -> None:
+        if not batch.has_prefill or batch.has_decode:
+            raise ValueError(
+                "FlashInfer layered metadata requires a prefill-only batch"
+            )
+        self._prepare_metadata(batch, defer_prefill_indices=True)
 
     def prepare_metadata_view(self, source: Batch, target: Batch) -> bool:
         metadata = source.attn_metadata
@@ -367,12 +439,76 @@ class FlashInferBackend(BaseAttnBackend):
         )
         return True
 
+    def compose_layered_metadata(
+        self,
+        decode: Batch,
+        prefill: Batch,
+        target: Batch,
+    ) -> None:
+        decode_metadata = decode.attn_metadata
+        prefill_metadata = prefill.attn_metadata
+        if not isinstance(prefill_metadata, FIMetadata):
+            raise TypeError("layered FlashInfer prefill metadata is missing")
+        if prefill_metadata.prefill is None:
+            raise TypeError("layered FlashInfer path metadata is incomplete")
+        if not isinstance(decode_metadata, FIMetadata):
+            raise TypeError("layered FlashInfer decode metadata is missing")
+        decode_path = decode_metadata.decode
+        if decode_path is None:
+            raise TypeError("layered FlashInfer decode path metadata is incomplete")
+        prefill_path = prefill_metadata.prefill
+        decode_rows = sum(req.extend_len for req in decode.reqs)
+        prefill_rows = sum(req.extend_len for req in prefill.reqs)
+        if decode_rows != decode.size or decode_path.num_query_tokens != decode_rows:
+            raise RuntimeError("layered FlashInfer decode layout is inconsistent")
+        if prefill_path.num_query_tokens != prefill_rows:
+            raise RuntimeError("layered FlashInfer prefill layout is inconsistent")
+        if target.positions.numel() != decode_rows + prefill_rows:
+            raise RuntimeError("layered FlashInfer target rows are inconsistent")
+        cached = getattr(prefill, "_layered_fi_composed_metadata", None)
+        metadata = (
+            cached[2]
+            if isinstance(cached, tuple)
+            and len(cached) == 3
+            and cached[0] == decode_rows
+            and cached[1] is prefill_path
+            else None
+        )
+        if not isinstance(metadata, FIMetadata):
+            metadata = FIMetadata(
+                query_indptr=torch.cat(
+                    (
+                        torch.arange(
+                            decode_rows + 1,
+                            dtype=torch.int32,
+                            device=self.device,
+                        ),
+                        prefill_metadata.query_indptr[1:] + decode_rows,
+                    )
+                ),
+                decode=decode_path,
+                prefill=prefill_path,
+            )
+            prefill._layered_fi_composed_metadata = (
+                decode_rows,
+                prefill_path,
+                metadata,
+            )
+        else:
+            # query_indptr and the prefill plan are tile/shape invariant;
+            # decode addressing is rebuilt or supplied by the current backend
+            # iteration and must be replaced before this mixed forward.
+            metadata.decode = decode_path
+            metadata.prefill = prefill_path
+        target.attn_metadata = metadata
+
     def reset_capture(self) -> None:
         # Base clears the common capture scratch; additionally drop the per-bs decode graph
         # wrappers (their indptr/indices alias freed capture scratch). Preserves the
         # long-lived workspace buffers. Lets init_capture_graph re-run after a cache rebuild.
         super().reset_capture()
         self.graph_wrappers = {}
+        self._active_prefill_path = None
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
@@ -412,7 +548,7 @@ class FlashInferBackend(BaseAttnBackend):
         assert isinstance(metadata, FIMetadata)
         assert metadata.decode is not None and metadata.prefill is None
         metadata.decode.wrapper = self.graph_wrappers[bs]
-        self._initialize_metadata_once(metadata)
+        self._ensure_metadata_plans(metadata)
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
@@ -421,4 +557,4 @@ class FlashInferBackend(BaseAttnBackend):
         assert not metadata.decode.initialized
         assert self.capture is not None and bs in self.capture_bs
         metadata.decode.wrapper = self.graph_wrappers[bs]
-        self._initialize_metadata_once(metadata)
+        self._ensure_metadata_plans(metadata)

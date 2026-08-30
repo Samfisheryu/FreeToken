@@ -975,6 +975,7 @@ class Engine:
         input_mapping,
         *,
         linear_cache_is_hybrid: bool,
+        layered_prefill: bool = False,
     ) -> None:
         """Let execution backends own metadata after Scheduler allocates rows."""
         if self.linear_state_pool is not None:
@@ -1006,7 +1007,14 @@ class Engine:
                 else batch.decode_size
             )
             batch.active_table_idx = input_mapping[0][:decode_rows].view(-1)
-        self.attn_backend.prepare_metadata(batch)
+        if layered_prefill:
+            if batch.has_decode:
+                raise ValueError(
+                    "layered prefill metadata requires a prefill-only batch"
+                )
+            self.attn_backend.prepare_layered_prefill_metadata(batch)
+        else:
+            self.attn_backend.prepare_metadata(batch)
 
     def capture_stable_decode_state(self, batch: Batch) -> object | None:
         adapter = self._layered_execution_adapter

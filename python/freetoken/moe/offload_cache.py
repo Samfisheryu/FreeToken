@@ -121,6 +121,7 @@ class ResidentExpertSession:
         self._cache = cache
         self._stages = stages
         self._active_index: int | None = None
+        self._active_has_decode = False
         self._prefetched_index: int | None = None
         self._closed = False
         self._prepares_at_start = cache.prefill_layer_prepares
@@ -144,6 +145,10 @@ class ResidentExpertSession:
     def begin(self, index: int, *, has_decode: bool = True) -> ResidentExpertStage:
         stage = self.stage(index)
         if self._active_index == index:
+            # One resident stage can span several static tiles. Decode membership
+            # is refreshed per tile; hint_next must reserve scratch capacity only
+            # for the final tile that actually overlaps decode.
+            self._active_has_decode = has_decode
             return stage
         if self._active_index is not None:
             raise RuntimeError("another resident expert stage is still active")
@@ -157,6 +162,7 @@ class ResidentExpertSession:
             next_layer=next_layer,
         )
         self._active_index = index
+        self._active_has_decode = has_decode
         return stage
 
     def hint_next(self, index: int) -> bool:
@@ -168,6 +174,7 @@ class ResidentExpertSession:
         prefetched = self._cache.try_prefetch_next_resident_group(
             stage.start_layer,
             stage.end_layer,
+            needs_decode_reserve=self._active_has_decode,
         )
         if prefetched:
             self._prefetched_index = index
@@ -184,6 +191,7 @@ class ResidentExpertSession:
             raise RuntimeError("completed resident stage is not active")
         self._cache.end_prefill_group()
         self._active_index = None
+        self._active_has_decode = False
         if self._prefetched_index is not None:
             next_stage = self.stage(self._prefetched_index)
             if next_start_layer != next_stage.start_layer:
@@ -221,6 +229,7 @@ class ResidentExpertSession:
         if self._active_index is not None:
             self._cache.end_prefill_group()
             self._active_index = None
+            self._active_has_decode = False
         if self._prefetched_index is not None:
             self._cache.cancel_prefetched_resident_group()
             self._prefetched_index = None
@@ -1368,13 +1377,21 @@ class OffloadMoeCache:
         )
 
     def try_prefetch_next_resident_group(
-        self, start_layer: int, end_layer: int
+        self,
+        start_layer: int,
+        end_layer: int,
+        *,
+        needs_decode_reserve: bool = True,
     ) -> bool:
         """Prefetch a next group without releasing the current resident group.
 
-        Mapping and causal admission run on the current compute stream. Copy plans
-        and ready events are disjoint from both decode and the active group, so
-        current-group compute can overlap the next group's H2D copies.
+        Mapping and causal admission run on the current compute stream. The
+        resident plan stays disjoint from decode's shared plan; before reusing it
+        for the next group, the compute stream waits until active-group copies have
+        consumed it. Alternating ready events then let next-group H2D overlap the
+        remaining current-group compute. A decode iteration retains one full
+        working set outside both pinned groups; a prefill-only iteration needs only
+        the two groups themselves.
         """
         if self.device.type != "cuda":
             return False
@@ -1393,9 +1410,13 @@ class OffloadMoeCache:
                 f"{self.effective_prefill_group_size} fit in the canonical pool"
         )
         active_start, active_end = self._resident_group_range
-        active_layers = active_end - active_start
-        protected_slots = (active_layers + group_layers) * self.num_experts
-        if self.decode_cache_size - protected_slots < self.num_experts:
+        protected_slots = sum(
+            self._resident_working_set_rows[active_start:active_end]
+        ) + sum(self._resident_working_set_rows[start_layer:end_layer])
+        decode_reserve = (
+            max(self._resident_working_set_rows) if needs_decode_reserve else 0
+        )
+        if self.decode_cache_size - protected_slots < decode_reserve:
             return False
 
         assert self.prefill_copy_stream is not None
@@ -1404,9 +1425,10 @@ class OffloadMoeCache:
         assert self._resident_prefetch_src_indices is not None
         assert self._resident_prefetch_num_indices is not None
         current_stream = torch.cuda.current_stream(self.device)
-        # Admission for a newly started current group runs on the copy stream.
-        # Waiting its ready events here keeps canonical maps single-writer while
-        # still allowing next-group copies to overlap the final current compute.
+        # The active group's H2D copies consume the shared resident plan tensors.
+        # Wait only for those copies before rewriting the plan; current-group GEMMs
+        # remain queued independently and can still overlap the next group's H2D.
+        active_layers = active_end - active_start
         for event in self._resident_group_ready_events[:active_layers]:
             current_stream.wait_event(event)
 

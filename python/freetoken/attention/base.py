@@ -5,8 +5,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, List
 
+import torch
+
 if TYPE_CHECKING:
-    import torch
     from freetoken.core import Batch
 
 
@@ -98,6 +99,30 @@ class BaseAttnBackend(ABC):
             return True
         return False
 
+    def prepare_layered_prefill_metadata(self, batch: Batch) -> None:
+        """Prepare metadata whose lifetime spans resident layer groups.
+
+        Backends may use a compact representation when the resident scheduler
+        guarantees that the request page-table rows cannot change until the
+        wave finishes.  The default keeps the ordinary snapshot semantics.
+        """
+        self.prepare_metadata(batch)
+
+    def compose_layered_metadata(
+        self,
+        decode: Batch,
+        prefill: Batch,
+        target: Batch,
+    ) -> None:
+        """Attach metadata to a decode-first resident execution batch.
+
+        The two source batches are already prepared and remain alive for the
+        duration of this forward.  Backends that can join their metadata views
+        without rebuilding page-table history should override this method.
+        """
+        del decode, prefill
+        self.prepare_metadata(target)
+
     def capture_stable_decode_state(self, batch: Batch) -> object | None:
         """Return opaque reusable decode metadata, or None if replay must rebuild."""
         del batch
@@ -121,6 +146,25 @@ class BaseAttnBackend(ABC):
             self.max_graph_bs = 0
 
 
+@dataclass
+class _HybridLayeredMetadata(BaseAttnMetadata):
+    """Two backend-owned path batches for one decode-first resident forward."""
+
+    decode_batch: Batch
+    prefill_batch: Batch
+    decode_rows: int
+    prefill_rows: int
+
+    def get_last_indices(self, bs: int) -> torch.Tensor:
+        decode_last = self.decode_batch.attn_metadata.get_last_indices(
+            self.decode_batch.size
+        )
+        prefill_last = self.prefill_batch.attn_metadata.get_last_indices(
+            self.prefill_batch.size
+        )
+        return torch.cat((decode_last, prefill_last + self.decode_rows))[:bs]
+
+
 class HybridBackend(BaseAttnBackend):
     def __init__(
         self,
@@ -139,6 +183,31 @@ class HybridBackend(BaseAttnBackend):
         batch: Batch,
         attn_spec: AttentionSpec | None = None,
     ) -> torch.Tensor:
+        metadata = batch.attn_metadata
+        if isinstance(metadata, _HybridLayeredMetadata):
+            total_rows = metadata.decode_rows + metadata.prefill_rows
+            if not (
+                q.shape[0] == k.shape[0] == v.shape[0] == total_rows
+            ):
+                raise RuntimeError("hybrid layered attention rows are inconsistent")
+            decode_rows = metadata.decode_rows
+            decode_output = self.decode_backend.forward(
+                q[:decode_rows],
+                k[:decode_rows],
+                v[:decode_rows],
+                layer_id,
+                metadata.decode_batch,
+                attn_spec=attn_spec,
+            )
+            prefill_output = self.prefill_backend.forward(
+                q[decode_rows:],
+                k[decode_rows:],
+                v[decode_rows:],
+                layer_id,
+                metadata.prefill_batch,
+                attn_spec=attn_spec,
+            )
+            return torch.cat((decode_output, prefill_output), dim=0)
         backend = self.prefill_backend if batch.uses_extend_path else self.decode_backend
         return backend.forward(q, k, v, layer_id, batch, attn_spec=attn_spec)
 
@@ -173,12 +242,35 @@ class HybridBackend(BaseAttnBackend):
         )
         if backend is self.prefill_backend:
             return backend.prepare_metadata_view(source, target)
-        if self.prefill_backend is self.decode_backend:
-            return backend.prepare_metadata_view(source, target)
         if target.is_decode_only:
             backend.prepare_metadata(target)
             return True
         return backend.prepare_metadata_view(source, target)
+
+    def prepare_layered_prefill_metadata(self, batch: Batch) -> None:
+        self.prefill_backend.prepare_layered_prefill_metadata(batch)
+
+    def compose_layered_metadata(
+        self,
+        decode: Batch,
+        prefill: Batch,
+        target: Batch,
+    ) -> None:
+        if self.prefill_backend is self.decode_backend:
+            self.prefill_backend.compose_layered_metadata(decode, prefill, target)
+            return
+        decode_rows = sum(req.extend_len for req in decode.reqs)
+        prefill_rows = sum(req.extend_len for req in prefill.reqs)
+        if decode_rows != decode.size:
+            raise RuntimeError("hybrid layered decode requires one row per request")
+        if target.positions.numel() != decode_rows + prefill_rows:
+            raise RuntimeError("hybrid layered target rows are inconsistent")
+        target.attn_metadata = _HybridLayeredMetadata(
+            decode_batch=decode,
+            prefill_batch=prefill,
+            decode_rows=decode_rows,
+            prefill_rows=prefill_rows,
+        )
 
     def capture_stable_decode_state(self, batch: Batch) -> object | None:
         return self.decode_backend.capture_stable_decode_state(batch)
@@ -187,5 +279,8 @@ class HybridBackend(BaseAttnBackend):
         return self.decode_backend.restore_stable_decode_state(batch, state)
 
     def reset_capture(self) -> None:
-        # Only the decode backend is ever captured (see init_capture_graph above).
+        # Only the decode backend owns graph buffers, but the prefill backend may
+        # retain eager layered-plan ownership that also becomes stale at rebuild.
         self.decode_backend.reset_capture()
+        if self.prefill_backend is not self.decode_backend:
+            self.prefill_backend.reset_capture()

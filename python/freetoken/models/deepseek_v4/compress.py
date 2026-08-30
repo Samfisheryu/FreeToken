@@ -28,7 +28,6 @@ class Compressor(nn.Module):
         self.compress_ratio = compress_ratio
         self.overlap = compress_ratio == 4
         self.rotate = rotate
-        self.max_batch_size = args.max_batch_size
         coff = 1 + self.overlap
 
         self.ape = nn.Parameter(torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32), requires_grad=False)
@@ -62,10 +61,6 @@ class Compressor(nn.Module):
     def cmp_pool(self) -> torch.Tensor:
         return self.attn.compress_pool(self.layer_id, self.tier)
 
-    @property
-    def state_ring(self):
-        return self.attn.compress_state_ring(self.layer_id, self.tier)
-
     def bind_paged(self, pool, layer_id: int, freqs_cis, device, tier: str) -> None:
         self.layer_id = layer_id
         self.tier = tier
@@ -96,10 +91,9 @@ class Compressor(nn.Module):
         )
 
     def _seed_carry_from_ring(self, window_slot: int) -> None:
-        # Carry-by-value on a radix re-prefill: seed the register carry FROM the paged ring block of
-        # the matched window TAIL page (covering [start_pos-128, start_pos)), retained by the radix.
-        # Replaces the from-scratch seed at a hit; the block was written by the producing request's
-        # page-boundary write-through, cat([kv_state, score_state]) split at item_size.
+        # Carry-by-value for radix re-prefill or a physical-tile continuation: seed the register
+        # from the prior token's window-page ring.  The producing prefix/tile wrote the block as
+        # cat([kv_state, score_state]), split here at item_size.
         block = self.attn.read_carry(  # [ring_size, 2*item]
             self.layer_id, self.tier, window_slot, self.ring_size
         )
@@ -118,6 +112,31 @@ class Compressor(nn.Module):
             kv=kv, score=score, lo=lo, hi=hi, window_slots=window_slots,
         )
 
+    def _write_boundary_carry_from_register(self, window_slot: int) -> None:
+        """Persist the page-boundary form of the current rolling register.
+
+        This is needed only when an extend segment begins less than one compression
+        block before a page boundary: the backend's raw-range writer cannot slice
+        the prefix of that bridge block from the new-token tensor.  At the boundary
+        the overlap compressor carries its just-completed block in the A half;
+        the non-overlap compressor starts the next block empty.
+        """
+        kv_state = self._kv_state[0]
+        score_state = self._score_state[0]
+        boundary_kv = torch.zeros_like(kv_state)
+        boundary_score = torch.full_like(score_state, float("-inf"))
+        if self.overlap:
+            ratio = self.compress_ratio
+            boundary_kv[:ratio].copy_(kv_state[:ratio])
+            boundary_score[:ratio].copy_(score_state[:ratio])
+        self.attn.write_carry(
+            self.layer_id,
+            self.tier,
+            window_slot,
+            self.ring_size,
+            torch.cat([boundary_kv, boundary_score], dim=-1),
+        )
+
     def overlap_transform(self, tensor: torch.Tensor, value=0):
         b, s, _, _ = tensor.size()
         ratio, d = self.compress_ratio, self.head_dim
@@ -126,16 +145,49 @@ class Compressor(nn.Module):
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return new_tensor
 
+    def _finalize_compressed_blocks(
+        self,
+        reduced: torch.Tensor,
+        dtype: torch.dtype,
+        first_block_start: int,
+        table_idx: int,
+    ) -> torch.Tensor:
+        """Normalize, encode, quantize and persist consecutive compressed blocks."""
+        ratio = self.compress_ratio
+        reduced = self.norm(reduced.to(dtype))
+        block_end = first_block_start + reduced.size(1) * ratio
+        freqs_cis = self.freqs_cis[first_block_start:block_end:ratio]
+        rope_dim = self.rope_head_dim
+        apply_rotary_emb(reduced[..., -rope_dim:], freqs_cis)
+        if self.rotate:
+            reduced = hadamard_transform(reduced)
+            fp4_act_quant_inplace(reduced, 32)
+        else:
+            act_quant_fp8_inplace(reduced[..., :-rope_dim], 64)
+        block_starts = torch.arange(
+            first_block_start,
+            block_end,
+            ratio,
+            device=self._device,
+        )
+        self.attn.scatter_compressed(
+            self.layer_id,
+            self.tier,
+            self.attn.compress_rows_of(table_idx, block_starts, ratio),
+            reduced[0],
+        )
+        return reduced
+
     def forward(self, x, start_pos: int, window_slots: torch.Tensor, tail_window_slot=None, ti: int = 0):
-        # Prefill (single-request, start_pos==0) or carry-aware re-prefill (start_pos>0, radix hit).
+        # Prefill (single-request, start_pos==0) or carry-aware continuation (start_pos>0).
         # ``window_slots`` is translate(full_loc_map[ti, start_pos:start_pos+seqlen]) (the NEW
-        # tokens' page-tail slots). ``tail_window_slot`` (start_pos>0 only) is the matched tail
-        # page's window slot from which the boundary carry is read. ``ti`` is the prefill request's
-        # table row (its cmp row).
+        # tokens' page-tail slots). ``tail_window_slot`` (start_pos>0 only) is the prior token's
+        # window-page slot from which the carry is read: a radix boundary and a static-tile
+        # continuation use the same by-value ring contract. ``ti`` is the request's table row.
         assert self.cmp_pool is not None
         bsz, seqlen, _ = x.size()
-        ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
-        # start_pos>0 (radix re-prefill): carry-aware extend of the new tokens.
+        ratio, overlap = self.compress_ratio, self.overlap
+        # start_pos>0: carry-aware radix or physical-tile continuation.
         if start_pos > 0:
             return self.extend(x, start_pos, window_slots, int(tail_window_slot), ti)
         dtype = x.dtype
@@ -171,47 +223,33 @@ class Compressor(nn.Module):
                 self._write_through_carry(int(window_slots[-1].item()))
         if not should_compress:
             return None
-        kv = self.norm(kv.to(dtype))
-        freqs_cis = self.freqs_cis[:cutoff:ratio]
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
-        if self.rotate:
-            kv = hadamard_transform(kv)
-            fp4_act_quant_inplace(kv, 32)
-        else:
-            act_quant_fp8_inplace(kv[..., :-rd], 64)
-        # Scatter compressed blocks [0, seqlen//ratio) to the paged cmp_pool: block b -> row
-        # full_loc(b*ratio) // ratio (arithmetic; block b starts at abs position b*ratio).
-        block_starts = torch.arange(0, cutoff, ratio, device=self._device)
-        self.attn.scatter_compressed(
-            self.layer_id, self.tier,
-            self.attn.compress_rows_of(ti, block_starts, self.compress_ratio), kv[0],
-        )
-        return kv
+        return self._finalize_compressed_blocks(kv, dtype, 0, ti)
 
     def extend(self, x, start_pos: int, window_slots: torch.Tensor, tail_window_slot: int, ti: int = 0):
-        """Carry-aware compressor extend for new tokens [start_pos, start_pos+seqlen).
+        """Carry-aware compressor continuation for ``[start_pos, start_pos+seqlen)``.
 
-        ``start_pos`` is 128-aligned (== the radix match boundary, divisible by both ratios).
-        The carry needed at ``start_pos`` lives in the matched window TAIL page's ring block;
-        seed the register from it, then run the SAME reduction as the from-scratch prefill on the
-        new tokens (the seeded ``ks[:ratio]`` overlap provides the first new block's previous-
-        block overlap, exactly as the from-scratch overlap-seed does). Compressed blocks scatter
-        to their arithmetic rows (full_loc // ratio). ``window_slots`` is the new tokens' window
-        slots (translate(full_loc_map[ti, start_pos:start_pos+seqlen])) for the boundary
-        write-through; ``tail_window_slot`` is the matched tail page slot at start_pos-1.
+        The prior token's window-page ring owns the carry at ``start_pos``.  A radix
+        re-prefill reaches this method at a page boundary; layered static tiling may
+        reach it at any token boundary.  Block-aligned starts retain the bulk fast
+        path below.  A partial-block start streams through the saved register so the
+        completed block keeps its absolute APE, frequency, compressed row and page
+        carry ownership.
         """
         assert self.cmp_pool is not None
-        assert start_pos % self.P == 0, "radix re-prefill boundary must be 128-aligned"
         bsz, seqlen, _ = x.size()
-        ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
+        ratio, overlap = self.compress_ratio, self.overlap
         dtype = x.dtype
-        # Seed the register carry FROM the ring (the matched tail page covering
-        # [start_pos-128, start_pos)). The producing request wrote this boundary carry by value.
+        # Seed from the page containing start_pos-1.  Radix insertion, an earlier
+        # physical tile, or decode wrote this carry by value before the consumer.
         self._seed_carry_from_ring(tail_window_slot)
 
         x = x.float()
         kv = self.wkv(x)
         score = self.wgate(x)
+        if start_pos % ratio:
+            return self._extend_from_partial_block(
+                kv, score, start_pos, window_slots, ti, dtype
+            )
         kv_full, score_full = kv, score
         ks, ss = self._kv_state, self._score_state
         should_compress = (start_pos + seqlen) // ratio > start_pos // ratio
@@ -268,28 +306,153 @@ class Compressor(nn.Module):
             self._write_through_carry(int(window_slots[-1].item()))
         if not should_compress:
             return None
-        reduced = self.norm(reduced.to(dtype))
-        # freqs per compressed block: position b*ratio for absolute block b. start_pos is ratio-
-        # aligned, so the new FULL blocks span [start_pos, start_pos+cutoff) at stride ratio. Use
-        # the block-aligned `cutoff` end (NOT start_pos+seqlen): a stepped slice over an unaligned
-        # span ceils to one extra element when seqlen % ratio != 0 (mirrors the from-scratch
-        # prefill's freqs_cis[:cutoff:ratio]).
-        freqs_cis = self.freqs_cis[start_pos:start_pos + cutoff:ratio]
-        assert freqs_cis.size(0) == reduced.size(1), f"{freqs_cis.shape=} {reduced.shape=}"
-        apply_rotary_emb(reduced[..., -rd:], freqs_cis)
-        if self.rotate:
-            reduced = hadamard_transform(reduced)
-            fp4_act_quant_inplace(reduced, 32)
-        else:
-            act_quant_fp8_inplace(reduced[..., :-rd], 64)
-        # Scatter the new compressed blocks (abs positions [start_pos, start_pos+cutoff)) to their
-        # arithmetic rows full_loc(b*ratio) // ratio.
-        block_starts = torch.arange(start_pos, start_pos + cutoff, ratio, device=self._device)
-        self.attn.scatter_compressed(
-            self.layer_id, self.tier,
-            self.attn.compress_rows_of(ti, block_starts, self.compress_ratio), reduced[0],
+        return self._finalize_compressed_blocks(
+            reduced,
+            dtype,
+            start_pos,
+            ti,
         )
-        return reduced
+
+    def _extend_from_partial_block(
+        self,
+        kv: torch.Tensor,
+        score: torch.Tensor,
+        start_pos: int,
+        window_slots: torch.Tensor,
+        ti: int,
+        dtype: torch.dtype,
+    ):
+        """Continue a compression block split by a physical prefill tile.
+
+        Only the bridge block is handled scalar-wise.  Every complete block after
+        it remains one vectorized reduction, so cost is independent of tile shape
+        apart from the work the original aligned path already performs.
+        """
+        bsz, seqlen, _ = kv.shape
+        ratio, overlap, d = (
+            self.compress_ratio,
+            self.overlap,
+            self.head_dim,
+        )
+        end = start_pos + seqlen
+        block_offset = start_pos % ratio
+        bridge_tokens = min(seqlen, ratio - block_offset)
+        ks, ss = self._kv_state, self._score_state
+        state_offset = ratio + block_offset if overlap else block_offset
+        ks[:bsz, state_offset:state_offset + bridge_tokens].copy_(
+            kv[:, :bridge_tokens]
+        )
+        ss[:bsz, state_offset:state_offset + bridge_tokens].copy_(
+            score[:, :bridge_tokens]
+            + self.ape[block_offset:block_offset + bridge_tokens]
+        )
+
+        # The segment ends inside the same compression block.  No page boundary
+        # can occur here because every page boundary is ratio-aligned.
+        if bridge_tokens < ratio - block_offset:
+            self._write_through_carry(int(window_slots[-1].item()))
+            return None
+
+        reduced_parts: list[torch.Tensor] = []
+        if overlap:
+            kv_eff = torch.cat(
+                [ks[:bsz, :ratio, :d], ks[:bsz, ratio:, d:]], dim=1
+            )
+            score_eff = torch.cat(
+                [ss[:bsz, :ratio, :d], ss[:bsz, ratio:, d:]], dim=1
+            )
+            reduced_parts.append(
+                (kv_eff * score_eff.softmax(dim=1)).sum(dim=1).unsqueeze(1)
+            )
+            ks[:bsz, :ratio].copy_(ks[:bsz, ratio:])
+            ss[:bsz, :ratio].copy_(ss[:bsz, ratio:])
+        else:
+            reduced_parts.append(
+                (ks[:bsz] * ss[:bsz].softmax(dim=1)).sum(dim=1).unsqueeze(1)
+            )
+
+        cursor = bridge_tokens
+        bridge_end = start_pos + bridge_tokens
+        boundary_lo = start_pos
+        if bridge_end % self.P == 0:
+            self._write_boundary_carry_from_register(
+                int(window_slots[bridge_tokens - 1].item())
+            )
+            # The bridge boundary is already written.  Slicing the raw range here
+            # makes every later boundary have a full ratio-token source block.
+            boundary_lo = bridge_end
+
+        full_tokens = ((seqlen - cursor) // ratio) * ratio
+        if full_tokens:
+            full_end = cursor + full_tokens
+            kv_blocks = kv[:, cursor:full_end].unflatten(1, (-1, ratio))
+            score_blocks = (
+                score[:, cursor:full_end].unflatten(1, (-1, ratio))
+                + self.ape
+            )
+            if overlap:
+                kv_chain = torch.cat(
+                    [ks[:bsz, :ratio].unsqueeze(1), kv_blocks], dim=1
+                )
+                score_chain = torch.cat(
+                    [ss[:bsz, :ratio].unsqueeze(1), score_blocks], dim=1
+                )
+                kv_eff = self.overlap_transform(kv_chain, 0)[:, 1:]
+                score_eff = self.overlap_transform(
+                    score_chain, float("-inf")
+                )[:, 1:]
+                reduced_parts.append(
+                    (kv_eff * score_eff.softmax(dim=2)).sum(dim=2)
+                )
+                ks[:bsz, :ratio].copy_(kv_blocks[:, -1])
+                ss[:bsz, :ratio].copy_(score_blocks[:, -1])
+            else:
+                reduced_parts.append(
+                    (kv_blocks * score_blocks.softmax(dim=2)).sum(dim=2)
+                )
+            cursor = full_end
+
+        # A completed block starts a fresh partial half.  Clear only after all
+        # reductions have consumed the bridge/full-block state, then retain the
+        # final incomplete suffix for the next physical tile or decode token.
+        if overlap:
+            ks[:bsz, ratio:].zero_()
+            ss[:bsz, ratio:].fill_(float("-inf"))
+            tail_offset = ratio
+        else:
+            ks[:bsz].zero_()
+            ss[:bsz].fill_(float("-inf"))
+            tail_offset = 0
+        tail = seqlen - cursor
+        if tail:
+            ks[:bsz, tail_offset:tail_offset + tail].copy_(kv[:, cursor:])
+            ss[:bsz, tail_offset:tail_offset + tail].copy_(
+                score[:, cursor:] + self.ape[:tail]
+            )
+
+        raw_offset = boundary_lo - start_pos
+        self._write_boundary_carries_range(
+            kv[:, raw_offset:],
+            score[:, raw_offset:],
+            boundary_lo,
+            end,
+            window_slots[raw_offset:],
+        )
+        if end % self.P != 0:
+            self._write_through_carry(int(window_slots[-1].item()))
+
+        reduced = (
+            reduced_parts[0]
+            if len(reduced_parts) == 1
+            else torch.cat(reduced_parts, dim=1)
+        )
+        first_block_start = start_pos - block_offset
+        return self._finalize_compressed_blocks(
+            reduced,
+            dtype,
+            first_block_start,
+            ti,
+        )
 
     def decode_step(
         self, x: torch.Tensor, pos: torch.Tensor, prev_window_slots: torch.Tensor,
@@ -426,9 +589,12 @@ class Indexer(nn.Module):
         )
 
     def extend(self, x, qr, start_pos, offset, window_slots, tail_window_slot, ti: int = 0):
-        """Carry-aware indexer for re-prefill new tokens [start_pos, end). Runs the indexer's
-        compressor extend (writes new idx blocks), scores each new query over compressed indexer
-        blocks [0, end//ratio) with a causal mask, returns top-k block indices offset by ``offset``."""
+        """Carry-aware indexer continuation for new tokens ``[start_pos, end)``.
+
+        Its private compressor shares the arbitrary-boundary continuation contract
+        with the attention compressor, writes newly completed idx blocks, then
+        scores each query over causal blocks ``[0, end // ratio)``.
+        """
         bsz, seqlen, _ = x.size()
         end = start_pos + seqlen
         freqs_cis = self.freqs_cis[start_pos:end]

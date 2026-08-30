@@ -26,6 +26,10 @@ class DSV4LayeredExecutionAdapter(LayeredExecutionAdapter):
     share expert residency but cannot be concatenated into one attention batch.
     """
 
+    @property
+    def uses_separate_group_inputs(self) -> bool:
+        return True
+
     def begin_group(
         self,
         group_input: ForwardInput,

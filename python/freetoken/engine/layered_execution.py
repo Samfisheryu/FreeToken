@@ -61,6 +61,16 @@ class _LayeredPrefillTile:
     terminal_rows: tuple[tuple[int, int], ...]
 
 
+@dataclass(frozen=True)
+class _LayeredGroupBuffers:
+    """Reusable decode-prefix/static-prefill execution tensors for one tile."""
+
+    decode_rows: int
+    positions: torch.Tensor
+    input_ids: torch.Tensor
+    out_loc: torch.Tensor
+
+
 @dataclass
 class _TiledPrefillState:
     """Adapter-owned stage x tile cursor and opaque per-tile model states."""
@@ -134,6 +144,11 @@ class LayeredExecutionAdapter:
         if cache is None:
             raise RuntimeError("layered execution requires an expert cache")
         return cache.open_resident_wave()
+
+    @property
+    def uses_separate_group_inputs(self) -> bool:
+        """Whether decode and prefill execute separately inside a resident group."""
+        return False
 
     def create_range_graph_inputs(self, seed_state: object):
         return self._engine.model.create_layer_range_graph_inputs(seed_state)
@@ -270,19 +285,134 @@ class LayeredExecutionAdapter:
         """Attach backend-owned metadata to an allocation-free batch view."""
         return self._engine.attn_backend.prepare_metadata_view(source, target)
 
-    def capture_prefill_metadata_state(self, prefill_input: ForwardInput):
-        del prefill_input
-        return None
+    def prepare_layered_prefill_input(self, prefill_input: ForwardInput) -> None:
+        """Prepare long-lived metadata without rebuilding static row mappings."""
+        batch = prefill_input.batch
+        self._engine.prepare_execution_metadata(
+            batch,
+            prefill_input.input_tuple,
+            linear_cache_is_hybrid=(
+                getattr(self._engine.config, "cache_type", "")
+                == "hybrid_radix"
+            ),
+            layered_prefill=True,
+        )
 
-    def restore_prefill_metadata_state(
+    def compose_group_input(
         self,
-        group_input: ForwardInput,
+        decode_input: ForwardInput,
         prefill_input: ForwardInput,
-        state,
-    ) -> None:
-        del group_input, prefill_input
-        if state is not None:
-            raise RuntimeError("model adapter cannot restore prefill metadata state")
+    ) -> ForwardInput:
+        """Join two prepared views for the active resident group only.
+
+        Allocation, output ownership and sampling stay with the two source
+        views.  Only Batch fields enter group execution, so token-pool mappings
+        remain borrowed from the static prefill view instead of being joined.
+        Backend metadata is joined from the already-prepared path metadata.
+        """
+        decode_batch = decode_input.batch
+        prefill_batch = prefill_input.batch
+        if not decode_batch.is_decode_only or not prefill_batch.has_prefill:
+            raise ValueError("layered group composition requires decode and prefill views")
+        if sum(req.extend_len for req in decode_batch.reqs) != decode_batch.size:
+            raise RuntimeError("layered decode requires one query row per request")
+        batch = Batch(
+            reqs=[*decode_batch.reqs, *prefill_batch.reqs],
+            decode_size=decode_batch.size,
+        )
+        batch.padded_reqs = list(batch.reqs)
+        batch.log_new_tokens = prefill_batch.log_new_tokens
+        batch.log_cached_tokens = prefill_batch.log_cached_tokens
+        batch.prompt_admissions = list(prefill_batch.prompt_admissions)
+        if decode_batch.out_loc is None or prefill_batch.out_loc is None:
+            raise RuntimeError("layered group source is missing output locations")
+        buffers = getattr(prefill_batch, "_layered_group_buffers", None)
+        if (
+            not isinstance(buffers, _LayeredGroupBuffers)
+            or buffers.decode_rows != decode_batch.size
+        ):
+            decode_rows = decode_batch.size
+
+            def allocate_join(
+                decode_tensor: torch.Tensor,
+                prefill_tensor: torch.Tensor,
+            ) -> torch.Tensor:
+                if decode_tensor.shape[1:] != prefill_tensor.shape[1:]:
+                    raise RuntimeError(
+                        "layered decode and prefill tensors have different shapes"
+                    )
+                if (
+                    decode_tensor.dtype != prefill_tensor.dtype
+                    or decode_tensor.device != prefill_tensor.device
+                ):
+                    raise RuntimeError(
+                        "layered decode and prefill tensors have different storage"
+                    )
+                result = torch.empty(
+                    (
+                        decode_tensor.shape[0] + prefill_tensor.shape[0],
+                        *decode_tensor.shape[1:],
+                    ),
+                    dtype=decode_tensor.dtype,
+                    device=decode_tensor.device,
+                )
+                result[decode_rows:].copy_(prefill_tensor)
+                return result
+
+            buffers = _LayeredGroupBuffers(
+                decode_rows=decode_rows,
+                positions=allocate_join(
+                    decode_batch.positions,
+                    prefill_batch.positions,
+                ),
+                input_ids=allocate_join(
+                    decode_batch.input_ids,
+                    prefill_batch.input_ids,
+                ),
+                out_loc=allocate_join(
+                    decode_batch.out_loc,
+                    prefill_batch.out_loc,
+                ),
+            )
+            prefill_batch._layered_group_buffers = buffers
+
+        decode_rows = buffers.decode_rows
+        buffers.positions[:decode_rows].copy_(decode_batch.positions)
+        buffers.input_ids[:decode_rows].copy_(decode_batch.input_ids)
+        buffers.out_loc[:decode_rows].copy_(decode_batch.out_loc)
+        batch.positions = buffers.positions
+        batch.out_loc = buffers.out_loc
+        batch.input_ids = buffers.input_ids
+        batch.active_table_idx = decode_batch.active_table_idx
+        batch.mm_embeds = prefill_batch.mm_embeds
+
+        decode_fla = decode_batch.fla_metadata
+        prefill_fla = prefill_batch.fla_metadata
+        if decode_fla is not None or prefill_fla is not None:
+            from freetoken.attention.linear import FLAMetadata
+
+            if not isinstance(decode_fla, FLAMetadata) or decode_fla.decode is None:
+                raise RuntimeError("layered decode linear metadata is missing")
+            if not isinstance(prefill_fla, FLAMetadata) or prefill_fla.prefill is None:
+                raise RuntimeError("layered prefill linear metadata is missing")
+            batch.fla_metadata = FLAMetadata(
+                decode=decode_fla.decode,
+                prefill=prefill_fla.prefill,
+            )
+
+        self._engine.attn_backend.compose_layered_metadata(
+            decode_batch,
+            prefill_batch,
+            batch,
+        )
+        return ForwardInput(
+            batch,
+            # Sampling and token-pool IO remain source-owned and are never
+            # performed through this execution-only combined view.
+            decode_input.sample_args,
+            prefill_input.input_tuple,
+            prefill_input.write_tuple,
+        )
 
     def capture_stable_decode_state(self, batch: Batch) -> object | None:
         if (
@@ -358,6 +488,7 @@ class LayeredExecutionAdapter:
                     getattr(self._engine.config, "cache_type", "")
                     == "hybrid_radix"
                 ),
+                layered_prefill=True,
             )
             for req_view, request_index in zip(
                 tile_reqs,
@@ -437,12 +568,12 @@ class LayeredExecutionAdapter:
     def decode_view(
         self,
         mixed_input: ForwardInput,
-        view: Batch | None = None,
+        *,
+        source_metadata_ready: bool = True,
     ) -> ForwardInput:
         mixed_batch = mixed_input.batch
         decode_size = mixed_batch.decode_size
-        if view is None:
-            view = _batch_view(mixed_batch, 0, decode_size, decode_size)
+        view = _batch_view(mixed_batch, 0, decode_size, decode_size)
         decode_rows = sum(req.extend_len for req in view.reqs)
         if decode_rows != decode_size:
             raise RuntimeError("layered decode requires one query row per request")
@@ -453,12 +584,25 @@ class LayeredExecutionAdapter:
         view.out_loc = mixed_batch.out_loc[:decode_rows]
         view.active_table_idx = mixed_input.input_tuple[0][:decode_rows]
         view.input_ids = mixed_batch.input_ids[:decode_rows]
-        metadata_ready = self.prepare_metadata_view(
-            mixed_batch,
-            view,
-        )
-        if not metadata_ready:
-            raise RuntimeError("decode metadata view was not prepared")
+        if source_metadata_ready:
+            metadata_ready = self.prepare_metadata_view(
+                mixed_batch,
+                view,
+            )
+            if not metadata_ready:
+                raise RuntimeError("decode metadata view was not prepared")
+        else:
+            self._engine.prepare_execution_metadata(
+                view,
+                (
+                    mixed_input.input_tuple[0][:decode_rows],
+                    mixed_input.input_tuple[1][:decode_rows],
+                ),
+                linear_cache_is_hybrid=(
+                    getattr(self._engine.config, "cache_type", "")
+                    == "hybrid_radix"
+                ),
+            )
         return ForwardInput(
             view,
             _sampling_view(mixed_input.sample_args, 0, decode_size),
@@ -475,20 +619,18 @@ class LayeredExecutionAdapter:
     def prefill_view(
         self,
         mixed_input: ForwardInput,
-        view: Batch | None = None,
         *,
         prepare_metadata: bool = True,
     ) -> tuple[ForwardInput, bool]:
         mixed_batch = mixed_input.batch
         request_start = mixed_batch.decode_size
         row_start = sum(req.extend_len for req in mixed_batch.decode_reqs)
-        if view is None:
-            view = _batch_view(
-                mixed_batch,
-                request_start,
-                len(mixed_batch.reqs),
-                0,
-            )
+        view = _batch_view(
+            mixed_batch,
+            request_start,
+            len(mixed_batch.reqs),
+            0,
+        )
         view.padded_reqs = list(view.reqs)
         view.positions = mixed_batch.positions[row_start:]
         if mixed_batch.out_loc is None:
