@@ -403,6 +403,8 @@ def parse_mode(value: str) -> dict[str, Any]:
     normalized = value.lower().replace("_", "-")
     if normalized == "legacy":
         return {"name": "legacy", "batching_policy": "legacy"}
+    if normalized == "mixed":
+        return {"name": "mixed", "batching_policy": "mixed"}
     parts = normalized.split("-")
     if len(parts) == 4 and parts[:2] == ["layered", "pipeline"]:
         group_text, wave_text = parts[2], parts[3]
