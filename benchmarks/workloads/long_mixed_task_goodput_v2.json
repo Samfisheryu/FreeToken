@@ -1,0 +1,134 @@
+{
+  "schema": "freetoken.long_mixed_task_goodput_spec.v2",
+  "name": "long-mixed-task-goodput-v2",
+  "system_prompt": "Follow the requested output format exactly.",
+  "max_sequence_length": 40960,
+  "tokenizer": {
+    "default_path": "/data1/lmcache_kv/models/Qwen3.6-35B-A3B",
+    "add_generation_prompt": true,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "length_buckets": {
+    "targets": [8192, 16384, 32768],
+    "minimum_fraction": 0.9,
+    "retrieval": {
+      "algorithm": "Okapi BM25",
+      "version": "question_only_original_blocks_v1",
+      "k1": 1.2,
+      "b": 0.75,
+      "maximum_block_tokens": 512,
+      "restore_source_order": true,
+      "padding_or_repetition": false
+    }
+  },
+  "traffic": {
+    "user_count": 20,
+    "first_submission_stagger_seconds": 0.5,
+    "think_time_seconds": 2.0,
+    "hard_request_timeout_seconds": 210,
+    "warmup": {
+      "task_count": 20,
+      "tasks_per_family": {
+        "numeric": 7,
+        "code": 7,
+        "knowledge": 6
+      }
+    },
+    "dev": {
+      "submission_window_seconds": 120,
+      "turns_per_user": 12,
+      "tasks_per_family": 80,
+      "length_bucket_counts_per_family": {
+        "8192": 32,
+        "16384": 32,
+        "32768": 16
+      }
+    },
+    "final": {
+      "submission_window_seconds": 180,
+      "turns_per_user": 51,
+      "tasks_per_family": 340,
+      "length_bucket_counts_per_family": {
+        "8192": 136,
+        "16384": 136,
+        "32768": 68
+      }
+    }
+  },
+  "families": {
+    "numeric": {
+      "max_tokens_cap": 128,
+      "slo_seconds": 90,
+      "instruction": "Return exactly one line in the form FINAL: number. Do not include any explanation. A percentage may use a trailing percent sign.",
+      "source": "docfinqa"
+    },
+    "code": {
+      "max_tokens_cap": 2048,
+      "slo_seconds": 180,
+      "instruction": "Return exactly one unified diff and no prose or Markdown fences. The patch must contain standard file headers and at least one hunk.",
+      "source": "swe_bm25_verified"
+    },
+    "knowledge": {
+      "max_tokens_cap": 32,
+      "slo_seconds": 60,
+      "instruction": "Return exactly one line in the form FINAL: A, FINAL: B, FINAL: C, or FINAL: D. Do not include any explanation.",
+      "source": "longbench_v2"
+    }
+  },
+  "sources": {
+    "docfinqa": {
+      "repository": "kensho/DocFinQA",
+      "revision": "64ebaff62f692495bcc182f45cf9a9606251b19b",
+      "license": "MIT",
+      "files": {
+        "validation": "dev.json",
+        "test": "test.json"
+      }
+    },
+    "swe_bm25": {
+      "repository": "princeton-nlp/SWE-bench_bm25_40K",
+      "revision": "c7bc17e54d390580a9d40ecc72948e3eac296b83",
+      "license": null,
+      "files": {
+        "test": "data/test-00000-of-00001.parquet"
+      }
+    },
+    "swe_verified": {
+      "repository": "SWE-bench/SWE-bench_Verified",
+      "revision": "78f471bf655a3137b2e8a75af1501690ec009ec3",
+      "license": null,
+      "files": {
+        "test": "data/test-00000-of-00001.parquet",
+        "eval_config": "eval.yaml"
+      }
+    },
+    "longbench_v2": {
+      "repository": "zai-org/LongBench-v2",
+      "revision": "2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9",
+      "license": "Apache-2.0",
+      "files": {
+        "train": "data.json"
+      },
+      "excluded_domain": "Code Repository Understanding",
+      "excluded_sub_domain": "Code repo QA"
+    }
+  },
+  "evaluators": {
+    "finqa_numeric": {
+      "repository": "czyssrs/FinQA",
+      "revision": "0f16e2867befa6840783e58be38c9efb9229d742",
+      "path": "code/evaluate/evaluate.py",
+      "license": "MIT",
+      "normalization": "official_str_to_num_then_python_round_5_v1"
+    },
+    "swebench": {
+      "repository": "SWE-bench/SWE-bench",
+      "version": "5.0.1",
+      "revision": "87ab1f6ced28f75ba73ca899dc759b019310944a",
+      "license": "MIT",
+      "container_source": "SWE-bench/SWE-bench_Verified.image"
+    }
+  }
+}

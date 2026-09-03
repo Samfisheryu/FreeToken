@@ -1,0 +1,41 @@
+{
+  "schema": "freetoken.aime_steady_goodput_workload.v1",
+  "name": "aime_steady_goodput_v1",
+  "description": "A steady-state task-goodput workload with staggered closed-loop users and a fixed submission window.",
+  "defaults": {
+    "user_count": 20,
+    "start_cadence_seconds": 10.0,
+    "think_time_seconds": 30.0,
+    "measurement_seconds": 1800.0
+  },
+  "task_stream": {
+    "format": "JSON Lines",
+    "required_fields": {
+      "task_id": "non-empty string unique within the file",
+      "problem": "non-empty string sent to the model",
+      "answer": "integer or text containing one boxed integer",
+      "source": "non-empty string identifying the task source"
+    },
+    "assignment": "For N users, zero-based user u receives row k*N+u on turn k.",
+    "repeat_policy": "Rows and task_id values are unique and the runner never wraps the stream. Exhaustion invalidates the arm."
+  },
+  "prompt_contract": {
+    "policy_scope": "One system prompt and one answer instruction are frozen for the entire arm; neither may vary by user or task.",
+    "default_system_prompt": "",
+    "answer_instruction": "Please reason step by step, and put your final answer within \\boxed{}.",
+    "append_instruction_when_missing": "\\boxed",
+    "default_message_construction": "Omit the system message when default_system_prompt is empty. Strip trailing whitespace from the task problem, append one newline plus answer_instruction when the problem does not already contain append_instruction_when_missing, and send that as the single user message.",
+    "task_endpoint": "The first streamed occurrence matching \\boxed{integer}; the client immediately closes the HTTP stream whether that integer is correct or incorrect.",
+    "no_box_behavior": "Wait for a server stop, length limit, request timeout, or observable HTTP/stream error."
+  },
+  "closed_loop": {
+    "first_submit_at": "schedule_origin + user_index * start_cadence_seconds",
+    "later_submit_at": "prior_task_terminal + think_time_seconds",
+    "inflight_limit_per_user": 1,
+    "measurement_start": "The first instant at which every configured user has submitted a request and has at least one terminal request.",
+    "measured_submission_interval": "[measurement_start, measurement_start + measurement_seconds)",
+    "drain": "After the interval closes, submit no new tasks and drain every measured request under the same request timeout.",
+    "denominator_seconds": "max(measurement_window_end, last_measured_terminal) - measurement_start",
+    "task_goodput_per_hour": "correct measured tasks / denominator_seconds * 3600"
+  }
+}

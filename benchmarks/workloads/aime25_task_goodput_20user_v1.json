@@ -1,0 +1,228 @@
+{
+  "schema": "freetoken.aime_task_goodput_workload.v1",
+  "name": "aime25_task_goodput_20user_v1",
+  "description": "Thirty unique AIME 2025 tasks served to twenty closed-loop users. Starts are staggered and a user's second task is submitted only after the first task terminates and the fixed think time elapses.",
+  "dataset": {
+    "repository": "math-ai/aime25",
+    "file": "test.jsonl",
+    "repository_type": "dataset",
+    "problem_field": "problem",
+    "fallback_problem_field": "prompt",
+    "answer_field": "answer",
+    "problem_count": 30
+  },
+  "prompt_contract": {
+    "policy_scope": "One system prompt and one answer instruction are frozen for the entire arm; neither may vary by user or problem.",
+    "default_system_prompt": "",
+    "answer_instruction": "Please reason step by step, and put your final answer within \\boxed{}.",
+    "append_instruction_when_missing": "\\boxed",
+    "default_message_construction": "Omit the system message when default_system_prompt is empty. Strip trailing whitespace from the dataset problem, append one newline plus answer_instruction when the problem does not already contain append_instruction_when_missing, and send that as the single user message.",
+    "task_endpoint": "The first streamed occurrence matching \\boxed{integer}; the client immediately closes the HTTP stream whether that integer is correct or incorrect.",
+    "no_box_behavior": "Wait for a server stop, length limit, request timeout, or observable HTTP/stream error."
+  },
+  "closed_loop": {
+    "user_count": 20,
+    "task_count": 30,
+    "first_task_submit_at": "schedule_origin + start_offset_seconds",
+    "later_task_submit_at": "prior_task_terminal + think_time_seconds",
+    "makespan": "last task terminal minus first actual task submission",
+    "task_goodput_per_hour": "correct boxed tasks / makespan_seconds * 3600"
+  },
+  "schedule_rationale": [
+    "A ten-second admission cadence avoids an artificial twenty-request barrier while keeping all twenty users active in one shared-service episode.",
+    "Every user has the same thirty-second think time, so later arrivals depend only on observable completion time rather than on the arm being evaluated.",
+    "Problems 0-19 are each assigned once as the users' first tasks; problems 20-29 are each assigned once as the second tasks of users 0-9."
+  ],
+  "users": [
+    {
+      "user_id": "aime_user_00",
+      "user_index": 0,
+      "start_offset_seconds": 0.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        0,
+        20
+      ]
+    },
+    {
+      "user_id": "aime_user_01",
+      "user_index": 1,
+      "start_offset_seconds": 10.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        1,
+        21
+      ]
+    },
+    {
+      "user_id": "aime_user_02",
+      "user_index": 2,
+      "start_offset_seconds": 20.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        2,
+        22
+      ]
+    },
+    {
+      "user_id": "aime_user_03",
+      "user_index": 3,
+      "start_offset_seconds": 30.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        3,
+        23
+      ]
+    },
+    {
+      "user_id": "aime_user_04",
+      "user_index": 4,
+      "start_offset_seconds": 40.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        4,
+        24
+      ]
+    },
+    {
+      "user_id": "aime_user_05",
+      "user_index": 5,
+      "start_offset_seconds": 50.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        5,
+        25
+      ]
+    },
+    {
+      "user_id": "aime_user_06",
+      "user_index": 6,
+      "start_offset_seconds": 60.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        6,
+        26
+      ]
+    },
+    {
+      "user_id": "aime_user_07",
+      "user_index": 7,
+      "start_offset_seconds": 70.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        7,
+        27
+      ]
+    },
+    {
+      "user_id": "aime_user_08",
+      "user_index": 8,
+      "start_offset_seconds": 80.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        8,
+        28
+      ]
+    },
+    {
+      "user_id": "aime_user_09",
+      "user_index": 9,
+      "start_offset_seconds": 90.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        9,
+        29
+      ]
+    },
+    {
+      "user_id": "aime_user_10",
+      "user_index": 10,
+      "start_offset_seconds": 100.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        10
+      ]
+    },
+    {
+      "user_id": "aime_user_11",
+      "user_index": 11,
+      "start_offset_seconds": 110.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        11
+      ]
+    },
+    {
+      "user_id": "aime_user_12",
+      "user_index": 12,
+      "start_offset_seconds": 120.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        12
+      ]
+    },
+    {
+      "user_id": "aime_user_13",
+      "user_index": 13,
+      "start_offset_seconds": 130.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        13
+      ]
+    },
+    {
+      "user_id": "aime_user_14",
+      "user_index": 14,
+      "start_offset_seconds": 140.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        14
+      ]
+    },
+    {
+      "user_id": "aime_user_15",
+      "user_index": 15,
+      "start_offset_seconds": 150.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        15
+      ]
+    },
+    {
+      "user_id": "aime_user_16",
+      "user_index": 16,
+      "start_offset_seconds": 160.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        16
+      ]
+    },
+    {
+      "user_id": "aime_user_17",
+      "user_index": 17,
+      "start_offset_seconds": 170.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        17
+      ]
+    },
+    {
+      "user_id": "aime_user_18",
+      "user_index": 18,
+      "start_offset_seconds": 180.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        18
+      ]
+    },
+    {
+      "user_id": "aime_user_19",
+      "user_index": 19,
+      "start_offset_seconds": 190.0,
+      "think_time_seconds": 30.0,
+      "problem_indices": [
+        19
+      ]
+    }
+  ]
+}

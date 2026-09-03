@@ -1,0 +1,135 @@
+{
+  "schema": "freetoken.mixed_task_goodput_spec.v1",
+  "name": "mixed_task_goodput_20user_v1",
+  "sources": {
+    "numeric": {
+      "dataset": "reasoning-machines/gsm-hard",
+      "revision": "960448f73503112d4226baeb8eb41d3fb5ae2506",
+      "file": "gsmhardv2.jsonl",
+      "license": "MIT",
+      "url": "https://huggingface.co/datasets/reasoning-machines/gsm-hard/resolve/960448f73503112d4226baeb8eb41d3fb5ae2506/gsmhardv2.jsonl"
+    },
+    "code": {
+      "evaluator": "EvalPlus",
+      "evaluator_version": "0.3.1",
+      "evaluator_commit": "e5d0ed0bab96280b60b637ec7f15b5e4841b0cb2",
+      "license": "Apache-2.0",
+      "datasets": {
+        "humaneval": {
+          "version": "v0.1.10",
+          "rows": 164,
+          "url": "https://github.com/evalplus/humanevalplus_release/releases/download/v0.1.10/HumanEvalPlus.jsonl.gz"
+        },
+        "mbpp": {
+          "version": "v0.2.0",
+          "rows": 378,
+          "url": "https://github.com/evalplus/mbppplus_release/releases/download/v0.2.0/MbppPlus.jsonl.gz"
+        }
+      }
+    },
+    "knowledge": {
+      "dataset": "cais/mmlu",
+      "revision": "c30699e8356da336a370243923dbaf21066bb9fe",
+      "license": "MIT",
+      "validation_url": "https://huggingface.co/datasets/cais/mmlu/resolve/c30699e8356da336a370243923dbaf21066bb9fe/all/validation-00000-of-00001.parquet",
+      "test_url": "https://huggingface.co/datasets/cais/mmlu/resolve/c30699e8356da336a370243923dbaf21066bb9fe/all/test-00000-of-00001.parquet",
+      "excluded_subjects": [
+        "abstract_algebra",
+        "college_mathematics",
+        "elementary_mathematics",
+        "high_school_mathematics",
+        "high_school_statistics"
+      ],
+      "answer_mapping": {
+        "0": "A",
+        "1": "B",
+        "2": "C",
+        "3": "D"
+      }
+    }
+  },
+  "traffic": {
+    "user_count": 20,
+    "first_submit_offset_seconds": "user_index",
+    "think_time_seconds": 30,
+    "warmup_task_count": 20,
+    "warmup_family_counts": {
+      "numeric": 7,
+      "code": 7,
+      "knowledge": 6
+    },
+    "dev": {
+      "submission_window_seconds": 300,
+      "turns_per_user": 12,
+      "tasks_per_family": 80
+    },
+    "final": {
+      "submission_window_seconds": 600,
+      "turns_per_user": 21,
+      "tasks_per_family": 140
+    },
+    "family_for_turn": "families[(user_index + turn_index) % 3]",
+    "assignment_order": "turn_index_then_user_index",
+    "wrap": false,
+    "denominator": "max(submission_window_end,last_terminal)-user_0_first_scored_submit"
+  },
+  "request_policy": {
+    "system_prompt": "Follow the requested output format exactly.",
+    "greedy": true,
+    "enable_thinking": false,
+    "families": {
+      "numeric": {
+        "instruction": "Solve the problem. Return exactly FINAL: number and no other text.",
+        "max_tokens_cap": 512,
+        "slo_seconds": 30
+      },
+      "code": {
+        "instruction": "Return a complete Python solution containing the requested function in exactly one ```python code fence and no other text.",
+        "max_tokens_cap": 768,
+        "slo_seconds": 60
+      },
+      "knowledge": {
+        "instruction": "Choose the best answer. Return exactly FINAL: A, FINAL: B, FINAL: C, or FINAL: D and no other text.",
+        "max_tokens_cap": 64,
+        "slo_seconds": 10
+      }
+    }
+  },
+  "selection": {
+    "numeric": "raw ordinal modulo 4 equals 0 for dev candidates and all other ordinals for final candidates; take evenly spaced rows; warmup uses evenly spaced unused rows",
+    "code": "sort numeric task id within each dataset, use sorted ordinal modulo 4 equals 0 for dev candidates and all other ordinals for final candidates; take evenly spaced rows within fixed dataset quotas; warmup uses evenly spaced unused rows",
+    "code_quotas": {
+      "dev": {
+        "humaneval": 24,
+        "mbpp": 56
+      },
+      "final": {
+        "humaneval": 42,
+        "mbpp": 98
+      },
+      "warmup": {
+        "humaneval": 2,
+        "mbpp": 5
+      }
+    },
+    "knowledge": "exclude five named mathematics subjects, sort subjects, then round-robin rows within subject; dev and warmup use validation and final uses test"
+  },
+  "training_isolation": {
+    "normalization": "UTF-8 decode, Unicode NFKC, normalize line endings, casefold, collapse each Unicode whitespace run to one ASCII space, strip",
+    "substring_filter_kinds": [
+      "problem",
+      "final_prompt"
+    ],
+    "audit_only_kinds": [
+      "entry_point",
+      "public_test",
+      "contract"
+    ],
+    "match": "exclude a training sample when its normalized text contains a complete normalized problem or final_prompt row; audit-only kinds are never substring filters",
+    "never_export": [
+      "GSM code",
+      "MMLU answer",
+      "EvalPlus canonical_solution"
+    ]
+  }
+}
