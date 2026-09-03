@@ -181,8 +181,8 @@ def load_nowag_expert_sources(
         raise ValueError("NoWAG runtime requires expert-only quantization with one global codebook")
     group_size = int(manifest.get("d", 0))
     assignment_bits = int(manifest.get("assignment_bits", 0))
-    if group_size != 6 or assignment_bits != 12:
-        raise ValueError("NoWAG runtime currently supports only D6/B12")
+    if group_size not in (4, 6) or assignment_bits != 12:
+        raise ValueError("NoWAG GPU runtime supports only D4/B12 or D6/B12")
     if manifest.get("assignments_packed") is not True:
         raise ValueError("NoWAG runtime requires packed assignments")
     source_assignment_layout = manifest.get("assignment_layout", "row_major")
